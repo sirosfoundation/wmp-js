@@ -87,6 +87,7 @@ export const Method = {
   FlowError: "wmp.flow.error",
   FlowCancel: "wmp.flow.cancel",
   Resolve: "wmp.resolve",
+  RelayRegister: "wmp.relay.register",
 } as const;
 
 export type MethodName = (typeof Method)[keyof typeof Method];
@@ -348,4 +349,30 @@ export const ResolveType = {
   Trust: "trust",
   Endpoint: "endpoint",
   OpenIDFederation: "openid_federation",
+} as const;
+
+// ---------------------------------------------------------------------------
+// Relay methods
+// ---------------------------------------------------------------------------
+
+export interface RelayRegisterParams {
+  wmp: Metadata;
+  auth?: AuthObject;
+}
+
+export interface RelayRegisterResult {
+  wmp: Metadata;
+  registered: boolean;
+  ttl?: number;
+}
+
+export interface RelayCap {
+  destinations?: string[];
+}
+
+export const ServiceClass = {
+  BestEffort: "best_effort",
+  Standard: "standard",
+  Registered: "registered",
+  Certified: "certified",
 } as const;

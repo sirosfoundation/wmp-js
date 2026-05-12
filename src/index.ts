@@ -12,6 +12,7 @@ export {
   AckStatus,
   CancelReason,
   ResolveType,
+  ServiceClass,
 } from "./types.js";
 export type {
   Metadata,
@@ -47,6 +48,9 @@ export type {
   FlowCancelResult,
   ResolveParams,
   ResolveResult,
+  RelayRegisterParams,
+  RelayRegisterResult,
+  RelayCap,
   MethodName,
 } from "./types.js";
 
@@ -88,3 +92,56 @@ export type {
 // Peer
 export { Peer } from "./peer.js";
 export type { Handler, PeerOptions } from "./peer.js";
+
+// MLS
+export {
+  MLSMethod,
+  CipherSuiteX25519AES128GCM,
+  CipherSuiteP256AES128GCM,
+  CredentialType,
+  MLSProfile,
+  mlsMethods,
+} from "./mls.js";
+export type {
+  MLSMethodName,
+  GroupCreateParams,
+  GroupCreateResult,
+  GroupJoinParams,
+  GroupJoinResult,
+  GroupAddParams,
+  GroupAddResult,
+  GroupRemoveParams,
+  GroupRemoveResult,
+  GroupUpdateParams,
+  MessageFetchParams,
+  MessageFetchResult,
+  KeyPackage,
+  KeyPackagesResponse,
+  EncryptedEnvelope,
+  MLSHandler,
+  MLSProvider,
+} from "./mls.js";
+
+// OpenID4x
+export {
+  OID4FlowType,
+  VCIStep,
+  VPStep,
+  OID4Action,
+  OpenID4xProfile,
+} from "./openid4x.js";
+export type {
+  OID4VCICapability,
+  OID4VPCapability,
+  FlowStartHandler,
+  ActionHandler,
+  OpenID4xConfig,
+} from "./openid4x.js";
+
+// Native transports (Node.js only — stdio NDJSON, Unix sockets)
+export { StdioTransport, UnixSocketTransport } from "./native.js";
+export type { StdioTransportOptions } from "./native.js";
+
+// Relay
+export { Relay } from "./relay.js";
+export type { RelayConfig, QueuedMessage } from "./relay.js";
