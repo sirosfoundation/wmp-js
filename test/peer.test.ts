@@ -197,31 +197,6 @@ describe("Peer", () => {
     expect(peer.session).toBe("ses-abc");
   });
 
-  it("createSession tracks userId and tenantId", async () => {
-    const transport = new MockTransport();
-    const peer = new Peer(transport);
-
-    const promise = peer.createSession({
-      security: { mode: "tls" },
-      auth: { type: "bearer", token: "jwt-token" },
-      userId: "alice@example.com",
-      tenantId: "acme-corp",
-    });
-    const req = transport.sent[0] as { id: string };
-
-    transport.receive(
-      createResponse(req.id, {
-        wmp: { version: "0.1", session_id: "ses-tenant" },
-        security: { mode: "tls" },
-      }),
-    );
-
-    await promise;
-    expect(peer.session).toBe("ses-tenant");
-    expect(peer.user).toBe("alice@example.com");
-    expect(peer.tenant).toBe("acme-corp");
-  });
-
   it("createSession calls setSessionId on transport when available", async () => {
     const transport = new MockTransport();
     const setSessionId = vi.fn();

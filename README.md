@@ -1,4 +1,4 @@
-# @sirosfoundation/wmp
+# @sirosfoundation/wmp-js
 
 [![CI](https://github.com/sirosfoundation/wmp-js/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/wmp-js/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
@@ -17,13 +17,13 @@ TypeScript implementation of the Wallet Messaging Protocol (WMP) — a JSON-RPC 
 ## Install
 
 ```bash
-npm install @sirosfoundation/wmp
+npm install @sirosfoundation/wmp-js
 ```
 
 ## Quick Start
 
 ```typescript
-import { Peer, HttpSseTransport } from "@sirosfoundation/wmp";
+import { Peer, HttpSseTransport } from "@sirosfoundation/wmp-js";
 
 const transport = new HttpSseTransport({
   rpcUrl: "https://wallet-backend.example.com/wmp/rpc",
@@ -89,7 +89,7 @@ peer.notify("method.name", params);
 Higher-level abstraction for wallet flows.
 
 ```typescript
-import { Registry } from "@sirosfoundation/wmp";
+import { Registry } from "@sirosfoundation/wmp-js";
 
 const registry = new Registry();
 

@@ -102,8 +102,6 @@ export class Peer implements PeerContext {
   private pending = new Map<string | number, PendingRequest>();
   private callTimeout: number;
   private sessionId?: string;
-  private userId?: string;
-  private tenantId?: string;
   private closed = false;
 
   constructor(transport: Transport, opts?: PeerOptions) {
@@ -126,16 +124,6 @@ export class Peer implements PeerContext {
   /** The negotiated session ID (set after session.create). */
   get session(): string | undefined {
     return this.sessionId;
-  }
-
-  /** The authenticated user ID (set from session create result or auth). */
-  get user(): string | undefined {
-    return this.userId;
-  }
-
-  /** The tenant ID for multi-tenant routing (set from session create result or auth). */
-  get tenant(): string | undefined {
-    return this.tenantId;
   }
 
   // -------------------------------------------------------------------------
@@ -183,10 +171,6 @@ export class Peer implements PeerContext {
     auth?: { type: string; token?: string; [key: string]: unknown };
     sender?: string;
     ttl?: number;
-    /** User ID for session binding (extracted from auth token by caller). */
-    userId?: string;
-    /** Tenant ID for multi-tenant routing. */
-    tenantId?: string;
   }): Promise<SessionCreateResult> {
     const wmp: Metadata = { version: VERSION, sender: opts.sender };
     const params: SessionCreateParams = {
@@ -206,9 +190,6 @@ export class Peer implements PeerContext {
       // Propagate session ID to transport for header/URL binding.
       this.bindSessionToTransport(result.wmp.session_id);
     }
-    // Track identity context for tenant routing.
-    if (opts.userId) this.userId = opts.userId;
-    if (opts.tenantId) this.tenantId = opts.tenantId;
     return result;
   }
 
