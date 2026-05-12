@@ -1,5 +1,5 @@
 {
-  "name": "@siros/wmp",
+  "name": "@sirosfoundation/wmp",
   "version": "0.1.0",
   "description": "Wallet Messaging Protocol (WMP) client library — JSON-RPC 2.0 over WebSocket and HTTP+SSE",
   "type": "module",
@@ -24,7 +24,7 @@
     "typescript": "^5.7.0",
     "vitest": "^3.2.0"
   },
-  "license": "Apache-2.0",
+  "license": "BSD-2-Clause",
   "repository": {
     "type": "git",
     "url": "https://github.com/sirosfoundation/wmp-js.git"
