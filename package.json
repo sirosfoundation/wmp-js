@@ -29,5 +29,9 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/sirosfoundation/wmp-js.git"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1"
   }
 }

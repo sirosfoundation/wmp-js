@@ -101,6 +101,8 @@ export {
   CredentialType,
   MLSProfile,
   mlsMethods,
+  NoopMLSHandler,
+  NoopMLSProvider,
 } from "./mls.js";
 export type {
   MLSMethodName,
@@ -124,6 +126,12 @@ export type {
 
 // OpenID4x
 export {
+  CredentialFormat,
+  allFormats,
+  isValidFormat,
+  GrantType,
+  ResponseMode,
+  ProofType,
   OID4FlowType,
   VCIStep,
   VPStep,
@@ -131,8 +139,17 @@ export {
   OpenID4xProfile,
 } from "./openid4x.js";
 export type {
+  CredentialFormatType,
   OID4VCICapability,
   OID4VPCapability,
+  CredentialDisplay,
+  CredentialConfigurationSupported,
+  CredentialResult,
+  VPTokenResult,
+  SignSubFlowParams,
+  SelectionAction,
+  ConsentAction,
+  CredentialSelection,
   FlowStartHandler,
   ActionHandler,
   OpenID4xConfig,
@@ -145,3 +162,7 @@ export type { StdioTransportOptions } from "./native.js";
 // Relay
 export { Relay } from "./relay.js";
 export type { RelayConfig, QueuedMessage } from "./relay.js";
+
+// Schema validation (Node.js only — requires fs)
+export { createValidator } from "./schema.js";
+export type { Validator, ValidationError } from "./schema.js";

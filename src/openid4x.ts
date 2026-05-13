@@ -26,6 +26,60 @@ import { WMPError } from "./jsonrpc.js";
 import { ErrorCode } from "./types.js";
 
 // ---------------------------------------------------------------------------
+// Credential format constants — aligned with wallet-common VerifiableCredentialFormat
+// ---------------------------------------------------------------------------
+
+export const CredentialFormat = {
+  VC_SDJWT: "vc+sd-jwt",
+  DC_SDJWT: "dc+sd-jwt",
+  MSO_MDOC: "mso_mdoc",
+  JWT_VC_JSON: "jwt_vc_json",
+} as const;
+
+export type CredentialFormatType = (typeof CredentialFormat)[keyof typeof CredentialFormat];
+
+export const allFormats: CredentialFormatType[] = [
+  CredentialFormat.VC_SDJWT,
+  CredentialFormat.DC_SDJWT,
+  CredentialFormat.MSO_MDOC,
+  CredentialFormat.JWT_VC_JSON,
+];
+
+export function isValidFormat(format: string): format is CredentialFormatType {
+  return allFormats.includes(format as CredentialFormatType);
+}
+
+// ---------------------------------------------------------------------------
+// Grant type constants for OID4VCI
+// ---------------------------------------------------------------------------
+
+export const GrantType = {
+  AuthorizationCode: "authorization_code",
+  PreAuthorizedCode: "pre-authorized_code",
+} as const;
+
+// ---------------------------------------------------------------------------
+// Response mode constants for OID4VP
+// ---------------------------------------------------------------------------
+
+export const ResponseMode = {
+  DirectPost: "direct_post",
+  DirectPostJWT: "direct_post.jwt",
+  DCAPI: "dc_api",
+  DCAPIJWT: "dc_api.jwt",
+} as const;
+
+// ---------------------------------------------------------------------------
+// Proof type constants
+// ---------------------------------------------------------------------------
+
+export const ProofType = {
+  JWT: "jwt",
+  Attestation: "attestation",
+  CWT: "cwt",
+} as const;
+
+// ---------------------------------------------------------------------------
 // Flow type constants
 // ---------------------------------------------------------------------------
 
@@ -93,6 +147,68 @@ export interface OID4VPCapability {
   supported_response_modes: string[];
   supported_formats: string[];
   supported_algorithms?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Credential configuration types
+// ---------------------------------------------------------------------------
+
+export interface CredentialDisplay {
+  name: string;
+  locale?: string;
+  description?: string;
+  logo_uri?: string;
+  logo_alt_text?: string;
+  background_color?: string;
+  text_color?: string;
+}
+
+export interface CredentialConfigurationSupported {
+  format: string;
+  scope?: string;
+  vct?: string;     // sd-jwt formats
+  doctype?: string;  // mso_mdoc
+  cryptographic_binding_methods_supported?: string[];
+  credential_signing_alg_values_supported?: string[];
+  proof_types_supported?: Record<string, unknown>;
+  display?: CredentialDisplay[];
+}
+
+export interface CredentialResult {
+  format: string;
+  credential: string;
+  vct?: string;
+  c_nonce?: string;
+}
+
+export interface VPTokenResult {
+  vp_token?: string | string[];
+  presentation_submission?: unknown;
+  response_code?: string;
+}
+
+export interface SignSubFlowParams {
+  action: string;
+  nonce: string;
+  audience: string;
+  proof_type?: string;
+  parent_flow_id: string;
+}
+
+export interface SelectionAction {
+  selected_indices: number[];
+  consent: boolean;
+}
+
+export interface ConsentAction {
+  selections: CredentialSelection[];
+  consent: boolean;
+}
+
+export interface CredentialSelection {
+  credential_id: string;
+  credential_query_id?: string;
+  disclosed_claims: string[];
 }
 
 // ---------------------------------------------------------------------------

@@ -243,3 +243,117 @@ export class MLSProfile implements MethodHandler {
 export function mlsMethods(): string[] {
   return Object.values(MLSMethod);
 }
+
+// ---------------------------------------------------------------------------
+// NoopMLSHandler — TLS-only sessions
+// ---------------------------------------------------------------------------
+
+/**
+ * NoopMLSHandler implements MLSHandler for TLS-only sessions.
+ * It accepts group lifecycle operations but performs no actual MLS
+ * cryptographic operations. Suitable for point-to-point sessions
+ * where transport-level TLS provides sufficient security.
+ */
+export class NoopMLSHandler implements MLSHandler {
+  private groups = new Map<string, { epoch: number; members: Set<string> }>();
+
+  async groupCreate(params: GroupCreateParams): Promise<GroupCreateResult> {
+    const members = new Set<string>(Object.keys(params.welcomes));
+    if (params.wmp.sender) members.add(params.wmp.sender);
+    this.groups.set(params.group_id, { epoch: 0, members });
+    return { wmp: params.wmp, group_id: params.group_id, epoch: 0 };
+  }
+
+  async groupJoin(params: GroupJoinParams): Promise<GroupJoinResult> {
+    return { wmp: params.wmp, group_id: "noop-group", epoch: 0 };
+  }
+
+  async groupAdd(params: GroupAddParams): Promise<GroupAddResult> {
+    for (const [, g] of this.groups) {
+      g.members.add(params.participant);
+      g.epoch++;
+      return { wmp: params.wmp, epoch: g.epoch };
+    }
+    throw new WMPError(ErrorCode.MLSError, "No group found");
+  }
+
+  async groupRemove(params: GroupRemoveParams): Promise<GroupRemoveResult> {
+    for (const [, g] of this.groups) {
+      g.members.delete(params.participant);
+      g.epoch++;
+      return { wmp: params.wmp, epoch: g.epoch };
+    }
+    throw new WMPError(ErrorCode.MLSError, "No group found");
+  }
+
+  async groupUpdate(_params: GroupUpdateParams): Promise<void> {
+    // Noop: no key rotation.
+  }
+
+  async messageFetch(params: MessageFetchParams): Promise<MessageFetchResult> {
+    return { wmp: params.wmp, messages: [], has_more: false };
+  }
+}
+
+/**
+ * NoopMLSProvider implements MLSProvider for TLS-only sessions.
+ * Messages pass through unencrypted, relying on transport-level TLS.
+ */
+export class NoopMLSProvider implements MLSProvider {
+  private groups = new Map<string, { epoch: number }>();
+
+  async generateKeyPackage(cipherSuite: number): Promise<KeyPackage> {
+    return {
+      id: "noop-kp-1",
+      cipher_suite: cipherSuite,
+      key_package: "",
+      expires: "2099-12-31T23:59:59Z",
+    };
+  }
+
+  async createGroup(_cs: number, participants: string[]): Promise<{ groupInfo: string; welcomes: Record<string, string> }> {
+    const welcomes: Record<string, string> = {};
+    for (const p of participants) welcomes[p] = "";
+    return { groupInfo: "", welcomes };
+  }
+
+  async processWelcome(_welcome: string): Promise<{ groupId: string; epoch: number }> {
+    return { groupId: "noop-group", epoch: 0 };
+  }
+
+  async addMember(groupId: string, _kp: string): Promise<{ commit: string; welcome: string }> {
+    const g = this.groups.get(groupId) ?? { epoch: 0 };
+    g.epoch++;
+    this.groups.set(groupId, g);
+    return { commit: "", welcome: "" };
+  }
+
+  async removeMember(groupId: string, _p: string): Promise<{ commit: string }> {
+    const g = this.groups.get(groupId) ?? { epoch: 0 };
+    g.epoch++;
+    this.groups.set(groupId, g);
+    return { commit: "" };
+  }
+
+  async processCommit(groupId: string, _commit: string): Promise<{ epoch: number }> {
+    const g = this.groups.get(groupId) ?? { epoch: 0 };
+    g.epoch++;
+    this.groups.set(groupId, g);
+    return { epoch: g.epoch };
+  }
+
+  async selfUpdate(groupId: string): Promise<{ commit: string }> {
+    const g = this.groups.get(groupId) ?? { epoch: 0 };
+    g.epoch++;
+    this.groups.set(groupId, g);
+    return { commit: "" };
+  }
+
+  async encrypt(_groupId: string, plaintext: Uint8Array): Promise<{ ciphertext: string; epoch: number }> {
+    return { ciphertext: new TextDecoder().decode(plaintext), epoch: 0 };
+  }
+
+  async decrypt(_groupId: string, ciphertext: string): Promise<{ plaintext: Uint8Array; epoch: number }> {
+    return { plaintext: new TextEncoder().encode(ciphertext), epoch: 0 };
+  }
+}
