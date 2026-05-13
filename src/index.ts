@@ -155,14 +155,6 @@ export type {
   OpenID4xConfig,
 } from "./openid4x.js";
 
-// Native transports (Node.js only — stdio NDJSON, Unix sockets)
-export { StdioTransport, UnixSocketTransport } from "./native.js";
-export type { StdioTransportOptions } from "./native.js";
-
 // Relay
 export { Relay } from "./relay.js";
 export type { RelayConfig, QueuedMessage } from "./relay.js";
-
-// Schema validation (Node.js only — requires fs)
-export { createValidator } from "./schema.js";
-export type { Validator, ValidationError } from "./schema.js";
