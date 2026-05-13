@@ -14,8 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          submodules: true
+
+      - name: Clone WMP spec (test vectors and schemas)
+        run: git clone https://github.com/leifj/wmp.git ../wmp
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
