@@ -143,12 +143,23 @@ export interface SessionCreateResult {
   capabilities?: Capabilities;
   security: SecurityMode;
   challenge?: string;
+  resumption_token?: string;
 }
 
 export interface SessionResumeParams {
   wmp: Metadata;
   session_id: string;
-  last_message_id?: string;
+  resumption_token: string;
+  last_received_id?: string;
+}
+
+export interface SessionResumeResult {
+  wmp: Metadata;
+  resumed: boolean;
+  resumption_token?: string;
+  missed_messages: number;
+  capabilities?: Capabilities;
+  security: SecurityMode;
 }
 
 export interface SessionCloseParams {

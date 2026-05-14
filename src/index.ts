@@ -25,6 +25,7 @@ export type {
   SessionCreateParams,
   SessionCreateResult,
   SessionResumeParams,
+  SessionResumeResult,
   SessionCloseParams,
   SessionAuthenticateParams,
   SessionAuthenticateResult,

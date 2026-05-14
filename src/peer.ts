@@ -31,6 +31,7 @@ import {
   type Metadata,
   type SessionCreateParams,
   type SessionCreateResult,
+  type SessionResumeResult,
   type SessionCloseParams,
   type FlowStartParams,
   type FlowStartResult,
@@ -102,6 +103,8 @@ export class Peer implements PeerContext {
   private pending = new Map<string | number, PendingRequest>();
   private callTimeout: number;
   private sessionId?: string;
+  private negotiatedVersion?: string;
+  private resumptionToken?: string;
   private closed = false;
 
   constructor(transport: Transport, opts?: PeerOptions) {
@@ -190,7 +193,48 @@ export class Peer implements PeerContext {
       // Propagate session ID to transport for header/URL binding.
       this.bindSessionToTransport(result.wmp.session_id);
     }
+    if (result.wmp?.version) {
+      this.negotiatedVersion = result.wmp.version;
+    }
+    if (result.resumption_token) {
+      this.resumptionToken = result.resumption_token;
+    }
     return result;
+  }
+
+  /** Resume a previously established WMP session using a resumption token. */
+  async resumeSession(opts?: {
+    lastReceivedId?: string;
+  }): Promise<SessionResumeResult> {
+    if (!this.sessionId || !this.resumptionToken) {
+      throw new Error("no session or resumption token to resume");
+    }
+    const params = {
+      wmp: { version: this.negotiatedVersion ?? VERSION } as Metadata,
+      session_id: this.sessionId,
+      resumption_token: this.resumptionToken,
+      last_received_id: opts?.lastReceivedId,
+    };
+    const result = await this.call<SessionResumeResult>(
+      Method.SessionResume,
+      params,
+    );
+    if (result.wmp?.session_id) {
+      this.sessionId = result.wmp.session_id;
+      this.bindSessionToTransport(result.wmp.session_id);
+    }
+    if (result.wmp?.version) {
+      this.negotiatedVersion = result.wmp.version;
+    }
+    if (result.resumption_token) {
+      this.resumptionToken = result.resumption_token;
+    }
+    return result;
+  }
+
+  /** The current resumption token (set after session.create or session.resume). */
+  get token(): string | undefined {
+    return this.resumptionToken;
   }
 
   /**
@@ -493,7 +537,7 @@ export class Peer implements PeerContext {
 
   private wmpMeta(): Metadata {
     return {
-      version: VERSION,
+      version: this.negotiatedVersion ?? VERSION,
       session_id: this.sessionId,
       timestamp: new Date().toISOString(),
     };
