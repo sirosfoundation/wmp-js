@@ -11,12 +11,12 @@ describe("Relay registration", () => {
 
   it("registers a participant", async () => {
     const result = (await relay.handleMethod(Method.RelayRegister, {
-      wmp: { version: "0.1", sender: "did:web:alice.example.com" },
+      wmp: { version: "0.1", sender: "x509:san:dns:alice.example.com" },
     })) as { registered: boolean; ttl: number };
 
     expect(result.registered).toBe(true);
     expect(result.ttl).toBe(60);
-    expect(relay.isRegistered("did:web:alice.example.com")).toBe(true);
+    expect(relay.isRegistered("x509:san:dns:alice.example.com")).toBe(true);
   });
 
   it("rejects missing sender", async () => {
@@ -39,10 +39,10 @@ describe("Relay registration", () => {
 
   it("unregisters a participant", async () => {
     await relay.handleMethod(Method.RelayRegister, {
-      wmp: { version: "0.1", sender: "did:web:alice.example.com" },
+      wmp: { version: "0.1", sender: "x509:san:dns:alice.example.com" },
     });
-    relay.unregister("did:web:alice.example.com");
-    expect(relay.isRegistered("did:web:alice.example.com")).toBe(false);
+    relay.unregister("x509:san:dns:alice.example.com");
+    expect(relay.isRegistered("x509:san:dns:alice.example.com")).toBe(false);
   });
 });
 
@@ -57,32 +57,32 @@ describe("Relay message queue", () => {
   });
 
   it("enqueues and drains messages", () => {
-    relay.enqueue("did:web:alice.example.com", { body: "hello" });
-    relay.enqueue("did:web:alice.example.com", { body: "world" });
+    relay.enqueue("x509:san:dns:alice.example.com", { body: "hello" });
+    relay.enqueue("x509:san:dns:alice.example.com", { body: "world" });
 
-    expect(relay.queueLength("did:web:alice.example.com")).toBe(2);
+    expect(relay.queueLength("x509:san:dns:alice.example.com")).toBe(2);
 
-    const messages = relay.drain("did:web:alice.example.com");
+    const messages = relay.drain("x509:san:dns:alice.example.com");
     expect(messages).toHaveLength(2);
     expect(messages[0].data).toEqual({ body: "hello" });
-    expect(relay.queueLength("did:web:alice.example.com")).toBe(0);
+    expect(relay.queueLength("x509:san:dns:alice.example.com")).toBe(0);
   });
 
   it("rejects when queue is full", () => {
-    relay.enqueue("did:web:bob.example.com", { n: 1 });
-    relay.enqueue("did:web:bob.example.com", { n: 2 });
-    relay.enqueue("did:web:bob.example.com", { n: 3 });
+    relay.enqueue("x509:san:dns:bob.example.com", { n: 1 });
+    relay.enqueue("x509:san:dns:bob.example.com", { n: 2 });
+    relay.enqueue("x509:san:dns:bob.example.com", { n: 3 });
 
-    expect(() => relay.enqueue("did:web:bob.example.com", { n: 4 })).toThrow();
+    expect(() => relay.enqueue("x509:san:dns:bob.example.com", { n: 4 })).toThrow();
   });
 
   it("returns empty array for unknown participant", () => {
-    const messages = relay.drain("did:web:nobody.example.com");
+    const messages = relay.drain("x509:san:dns:nobody.example.com");
     expect(messages).toEqual([]);
   });
 
   it("reports zero queue length for unknown participant", () => {
-    expect(relay.queueLength("did:web:nobody.example.com")).toBe(0);
+    expect(relay.queueLength("x509:san:dns:nobody.example.com")).toBe(0);
   });
 });
 
@@ -91,19 +91,19 @@ describe("Relay expiry", () => {
     const relay = new Relay({ registrationTTL: 1 }); // 1ms TTL
 
     await relay.handleMethod(Method.RelayRegister, {
-      wmp: { version: "0.1", sender: "did:web:alice.example.com" },
+      wmp: { version: "0.1", sender: "x509:san:dns:alice.example.com" },
     });
 
     // Wait for expiry
     await new Promise((r) => setTimeout(r, 10));
 
-    expect(relay.isRegistered("did:web:alice.example.com")).toBe(false);
+    expect(relay.isRegistered("x509:san:dns:alice.example.com")).toBe(false);
   });
 
   it("purges expired messages", () => {
     const relay = new Relay({ messageTTL: 1 }); // 1ms TTL
 
-    relay.enqueue("did:web:alice.example.com", { body: "test" });
+    relay.enqueue("x509:san:dns:alice.example.com", { body: "test" });
 
     // Wait for expiry then purge
     const start = Date.now();
@@ -112,19 +112,19 @@ describe("Relay expiry", () => {
     }
 
     relay.purgeExpired();
-    expect(relay.queueLength("did:web:alice.example.com")).toBe(0);
+    expect(relay.queueLength("x509:san:dns:alice.example.com")).toBe(0);
   });
 
   it("purges expired registrations", async () => {
     const relay = new Relay({ registrationTTL: 1 }); // 1ms TTL
 
     await relay.handleMethod(Method.RelayRegister, {
-      wmp: { version: "0.1", sender: "did:web:alice.example.com" },
+      wmp: { version: "0.1", sender: "x509:san:dns:alice.example.com" },
     });
 
     await new Promise((r) => setTimeout(r, 10));
     relay.purgeExpired();
 
-    expect(relay.isRegistered("did:web:alice.example.com")).toBe(false);
+    expect(relay.isRegistered("x509:san:dns:alice.example.com")).toBe(false);
   });
 });

@@ -13,6 +13,7 @@ export {
   CancelReason,
   ResolveType,
   ServiceClass,
+  AuthType,
 } from "./types.js";
 export type {
   Metadata,
@@ -159,3 +160,7 @@ export type {
 // Relay
 export { Relay } from "./relay.js";
 export type { RelayConfig, QueuedMessage } from "./relay.js";
+
+// Discovery
+export { extractDomain, discoverEndpoint } from "./discovery.js";
+export type { WellKnownConfig } from "./discovery.js";
