@@ -164,3 +164,23 @@ export type { RelayConfig, QueuedMessage } from "./relay.js";
 // Discovery
 export { extractDomain, discoverEndpoint } from "./discovery.js";
 export type { WellKnownConfig } from "./discovery.js";
+
+// Invitation
+export {
+  InvitationPurpose,
+  createInvitation,
+  invitationSigningPayload,
+  invitationToURI,
+  invitationToHTTPSURI,
+  parseInvitationURI,
+  parseInvitationJSON,
+  isInvitationExpired,
+  generateNonce,
+  MemoryInvitationStore,
+  validateInvitationNonce,
+} from "./invitation.js";
+export type {
+  Invitation,
+  CreateInvitationOptions,
+  InvitationStore,
+} from "./invitation.js";

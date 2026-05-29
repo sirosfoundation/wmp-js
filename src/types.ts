@@ -149,6 +149,7 @@ export interface SessionCreateParams {
   security: SecurityMode;
   ttl?: number;
   auth?: AuthObject;
+  invitation_nonce?: string;
 }
 
 export interface SessionCreateResult {
