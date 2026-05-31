@@ -110,7 +110,7 @@ describe("MLSProfile dispatch", () => {
   it("dispatches GroupAdd", async () => {
     const result = await profile.handleMethod(MLSMethod.GroupAdd, {
       wmp,
-      participant: "did:web:dave.example.com",
+      participant: "x509:san:dns:dave.example.com",
       commit: "Y29tbWl0",
       welcome: "d2VsY29tZQ",
     });
@@ -121,7 +121,7 @@ describe("MLSProfile dispatch", () => {
   it("dispatches GroupRemove", async () => {
     const result = await profile.handleMethod(MLSMethod.GroupRemove, {
       wmp,
-      participant: "did:web:carol.example.com",
+      participant: "x509:san:dns:carol.example.com",
       commit: "Y29tbWl0",
     });
     expect(handler.lastMethod).toBe(MLSMethod.GroupRemove);
@@ -164,8 +164,8 @@ describe("GroupCreateParams serialization", () => {
       accepted_identity_schemes: ["did", "x509", "uri"],
       group_info: "Z3JvdXBpbmZv",
       welcomes: {
-        "did:web:bob.example.com": "d2VsY29tZS1ib2I",
-        "did:web:carol.example.com": "d2VsY29tZS1jYXJvbA",
+        "x509:san:dns:bob.example.com": "d2VsY29tZS1ib2I",
+        "x509:san:dns:carol.example.com": "d2VsY29tZS1jYXJvbA",
       },
     };
 
@@ -186,7 +186,7 @@ describe("EncryptedEnvelope", () => {
         session_id: "ses-abc",
         encrypted: true,
         epoch: 3,
-        sender: "did:web:alice.example.com",
+        sender: "x509:san:dns:alice.example.com",
       },
       ciphertext: "Y2lwaGVydGV4dC1kYXRh",
     };

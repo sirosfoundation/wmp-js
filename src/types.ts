@@ -126,8 +126,21 @@ export const ErrorCode = {
 export interface AuthObject {
   type: string;
   token?: string;
+  signature?: string;
+  x5c?: string[];
   [key: string]: unknown;
 }
+
+/** Authentication type constants. */
+export const AuthType = {
+  Bearer: "bearer",
+  DPoP: "dpop",
+  MTLS: "mtls",
+  SignedChallenge: "signed_challenge",
+  X5C: "x5c",
+  /** @deprecated Use SignedChallenge instead. */
+  DIDAuth: "did_auth",
+} as const;
 
 export interface SessionCreateParams {
   wmp: Metadata;
@@ -136,6 +149,7 @@ export interface SessionCreateParams {
   security: SecurityMode;
   ttl?: number;
   auth?: AuthObject;
+  invitation_nonce?: string;
 }
 
 export interface SessionCreateResult {
