@@ -187,12 +187,28 @@ export interface VPTokenResult {
   response_code?: string;
 }
 
+/**
+ * TransactionData represents a single transaction data object from
+ * the verifier's OID4VP authorization request (TS12/SCA).
+ */
+export interface TransactionData {
+  type: string;
+  params?: Record<string, unknown>;
+  /** Credential IDs this transaction data applies to */
+  credential_ids?: string[];
+  /** Hash algorithm for transaction_data_hashes */
+  hash_alg?: string;
+  /** Algorithm identifier for the hashes claim in KB-JWT */
+  transaction_data_hashes_alg?: string;
+}
+
 export interface SignSubFlowParams {
   action: string;
   nonce: string;
   audience: string;
   proof_type?: string;
   parent_flow_id: string;
+  transaction_data?: TransactionData[];
 }
 
 export interface SelectionAction {
