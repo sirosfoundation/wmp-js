@@ -147,6 +147,8 @@ export type {
   CredentialDisplay,
   CredentialConfigurationSupported,
   CredentialResult,
+  CredentialEvent,
+  CredentialNotificationParams,
   VPTokenResult,
   SignSubFlowParams,
   SelectionAction,
