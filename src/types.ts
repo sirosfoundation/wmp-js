@@ -86,6 +86,7 @@ export const Method = {
   FlowComplete: "wmp.flow.complete",
   FlowError: "wmp.flow.error",
   FlowCancel: "wmp.flow.cancel",
+  CredentialNotification: "wmp.credential.notification",
   Resolve: "wmp.resolve",
   RelayRegister: "wmp.relay.register",
 } as const;

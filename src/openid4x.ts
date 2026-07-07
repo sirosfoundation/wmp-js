@@ -13,6 +13,7 @@ import type {
   FlowProgressParams,
   FlowCompleteParams,
   FlowErrorParams,
+  Metadata,
   ResolveParams,
   ResolveResult,
 } from "./types.js";
@@ -179,6 +180,19 @@ export interface CredentialResult {
   credential: string;
   vct?: string;
   c_nonce?: string;
+  notification_id?: string;
+}
+
+/** OID4VCI §10 credential lifecycle events. */
+export type CredentialEvent = "credential_accepted" | "credential_failure";
+
+/** Params for wmp.credential.notification. */
+export interface CredentialNotificationParams {
+  wmp: Metadata;
+  flow_id: string;
+  notification_id: string;
+  event: CredentialEvent;
+  event_description?: string;
 }
 
 export interface VPTokenResult {
