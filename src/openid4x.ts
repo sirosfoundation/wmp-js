@@ -13,6 +13,7 @@ import type {
   FlowProgressParams,
   FlowCompleteParams,
   FlowErrorParams,
+  Metadata,
   ResolveParams,
   ResolveResult,
 } from "./types.js";
@@ -187,7 +188,7 @@ export type CredentialEvent = "credential_accepted" | "credential_failure";
 
 /** Params for wmp.credential.notification. */
 export interface CredentialNotificationParams {
-  wmp: { version: string };
+  wmp: Metadata;
   flow_id: string;
   notification_id: string;
   event: CredentialEvent;
