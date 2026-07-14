@@ -5,9 +5,16 @@ import {
   VPStep,
   OID4Action,
   OpenID4xProfile,
+  buildVCIFlowStart,
+  withAttestation,
+} from "../src/openid4x.js";
+import type {
+  ClientAttestationProvider,
+  OID4VCIFlowParams,
+  CredentialNotificationParams,
 } from "../src/openid4x.js";
 import type { FlowStartParams, FlowActionParams, Metadata } from "../src/types.js";
-import { ErrorCode } from "../src/types.js";
+import { ErrorCode, VERSION } from "../src/types.js";
 
 const wmp: Metadata = { version: "0.1", session_id: "ses-1" };
 
@@ -211,5 +218,107 @@ describe("OpenID4xProfile resolve", () => {
     await expect(
       p.handleResolve({ wmp, type: "vctm", uri: "https://example.com" }),
     ).rejects.toMatchObject({ code: ErrorCode.CapabilityNotSupported });
+  });
+});
+
+describe("buildVCIFlowStart", () => {
+  it("builds flow start params with offer", () => {
+    const params: OID4VCIFlowParams = { offer: "openid-credential-offer://example" };
+    const result = buildVCIFlowStart("ses-1", "flow-1", params);
+
+    expect(result.wmp.version).toBe(VERSION);
+    expect(result.wmp.session_id).toBe("ses-1");
+    expect(result.flow_type).toBe("oid4vci");
+    expect(result.flow_id).toBe("flow-1");
+    expect(result.params).toBe(params);
+    expect(result.timeout).toBeUndefined();
+  });
+
+  it("builds flow start params with credential_offer_uri", () => {
+    const params: OID4VCIFlowParams = { credential_offer_uri: "https://issuer.example/offer/123" };
+    const result = buildVCIFlowStart("ses-2", "flow-2", params, 30000);
+
+    expect(result.wmp.version).toBe(VERSION);
+    expect(result.flow_type).toBe("oid4vci");
+    expect(result.flow_id).toBe("flow-2");
+    expect(result.params).toEqual({ credential_offer_uri: "https://issuer.example/offer/123" });
+    expect(result.timeout).toBe(30000);
+  });
+
+  it("includes attestation fields when present in params", () => {
+    const params: OID4VCIFlowParams = {
+      offer: "openid-credential-offer://example",
+      client_attestation: "wia-jwt",
+      client_attestation_pop: "pop-jwt",
+    };
+    const result = buildVCIFlowStart("ses-3", "flow-3", params);
+    expect((result.params as typeof params).client_attestation).toBe("wia-jwt");
+    expect((result.params as typeof params).client_attestation_pop).toBe("pop-jwt");
+  });
+});
+
+describe("withAttestation", () => {
+  it("merges attestation into params when provider returns credentials", async () => {
+    const provider: ClientAttestationProvider = {
+      getAttestation: async (_audience) => ({
+        client_attestation: "wia-test-jwt",
+        client_attestation_pop: "pop-test-jwt",
+      }),
+    };
+    const params: OID4VCIFlowParams = { offer: "openid-credential-offer://example" };
+    const result = await withAttestation(provider, "https://issuer.example", params);
+
+    expect(result.client_attestation).toBe("wia-test-jwt");
+    expect(result.client_attestation_pop).toBe("pop-test-jwt");
+    expect((result as { offer: string }).offer).toBe("openid-credential-offer://example");
+  });
+
+  it("returns params unchanged when provider returns null", async () => {
+    const provider: ClientAttestationProvider = {
+      getAttestation: async () => null,
+    };
+    const params: OID4VCIFlowParams = { offer: "openid-credential-offer://example" };
+    const result = await withAttestation(provider, "https://issuer.example", params);
+
+    expect(result).toBe(params); // same reference — no modification
+  });
+
+  it("passes audience to provider", async () => {
+    let receivedAudience = "";
+    const provider: ClientAttestationProvider = {
+      getAttestation: async (audience) => {
+        receivedAudience = audience;
+        return null;
+      },
+    };
+    const params: OID4VCIFlowParams = { credential_offer_uri: "https://issuer.example/offer" };
+    await withAttestation(provider, "https://as.issuer.example", params);
+
+    expect(receivedAudience).toBe("https://as.issuer.example");
+  });
+});
+
+describe("CredentialNotificationParams type", () => {
+  it("can construct a valid notification payload", () => {
+    const notification: CredentialNotificationParams = {
+      wmp: { version: VERSION, session_id: "ses-1" },
+      flow_id: "flow-1",
+      notification_id: "notif-123",
+      event: "credential_accepted",
+    };
+    expect(notification.event).toBe("credential_accepted");
+    expect(notification.notification_id).toBe("notif-123");
+  });
+
+  it("supports event_description", () => {
+    const notification: CredentialNotificationParams = {
+      wmp: { version: VERSION, session_id: "ses-1" },
+      flow_id: "flow-1",
+      notification_id: "notif-456",
+      event: "credential_failure",
+      event_description: "User revoked consent",
+    };
+    expect(notification.event).toBe("credential_failure");
+    expect(notification.event_description).toBe("User revoked consent");
   });
 });

@@ -24,7 +24,7 @@ import type {
   ResolveHandler,
 } from "./profile.js";
 import { WMPError } from "./jsonrpc.js";
-import { ErrorCode } from "./types.js";
+import { ErrorCode, VERSION } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Credential format constants — aligned with wallet-common VerifiableCredentialFormat
@@ -199,6 +199,150 @@ export interface VPTokenResult {
   vp_token?: string | string[];
   presentation_submission?: unknown;
   response_code?: string;
+}
+
+// ---------------------------------------------------------------------------
+// OID4VCI flow start params — the protocol-specific payload inside
+// FlowStartParams.params for OID4VCI flows.
+// ---------------------------------------------------------------------------
+
+/**
+ * Client attestation credentials (WIA + PoP) for issuer authentication.
+ * Produced by a {@link ClientAttestationProvider}.
+ */
+export interface ClientAttestation {
+  /** WIA JWT (typ: oauth-client-attestation+jwt) */
+  client_attestation: string;
+  /** PoP JWT (typ: oauth-client-attestation-pop+jwt) signed by wallet instance key */
+  client_attestation_pop: string;
+}
+
+/**
+ * Provider interface for obtaining OAuth client attestation credentials.
+ *
+ * Callers implement this to decouple wmp-js from any specific wallet backend.
+ * The provider is responsible for:
+ * 1. Obtaining a WIA JWT from the wallet provider (implementation-defined)
+ * 2. Signing the PoP JWT with the wallet instance key (aud = issuer AS URL)
+ *
+ * Example implementations:
+ * - SIROS: calls /wallet-provider/wia/generate, signs PoP with passkey-PRF key
+ * - EUDI: calls the PID provider's WIA endpoint, signs PoP with device key
+ * - Test: returns static test JWTs
+ */
+export interface ClientAttestationProvider {
+  /**
+   * Get attestation credentials for a specific issuer.
+   * @param audience - The issuer's AS URL (used as PoP aud claim)
+   * @returns WIA + PoP JWTs, or null if attestation is not available/required
+   */
+  getAttestation(audience: string): Promise<ClientAttestation | null>;
+}
+
+/**
+ * OID4VCI-specific parameters for wmp.flow.start.
+ * Passed as the `params` field of FlowStartParams when flow_type = "oid4vci".
+ *
+ * Client attestation fields support draft-ietf-oauth-attestation-based-client-auth-04:
+ * - `client_attestation`: WIA JWT from the provider
+ * - `client_attestation_pop`: PoP JWT signed by the wallet instance key (aud = AS URL)
+ *
+ * The instance key is held client-side (never on the backend).
+ * The backend forwards these as HTTP headers without modification.
+ */
+/** Common fields shared by all OID4VCI flow param variants. */
+interface OID4VCIFlowParamsBase {
+  /** OAuth redirect URI for authorization code flow */
+  redirect_uri?: string;
+
+  // --- Client attestation (draft-ietf-oauth-attestation-based-client-auth-04) ---
+
+  /** WIA JWT (typ: oauth-client-attestation+jwt) obtained via ClientAttestationProvider */
+  client_attestation?: string;
+  /** PoP JWT (typ: oauth-client-attestation-pop+jwt) signed by wallet instance key */
+  client_attestation_pop?: string;
+
+  // --- Resumption fields (same-tab redirect flow) ---
+
+  /** Authorization code from OAuth redirect */
+  auth_code?: string;
+  /** PKCE code verifier (saved by client before redirect) */
+  code_verifier?: string;
+}
+
+/** OID4VCI params with an inline credential offer. */
+export interface OID4VCIFlowParamsWithOffer extends OID4VCIFlowParamsBase {
+  /** Credential offer URI (openid-credential-offer://...) */
+  offer: string;
+  credential_offer_uri?: never;
+}
+
+/** OID4VCI params with a credential offer by reference. */
+export interface OID4VCIFlowParamsWithURI extends OID4VCIFlowParamsBase {
+  offer?: never;
+  /** Credential offer URI by reference (https://...) */
+  credential_offer_uri: string;
+}
+
+/**
+ * OID4VCI-specific parameters for wmp.flow.start.
+ * Passed as the `params` field of FlowStartParams when flow_type = "oid4vci".
+ *
+ * Exactly one of `offer` or `credential_offer_uri` must be provided.
+ */
+export type OID4VCIFlowParams = OID4VCIFlowParamsWithOffer | OID4VCIFlowParamsWithURI;
+
+/**
+ * OID4VP-specific parameters for wmp.flow.start.
+ * Passed as the `params` field of FlowStartParams when flow_type = "oid4vp".
+ */
+export interface OID4VPFlowParams {
+  /** Request URI (openid4vp://...) */
+  request_uri?: string;
+  /** Request URI by reference (https://...) */
+  request_uri_ref?: string;
+}
+
+/**
+ * Helper to build WMP FlowStartParams for an OID4VCI flow.
+ * If attestation is provided, it is included in the params.
+ */
+export function buildVCIFlowStart(
+  sessionId: string,
+  flowId: string,
+  params: OID4VCIFlowParams,
+  timeout?: number,
+): FlowStartParams {
+  return {
+    wmp: { version: VERSION, session_id: sessionId },
+    flow_type: OID4FlowType.OID4VCI,
+    flow_id: flowId,
+    params,
+    timeout,
+  };
+}
+
+/**
+ * Helper to build VCI flow params with attestation from a provider.
+ * Calls the provider to obtain WIA + PoP, then merges into the params.
+ *
+ * @param provider - The attestation provider (caller-supplied)
+ * @param audience - The issuer's AS URL for PoP audience binding
+ * @param params - Base OID4VCI flow params (offer, redirect_uri, etc.)
+ * @returns params with attestation fields populated (or unchanged if provider returns null)
+ */
+export async function withAttestation(
+  provider: ClientAttestationProvider,
+  audience: string,
+  params: OID4VCIFlowParams,
+): Promise<OID4VCIFlowParams> {
+  const attestation = await provider.getAttestation(audience);
+  if (!attestation) return params;
+  return {
+    ...params,
+    client_attestation: attestation.client_attestation,
+    client_attestation_pop: attestation.client_attestation_pop,
+  };
 }
 
 /**
