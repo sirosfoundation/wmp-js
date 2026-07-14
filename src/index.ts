@@ -139,6 +139,7 @@ export {
   VPStep,
   OID4Action,
   OpenID4xProfile,
+  buildVCIFlowStart,
 } from "./openid4x.js";
 export type {
   CredentialFormatType,
@@ -150,6 +151,8 @@ export type {
   CredentialEvent,
   CredentialNotificationParams,
   VPTokenResult,
+  OID4VCIFlowParams,
+  OID4VPFlowParams,
   SignSubFlowParams,
   SelectionAction,
   ConsentAction,

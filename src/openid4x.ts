@@ -201,6 +201,74 @@ export interface VPTokenResult {
   response_code?: string;
 }
 
+// ---------------------------------------------------------------------------
+// OID4VCI flow start params — the protocol-specific payload inside
+// FlowStartParams.params for OID4VCI flows.
+// ---------------------------------------------------------------------------
+
+/**
+ * OID4VCI-specific parameters for wmp.flow.start.
+ * Passed as the `params` field of FlowStartParams when flow_type = "oid4vci".
+ *
+ * Client attestation fields support draft-ietf-oauth-attestation-based-client-auth-04:
+ * - `client_attestation`: WIA JWT obtained from /wallet-provider/wia/generate
+ * - `client_attestation_pop`: PoP JWT signed by the wallet instance key (aud = AS URL)
+ *
+ * The instance key is held client-side in passkey-PRF-encrypted private data.
+ * The backend forwards these as HTTP headers — it never touches the instance key.
+ */
+export interface OID4VCIFlowParams {
+  /** Credential offer URI (openid-credential-offer://...) */
+  offer?: string;
+  /** Credential offer URI by reference (https://...) */
+  credential_offer_uri?: string;
+  /** OAuth redirect URI for authorization code flow */
+  redirect_uri?: string;
+
+  // --- Client attestation (draft-ietf-oauth-attestation-based-client-auth-04) ---
+
+  /** WIA JWT (typ: oauth-client-attestation+jwt) obtained from wallet provider */
+  client_attestation?: string;
+  /** PoP JWT (typ: oauth-client-attestation-pop+jwt) signed by wallet instance key */
+  client_attestation_pop?: string;
+
+  // --- Resumption fields (same-tab redirect flow) ---
+
+  /** Authorization code from OAuth redirect */
+  auth_code?: string;
+  /** PKCE code verifier (saved by client before redirect) */
+  code_verifier?: string;
+}
+
+/**
+ * OID4VP-specific parameters for wmp.flow.start.
+ * Passed as the `params` field of FlowStartParams when flow_type = "oid4vp".
+ */
+export interface OID4VPFlowParams {
+  /** Request URI (openid4vp://...) */
+  request_uri?: string;
+  /** Request URI by reference (https://...) */
+  request_uri_ref?: string;
+}
+
+/**
+ * Helper to build WMP FlowStartParams for an OID4VCI flow with attestation.
+ */
+export function buildVCIFlowStart(
+  sessionId: string,
+  flowId: string,
+  params: OID4VCIFlowParams,
+  timeout?: number,
+): FlowStartParams {
+  return {
+    wmp: { version: "1.0", session_id: sessionId },
+    flow_type: OID4FlowType.OID4VCI,
+    flow_id: flowId,
+    params,
+    timeout,
+  };
+}
+
 /**
  * TransactionData represents a single transaction data object from
  * the verifier's OID4VP authorization request (TS12/SCA).
