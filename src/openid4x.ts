@@ -24,7 +24,7 @@ import type {
   ResolveHandler,
 } from "./profile.js";
 import { WMPError } from "./jsonrpc.js";
-import { ErrorCode } from "./types.js";
+import { ErrorCode, VERSION } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Credential format constants — aligned with wallet-common VerifiableCredentialFormat
@@ -250,11 +250,8 @@ export interface ClientAttestationProvider {
  * The instance key is held client-side (never on the backend).
  * The backend forwards these as HTTP headers without modification.
  */
-export interface OID4VCIFlowParams {
-  /** Credential offer URI (openid-credential-offer://...) */
-  offer?: string;
-  /** Credential offer URI by reference (https://...) */
-  credential_offer_uri?: string;
+/** Common fields shared by all OID4VCI flow param variants. */
+interface OID4VCIFlowParamsBase {
   /** OAuth redirect URI for authorization code flow */
   redirect_uri?: string;
 
@@ -272,6 +269,28 @@ export interface OID4VCIFlowParams {
   /** PKCE code verifier (saved by client before redirect) */
   code_verifier?: string;
 }
+
+/** OID4VCI params with an inline credential offer. */
+export interface OID4VCIFlowParamsWithOffer extends OID4VCIFlowParamsBase {
+  /** Credential offer URI (openid-credential-offer://...) */
+  offer: string;
+  credential_offer_uri?: never;
+}
+
+/** OID4VCI params with a credential offer by reference. */
+export interface OID4VCIFlowParamsWithURI extends OID4VCIFlowParamsBase {
+  offer?: never;
+  /** Credential offer URI by reference (https://...) */
+  credential_offer_uri: string;
+}
+
+/**
+ * OID4VCI-specific parameters for wmp.flow.start.
+ * Passed as the `params` field of FlowStartParams when flow_type = "oid4vci".
+ *
+ * Exactly one of `offer` or `credential_offer_uri` must be provided.
+ */
+export type OID4VCIFlowParams = OID4VCIFlowParamsWithOffer | OID4VCIFlowParamsWithURI;
 
 /**
  * OID4VP-specific parameters for wmp.flow.start.
@@ -295,7 +314,7 @@ export function buildVCIFlowStart(
   timeout?: number,
 ): FlowStartParams {
   return {
-    wmp: { version: "1.0", session_id: sessionId },
+    wmp: { version: VERSION, session_id: sessionId },
     flow_type: OID4FlowType.OID4VCI,
     flow_id: flowId,
     params,
