@@ -1,6 +1,7 @@
 # @sirosfoundation/wmp-js
 
 [![CI](https://github.com/sirosfoundation/wmp-js/actions/workflows/ci.yml/badge.svg)](https://github.com/sirosfoundation/wmp-js/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/sirosfoundation/wmp-js/badge)](https://scorecard.dev/viewer/?uri=github.com/sirosfoundation/wmp-js)
 [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue)](LICENSE)
 
 TypeScript implementation of the Wallet Messaging Protocol (WMP) — a JSON-RPC 2.0 protocol for bidirectional communication between wallet frontends and backend services.
