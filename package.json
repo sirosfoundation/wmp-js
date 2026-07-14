@@ -1,6 +1,6 @@
 {
   "name": "@sirosfoundation/wmp-js",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Wallet Messaging Protocol (WMP) client library — JSON-RPC 2.0 over WebSocket and HTTP+SSE",
   "type": "module",
   "main": "dist/index.js",
