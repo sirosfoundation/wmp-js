@@ -207,15 +207,48 @@ export interface VPTokenResult {
 // ---------------------------------------------------------------------------
 
 /**
+ * Client attestation credentials (WIA + PoP) for issuer authentication.
+ * Produced by a {@link ClientAttestationProvider}.
+ */
+export interface ClientAttestation {
+  /** WIA JWT (typ: oauth-client-attestation+jwt) */
+  client_attestation: string;
+  /** PoP JWT (typ: oauth-client-attestation-pop+jwt) signed by wallet instance key */
+  client_attestation_pop: string;
+}
+
+/**
+ * Provider interface for obtaining OAuth client attestation credentials.
+ *
+ * Callers implement this to decouple wmp-js from any specific wallet backend.
+ * The provider is responsible for:
+ * 1. Obtaining a WIA JWT from the wallet provider (implementation-defined)
+ * 2. Signing the PoP JWT with the wallet instance key (aud = issuer AS URL)
+ *
+ * Example implementations:
+ * - SIROS: calls /wallet-provider/wia/generate, signs PoP with passkey-PRF key
+ * - EUDI: calls the PID provider's WIA endpoint, signs PoP with device key
+ * - Test: returns static test JWTs
+ */
+export interface ClientAttestationProvider {
+  /**
+   * Get attestation credentials for a specific issuer.
+   * @param audience - The issuer's AS URL (used as PoP aud claim)
+   * @returns WIA + PoP JWTs, or null if attestation is not available/required
+   */
+  getAttestation(audience: string): Promise<ClientAttestation | null>;
+}
+
+/**
  * OID4VCI-specific parameters for wmp.flow.start.
  * Passed as the `params` field of FlowStartParams when flow_type = "oid4vci".
  *
  * Client attestation fields support draft-ietf-oauth-attestation-based-client-auth-04:
- * - `client_attestation`: WIA JWT obtained from /wallet-provider/wia/generate
+ * - `client_attestation`: WIA JWT from the provider
  * - `client_attestation_pop`: PoP JWT signed by the wallet instance key (aud = AS URL)
  *
- * The instance key is held client-side in passkey-PRF-encrypted private data.
- * The backend forwards these as HTTP headers — it never touches the instance key.
+ * The instance key is held client-side (never on the backend).
+ * The backend forwards these as HTTP headers without modification.
  */
 export interface OID4VCIFlowParams {
   /** Credential offer URI (openid-credential-offer://...) */
@@ -227,7 +260,7 @@ export interface OID4VCIFlowParams {
 
   // --- Client attestation (draft-ietf-oauth-attestation-based-client-auth-04) ---
 
-  /** WIA JWT (typ: oauth-client-attestation+jwt) obtained from wallet provider */
+  /** WIA JWT (typ: oauth-client-attestation+jwt) obtained via ClientAttestationProvider */
   client_attestation?: string;
   /** PoP JWT (typ: oauth-client-attestation-pop+jwt) signed by wallet instance key */
   client_attestation_pop?: string;
@@ -252,7 +285,8 @@ export interface OID4VPFlowParams {
 }
 
 /**
- * Helper to build WMP FlowStartParams for an OID4VCI flow with attestation.
+ * Helper to build WMP FlowStartParams for an OID4VCI flow.
+ * If attestation is provided, it is included in the params.
  */
 export function buildVCIFlowStart(
   sessionId: string,
@@ -266,6 +300,29 @@ export function buildVCIFlowStart(
     flow_id: flowId,
     params,
     timeout,
+  };
+}
+
+/**
+ * Helper to build VCI flow params with attestation from a provider.
+ * Calls the provider to obtain WIA + PoP, then merges into the params.
+ *
+ * @param provider - The attestation provider (caller-supplied)
+ * @param audience - The issuer's AS URL for PoP audience binding
+ * @param params - Base OID4VCI flow params (offer, redirect_uri, etc.)
+ * @returns params with attestation fields populated (or unchanged if provider returns null)
+ */
+export async function withAttestation(
+  provider: ClientAttestationProvider,
+  audience: string,
+  params: OID4VCIFlowParams,
+): Promise<OID4VCIFlowParams> {
+  const attestation = await provider.getAttestation(audience);
+  if (!attestation) return params;
+  return {
+    ...params,
+    client_attestation: attestation.client_attestation,
+    client_attestation_pop: attestation.client_attestation_pop,
   };
 }
 
