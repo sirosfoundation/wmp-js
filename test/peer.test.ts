@@ -422,4 +422,55 @@ describe("Peer", () => {
     expect(handler.onCapabilityList).toHaveBeenCalled();
     expect(transport.sent).toHaveLength(1);
   });
+
+  it("returns method-not-found for unhandled session.resume", async () => {
+    const transport = new MockTransport();
+    new Peer(transport); // no handler methods defined
+
+    transport.receive(
+      createRequest(Method.SessionResume, {
+        wmp: { version: "0.1" },
+        session_id: "ses-1",
+        resumption_token: "tok",
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(transport.sent).toHaveLength(1);
+    const resp = transport.sent[0] as { error: { code: number } };
+    expect(resp.error.code).toBe(ErrorCode.MethodNotFound);
+  });
+
+  it("returns method-not-found for unhandled message.poll", async () => {
+    const transport = new MockTransport();
+    new Peer(transport);
+
+    transport.receive(
+      createRequest(Method.MessagePoll, {
+        wmp: { version: "0.1" },
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(transport.sent).toHaveLength(1);
+    const resp = transport.sent[0] as { error: { code: number } };
+    expect(resp.error.code).toBe(ErrorCode.MethodNotFound);
+  });
+
+  it("returns method-not-found for unhandled capability.update", async () => {
+    const transport = new MockTransport();
+    new Peer(transport);
+
+    transport.receive(
+      createRequest(Method.CapabilityUpdate, {
+        wmp: { version: "0.1" },
+        add: {},
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(transport.sent).toHaveLength(1);
+    const resp = transport.sent[0] as { error: { code: number } };
+    expect(resp.error.code).toBe(ErrorCode.MethodNotFound);
+  });
 });
