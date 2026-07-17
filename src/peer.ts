@@ -31,8 +31,20 @@ import {
   type Metadata,
   type SessionCreateParams,
   type SessionCreateResult,
+  type SessionResumeParams,
   type SessionResumeResult,
   type SessionCloseParams,
+  type SessionAuthenticateParams,
+  type SessionAuthenticateResult,
+  type MessageDeliverParams,
+  type MessageAckParams,
+  type MessagePollParams,
+  type MessagePollResult,
+  type MessageStatusParams,
+  type CapabilityUpdateParams,
+  type CapabilityUpdateResult,
+  type CapabilityListParams,
+  type CapabilityListResult,
   type FlowStartParams,
   type FlowStartResult,
   type FlowProgressParams,
@@ -60,14 +72,31 @@ import {
  * All methods are optional — unimplemented methods return "method not found".
  */
 export interface Handler {
+  // Session lifecycle
   onSessionCreate?(params: SessionCreateParams): Promise<SessionCreateResult>;
+  onSessionResume?(params: SessionResumeParams): Promise<SessionResumeResult>;
   onSessionClose?(params: SessionCloseParams): void;
+  onSessionAuthenticate?(params: SessionAuthenticateParams): Promise<SessionAuthenticateResult>;
+
+  // Message delivery
+  onMessageDeliver?(params: MessageDeliverParams): void;
+  onMessageAck?(params: MessageAckParams): void;
+  onMessagePoll?(params: MessagePollParams): Promise<MessagePollResult>;
+  onMessageStatus?(params: MessageStatusParams): void;
+
+  // Capability negotiation
+  onCapabilityUpdate?(params: CapabilityUpdateParams): Promise<CapabilityUpdateResult>;
+  onCapabilityList?(params: CapabilityListParams): Promise<CapabilityListResult>;
+
+  // Structured flows
   onFlowStart?(params: FlowStartParams): Promise<FlowStartResult>;
   onFlowProgress?(params: FlowProgressParams): void;
   onFlowAction?(params: FlowActionParams): Promise<FlowActionResult>;
   onFlowComplete?(params: FlowCompleteParams): void;
   onFlowError?(params: FlowErrorParams): void;
   onFlowCancel?(params: FlowCancelParams): Promise<FlowCancelResult>;
+
+  // Metadata resolution
   onResolve?(params: ResolveParams): Promise<ResolveResult>;
 }
 
@@ -435,11 +464,61 @@ export class Peer implements PeerContext {
         }
         break;
 
+      case Method.SessionResume:
+        if (this.handler.onSessionResume) {
+          return this.handler.onSessionResume(p);
+        }
+        break;
+
       case Method.SessionClose:
         if (this.handler.onSessionClose) {
           this.handler.onSessionClose(p);
         }
         return undefined;
+
+      case Method.SessionAuthenticate:
+        if (this.handler.onSessionAuthenticate) {
+          return this.handler.onSessionAuthenticate(p);
+        }
+        break;
+
+      // Messages
+      case Method.MessageDeliver:
+        if (this.handler.onMessageDeliver) {
+          this.handler.onMessageDeliver(p);
+        }
+        return undefined;
+
+      case Method.MessageAck:
+        if (this.handler.onMessageAck) {
+          this.handler.onMessageAck(p);
+        }
+        return undefined;
+
+      case Method.MessagePoll:
+        if (this.handler.onMessagePoll) {
+          return this.handler.onMessagePoll(p);
+        }
+        break;
+
+      case Method.MessageStatus:
+        if (this.handler.onMessageStatus) {
+          this.handler.onMessageStatus(p);
+        }
+        return undefined;
+
+      // Capabilities
+      case Method.CapabilityUpdate:
+        if (this.handler.onCapabilityUpdate) {
+          return this.handler.onCapabilityUpdate(p);
+        }
+        break;
+
+      case Method.CapabilityList:
+        if (this.handler.onCapabilityList) {
+          return this.handler.onCapabilityList(p);
+        }
+        break;
 
       // Flows — delegate to profile FlowHandlers first, then handler.
       case Method.FlowStart: {

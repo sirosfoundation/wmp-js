@@ -127,8 +127,11 @@ export const ErrorCode = {
 export interface AuthObject {
   type: string;
   token?: string;
+  proof?: string;
+  challenge?: string;
   signature?: string;
   x5c?: string[];
+  did_auth?: unknown;
   [key: string]: unknown;
 }
 
@@ -184,15 +187,13 @@ export interface SessionCloseParams {
 
 export interface SessionAuthenticateParams {
   wmp: Metadata;
-  type: string;
-  token?: string;
-  response?: string;
-  [key: string]: unknown;
+  auth: AuthObject;
 }
 
 export interface SessionAuthenticateResult {
   wmp: Metadata;
   authenticated: boolean;
+  identity?: string;
 }
 
 // Close reason constants.

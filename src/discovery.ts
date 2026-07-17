@@ -8,6 +8,9 @@ export interface WellKnownConfig {
   endpoints: Record<string, string>;
   security_modes: string[];
   capabilities?: Record<string, unknown>;
+  accepted_schemes?: string[];
+  mls_key_packages?: string;
+  relay?: string;
   identity_providers?: string[];
   trust_frameworks?: string[];
 }
