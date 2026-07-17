@@ -21,6 +21,8 @@ export interface Metadata {
   identity_assertions?: IdentityAssertion[];
   relay_chain?: RelayEntry[];
   trace_id?: string;
+  sender_delegate?: SenderDelegate;
+  deliver_after?: string;
 }
 
 export interface IdentityAssertion {
@@ -52,6 +54,19 @@ export interface RelayEntry {
   timestamp_token?: string;
   signature?: string;
   service_class?: string;
+}
+
+export interface SenderDelegate {
+  id: string;
+  identity_assertions?: IdentityAssertion[];
+  authorization?: DelegateAuthorization;
+}
+
+export interface DelegateAuthorization {
+  type: string;
+  credential?: string;
+  scope?: string[];
+  valid_until?: string;
 }
 
 export interface SecurityMode {
@@ -118,6 +133,10 @@ export const ErrorCode = {
   IdentityAssertionInvalid: -31012,
   VersionNotSupported: -31013,
   QueueFull: -31014,
+  DelegationInvalid: -31015,
+  ConsignmentModeUnsupported: -31016,
+  AssuranceLevelUnsupported: -31017,
+  PolicyUnsupported: -31018,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -214,6 +233,12 @@ export interface MessageDeliverParams {
   content_type?: string;
   body?: unknown;
   ciphertext?: string;
+  reply_to?: string;
+  in_reply_to?: string;
+  message_type?: string;
+  consignment_mode?: string;
+  recipient_assurance_level?: string;
+  applicable_policies?: string[];
 }
 
 export interface MessageAckParams {
@@ -245,6 +270,18 @@ export const AckStatus = {
   Read: "read",
   Processed: "processed",
   Failed: "failed",
+} as const;
+
+export const ConsignmentMode = {
+  Basic: "basic",
+  Consented: "consented",
+  ConsentedSigned: "consented_signed",
+} as const;
+
+export const AssuranceLevel = {
+  Low: "low",
+  Substantial: "substantial",
+  High: "high",
 } as const;
 
 // ---------------------------------------------------------------------------

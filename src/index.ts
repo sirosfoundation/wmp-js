@@ -10,6 +10,8 @@ export {
   FlowType,
   CloseReason,
   AckStatus,
+  ConsignmentMode,
+  AssuranceLevel,
   CancelReason,
   ResolveType,
   ServiceClass,
@@ -20,6 +22,8 @@ export type {
   IdentityAssertion,
   TrustHint,
   RelayEntry,
+  SenderDelegate,
+  DelegateAuthorization,
   SecurityMode,
   Capabilities,
   AuthObject,
@@ -167,6 +171,17 @@ export type {
   OpenID4xConfig,
 } from "./openid4x.js";
 
+// Evidence (ERDS)
+export { EvidenceEvent, EventReasonCode } from "./evidence.js";
+export type {
+  EvidenceEventType,
+  EvidenceEventReason,
+  EvidenceIssuer,
+  ExternalSystem,
+  ExternalErds,
+  EvidenceNotifyParams,
+} from "./evidence.js";
+
 // Relay
 export { Relay } from "./relay.js";
 export type { RelayConfig, QueuedMessage } from "./relay.js";
@@ -178,6 +193,7 @@ export type { Session, SessionStore } from "./session-store.js";
 // Discovery
 export { extractDomain, discoverEndpoint } from "./discovery.js";
 export type { WellKnownConfig } from "./discovery.js";
+export type { ErdsMetadata, RecipientMetadata } from "./discovery.js";
 
 // Invitation
 export {
