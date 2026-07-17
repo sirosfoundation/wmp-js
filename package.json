@@ -36,7 +36,10 @@
     "url": "https://github.com/sirosfoundation/wmp-js.git"
   },
   "dependencies": {
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.2.0",
     "ajv": "^8.20.0",
-    "ajv-formats": "^3.0.1"
+    "ajv-formats": "^3.0.1",
+    "ts-mls": "^1.6.2"
   }
 }

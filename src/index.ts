@@ -106,6 +106,8 @@ export {
   NoopMLSHandler,
   NoopMLSProvider,
 } from "./mls.js";
+export { TsMlsProvider } from "./mls-provider.js";
+export type { TsMlsProviderOptions } from "./mls-provider.js";
 export type {
   MLSMethodName,
   GroupCreateParams,
@@ -168,6 +170,10 @@ export type {
 // Relay
 export { Relay } from "./relay.js";
 export type { RelayConfig, QueuedMessage } from "./relay.js";
+
+// Session store (server-side)
+export { MemorySessionStore } from "./session-store.js";
+export type { Session, SessionStore } from "./session-store.js";
 
 // Discovery
 export { extractDomain, discoverEndpoint } from "./discovery.js";
