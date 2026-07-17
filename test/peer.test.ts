@@ -3,7 +3,18 @@ import { Peer, type Handler } from "../src/peer.js";
 import type { Transport, TransportEvents, TransportEventName } from "../src/transport.js";
 import type { Message } from "../src/jsonrpc.js";
 import { createResponse, createRequest, createNotification } from "../src/jsonrpc.js";
-import { Method, ErrorCode, type FlowStartParams, type FlowProgressParams } from "../src/types.js";
+import {
+  Method,
+  ErrorCode,
+  type FlowStartParams,
+  type FlowProgressParams,
+  type SessionCreateParams,
+  type SessionResumeParams,
+  type SessionAuthenticateParams,
+  type MessagePollParams,
+  type CapabilityUpdateParams,
+  type CapabilityListParams,
+} from "../src/types.js";
 
 // ---------------------------------------------------------------------------
 // Mock transport — in-memory, synchronous
@@ -231,5 +242,235 @@ describe("Peer", () => {
     const msg = transport.sent[0] as { id?: string; method: string };
     expect(msg.id).toBeUndefined();
     expect(msg.method).toBe(Method.FlowProgress);
+  });
+
+  // -------------------------------------------------------------------------
+  // Tests for newly-added dispatch paths (alignment with go-wmp)
+  // -------------------------------------------------------------------------
+
+  it("dispatches session.resume to handler", async () => {
+    const transport = new MockTransport();
+    const handler: Handler = {
+      onSessionResume: vi.fn(async (p: SessionResumeParams) => ({
+        wmp: { version: "0.1", session_id: p.session_id },
+        resumed: true,
+        missed_messages: 0,
+        security: { mode: "tls" },
+      })),
+    };
+    new Peer(transport, { handler });
+
+    transport.receive(
+      createRequest(Method.SessionResume, {
+        wmp: { version: "0.1" },
+        session_id: "ses-1",
+        resumption_token: "tok-1",
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler.onSessionResume).toHaveBeenCalled();
+    expect(transport.sent).toHaveLength(1);
+    expect((transport.sent[0] as { result: { resumed: boolean } }).result.resumed).toBe(true);
+  });
+
+  it("dispatches session.authenticate to handler", async () => {
+    const transport = new MockTransport();
+    const handler: Handler = {
+      onSessionAuthenticate: vi.fn(async () => ({
+        wmp: { version: "0.1" },
+        authenticated: true,
+        identity: "did:web:example.com",
+      })),
+    };
+    new Peer(transport, { handler });
+
+    transport.receive(
+      createRequest(Method.SessionAuthenticate, {
+        wmp: { version: "0.1" },
+        auth: { type: "bearer", token: "tok" },
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler.onSessionAuthenticate).toHaveBeenCalled();
+    const resp = transport.sent[0] as { result: { authenticated: boolean } };
+    expect(resp.result.authenticated).toBe(true);
+  });
+
+  it("dispatches message.deliver notification to handler", async () => {
+    const transport = new MockTransport();
+    const handler: Handler = {
+      onMessageDeliver: vi.fn(),
+    };
+    new Peer(transport, { handler });
+
+    transport.receive(
+      createNotification(Method.MessageDeliver, {
+        wmp: { version: "0.1", session_id: "ses-1" },
+        content_type: "text/plain",
+        body: "hello",
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler.onMessageDeliver).toHaveBeenCalled();
+    expect(transport.sent).toHaveLength(0); // notification, no response
+  });
+
+  it("dispatches message.ack notification to handler", async () => {
+    const transport = new MockTransport();
+    const handler: Handler = {
+      onMessageAck: vi.fn(),
+    };
+    new Peer(transport, { handler });
+
+    transport.receive(
+      createNotification(Method.MessageAck, {
+        wmp: { version: "0.1" },
+        message_ids: ["m1"],
+        status: "received",
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler.onMessageAck).toHaveBeenCalled();
+  });
+
+  it("dispatches message.poll request to handler", async () => {
+    const transport = new MockTransport();
+    const handler: Handler = {
+      onMessagePoll: vi.fn(async () => ({
+        wmp: { version: "0.1" },
+        messages: [{ id: "m1" }],
+      })),
+    };
+    new Peer(transport, { handler });
+
+    transport.receive(
+      createRequest(Method.MessagePoll, {
+        wmp: { version: "0.1" },
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler.onMessagePoll).toHaveBeenCalled();
+    const resp = transport.sent[0] as { result: { messages: unknown[] } };
+    expect(resp.result.messages).toHaveLength(1);
+  });
+
+  it("dispatches message.status notification to handler", async () => {
+    const transport = new MockTransport();
+    const handler: Handler = {
+      onMessageStatus: vi.fn(),
+    };
+    new Peer(transport, { handler });
+
+    transport.receive(
+      createNotification(Method.MessageStatus, {
+        wmp: { version: "0.1" },
+        message_id: "m1",
+        status: "delivered",
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler.onMessageStatus).toHaveBeenCalled();
+  });
+
+  it("dispatches capability.update request to handler", async () => {
+    const transport = new MockTransport();
+    const handler: Handler = {
+      onCapabilityUpdate: vi.fn(async () => ({
+        wmp: { version: "0.1" },
+        capabilities: { messaging: {} },
+        security: { mode: "tls" },
+      })),
+    };
+    new Peer(transport, { handler });
+
+    transport.receive(
+      createRequest(Method.CapabilityUpdate, {
+        wmp: { version: "0.1" },
+        add: { relay: {} },
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler.onCapabilityUpdate).toHaveBeenCalled();
+    expect(transport.sent).toHaveLength(1);
+  });
+
+  it("dispatches capability.list request to handler", async () => {
+    const transport = new MockTransport();
+    const handler: Handler = {
+      onCapabilityList: vi.fn(async () => ({
+        wmp: { version: "0.1" },
+        capabilities: {},
+        security: { mode: "tls" },
+      })),
+    };
+    new Peer(transport, { handler });
+
+    transport.receive(
+      createRequest(Method.CapabilityList, {
+        wmp: { version: "0.1" },
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(handler.onCapabilityList).toHaveBeenCalled();
+    expect(transport.sent).toHaveLength(1);
+  });
+
+  it("returns method-not-found for unhandled session.resume", async () => {
+    const transport = new MockTransport();
+    new Peer(transport); // no handler methods defined
+
+    transport.receive(
+      createRequest(Method.SessionResume, {
+        wmp: { version: "0.1" },
+        session_id: "ses-1",
+        resumption_token: "tok",
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(transport.sent).toHaveLength(1);
+    const resp = transport.sent[0] as { error: { code: number } };
+    expect(resp.error.code).toBe(ErrorCode.MethodNotFound);
+  });
+
+  it("returns method-not-found for unhandled message.poll", async () => {
+    const transport = new MockTransport();
+    new Peer(transport);
+
+    transport.receive(
+      createRequest(Method.MessagePoll, {
+        wmp: { version: "0.1" },
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(transport.sent).toHaveLength(1);
+    const resp = transport.sent[0] as { error: { code: number } };
+    expect(resp.error.code).toBe(ErrorCode.MethodNotFound);
+  });
+
+  it("returns method-not-found for unhandled capability.update", async () => {
+    const transport = new MockTransport();
+    new Peer(transport);
+
+    transport.receive(
+      createRequest(Method.CapabilityUpdate, {
+        wmp: { version: "0.1" },
+        add: {},
+      }) as Message,
+    );
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(transport.sent).toHaveLength(1);
+    const resp = transport.sent[0] as { error: { code: number } };
+    expect(resp.error.code).toBe(ErrorCode.MethodNotFound);
   });
 });
