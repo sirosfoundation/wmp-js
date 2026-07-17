@@ -13,6 +13,25 @@ export interface WellKnownConfig {
   relay?: string;
   identity_providers?: string[];
   trust_frameworks?: string[];
+  erds?: ErdsMetadata;
+  recipient_metadata?: RecipientMetadata;
+}
+
+export interface ErdsMetadata {
+  consignment_modes?: string[];
+  assurance_levels?: string[];
+  supported_policies?: string[];
+  delegation?: boolean;
+  evidence_repository?: string;
+  evidence_retention?: string;
+  scheduled_delivery?: boolean;
+}
+
+export interface RecipientMetadata {
+  accepted_content_types?: string[];
+  max_message_size?: number;
+  consignment_preferences?: string;
+  encryption_required?: boolean;
 }
 
 /**
