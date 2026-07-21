@@ -76,6 +76,8 @@ class Emitter {
 export interface WebSocketTransportOptions {
   /** WebSocket subprotocol. Default: "wmp.v1" */
   protocols?: string | string[];
+  /** Allow unencrypted ws:// URLs. Default: false. */
+  allowInsecure?: boolean;
 }
 
 /**
@@ -88,6 +90,24 @@ export class WebSocketTransport extends Emitter implements Transport {
   constructor(url: string, opts?: WebSocketTransportOptions) {
     super();
     const protocols = opts?.protocols ?? "wmp.v1";
+
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error("Invalid WebSocket URL");
+    }
+    if (parsed.protocol !== "wss:" && parsed.protocol !== "ws:") {
+      throw new Error(
+        `Invalid WebSocket URL scheme: ${parsed.protocol}. Use ws:// or wss://`,
+      );
+    }
+    if (parsed.protocol === "ws:" && !opts?.allowInsecure) {
+      throw new Error(
+        "Unencrypted ws:// WebSocket URLs are not allowed unless allowInsecure is true",
+      );
+    }
+
     this.ws = new WebSocket(url, protocols);
 
     this.ws.onopen = () => this.emit("open");
@@ -99,7 +119,7 @@ export class WebSocketTransport extends Emitter implements Transport {
     };
     this.ws.onmessage = (ev) => {
       try {
-        const msg = decodeMessage(String(ev.data));
+        const msg = decodeMessage(String(ev.data), { maxSize: 4 * 1024 * 1024 });
         this.emit("message", msg);
       } catch (err) {
         this.emit("error", err instanceof Error ? err : new Error(String(err)));
@@ -199,6 +219,21 @@ export class HttpSseTransport extends Emitter implements Transport {
    * Separated from the constructor so callers can register listeners first.
    */
   connectSSE(lastEventId?: string): void {
+    this.eventSource?.close();
+    this.eventSource = null;
+
+    this.setupEventSource(lastEventId);
+  }
+
+  /**
+   * Reconnect the SSE stream with the current authorization/session state.
+   * Useful after calling setAuthorization.
+   */
+  reconnectSSE(lastEventId?: string): void {
+    this.connectSSE(lastEventId);
+  }
+
+  private setupEventSource(lastEventId?: string): void {
     // Build the SSE URL with session_id (required for tenant routing)
     // and optional lastEventId for event replay.
     let url = this.eventsUrl;
@@ -223,7 +258,7 @@ export class HttpSseTransport extends Emitter implements Transport {
     // WMP events use the "wmp" event type per the spec.
     this.eventSource.addEventListener("wmp", (ev) => {
       try {
-        const msg = decodeMessage((ev as MessageEvent).data);
+        const msg = decodeMessage((ev as MessageEvent).data, { maxSize: 4 * 1024 * 1024 });
         this.emit("message", msg);
       } catch (err) {
         this.emit(
@@ -236,7 +271,7 @@ export class HttpSseTransport extends Emitter implements Transport {
     // Also handle default "message" events for compatibility.
     this.eventSource.onmessage = (ev) => {
       try {
-        const msg = decodeMessage(ev.data);
+        const msg = decodeMessage(ev.data, { maxSize: 4 * 1024 * 1024 });
         this.emit("message", msg);
       } catch (err) {
         this.emit(

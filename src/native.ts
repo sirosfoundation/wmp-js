@@ -45,11 +45,15 @@ class Emitter {
 // Stdio transport (NDJSON over stdin/stdout)
 // ---------------------------------------------------------------------------
 
+const DEFAULT_MAX_LINE_LENGTH = 1024 * 1024; // 1 MB
+
 export interface StdioTransportOptions {
   /** Readable stream for incoming messages. Default: process.stdin */
   input?: Readable;
   /** Writable stream for outgoing messages. Default: process.stdout */
   output?: Writable;
+  /** Maximum line length in characters before the transport is closed. Default: 1 MB. */
+  maxLineLength?: number;
 }
 
 /**
@@ -65,11 +69,13 @@ export class StdioTransport extends Emitter implements Transport {
   private output: Writable;
   private buffer = "";
   private closed = false;
+  private maxLineLength: number;
 
   constructor(opts?: StdioTransportOptions) {
     super();
     this.input = opts?.input ?? process.stdin;
     this.output = opts?.output ?? process.stdout;
+    this.maxLineLength = opts?.maxLineLength ?? DEFAULT_MAX_LINE_LENGTH;
 
     this.input.setEncoding("utf8");
     this.input.on("data", (chunk: string) => this.onData(chunk));
@@ -82,6 +88,16 @@ export class StdioTransport extends Emitter implements Transport {
 
   private onData(chunk: string): void {
     this.buffer += chunk;
+
+    if (this.buffer.length > this.maxLineLength) {
+      this.emit(
+        "error",
+        new Error("Native transport line exceeds maximum length"),
+      );
+      this.close();
+      return;
+    }
+
     // Split on newlines — each line is a complete JSON-RPC message
     const lines = this.buffer.split("\n");
     // Last element is incomplete (may be empty string if chunk ended with \n)
@@ -148,14 +164,21 @@ export class StdioTransport extends Emitter implements Transport {
  *   const sock = connect("/tmp/wmp.sock");
  *   const transport = new UnixSocketTransport(sock);
  */
+export interface UnixSocketTransportOptions {
+  /** Maximum line length in characters before the transport is closed. Default: 1 MB. */
+  maxLineLength?: number;
+}
+
 export class UnixSocketTransport extends Emitter implements Transport {
   private socket: Socket;
   private buffer = "";
   private closed = false;
+  private maxLineLength: number;
 
-  constructor(socket: Socket) {
+  constructor(socket: Socket, opts?: UnixSocketTransportOptions) {
     super();
     this.socket = socket;
+    this.maxLineLength = opts?.maxLineLength ?? DEFAULT_MAX_LINE_LENGTH;
 
     this.socket.setEncoding("utf8");
     this.socket.on("connect", () => this.emit("open"));
@@ -172,6 +195,16 @@ export class UnixSocketTransport extends Emitter implements Transport {
 
   private onData(chunk: string): void {
     this.buffer += chunk;
+
+    if (this.buffer.length > this.maxLineLength) {
+      this.emit(
+        "error",
+        new Error("Native transport line exceeds maximum length"),
+      );
+      this.close();
+      return;
+    }
+
     const lines = this.buffer.split("\n");
     this.buffer = lines.pop()!;
 

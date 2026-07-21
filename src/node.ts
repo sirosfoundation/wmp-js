@@ -10,7 +10,10 @@ export * from "./index.js";
 
 // Native transports (Node.js only — stdio NDJSON, Unix sockets)
 export { StdioTransport, UnixSocketTransport } from "./native.js";
-export type { StdioTransportOptions } from "./native.js";
+export type {
+  StdioTransportOptions,
+  UnixSocketTransportOptions,
+} from "./native.js";
 
 // Schema validation (Node.js only — requires fs)
 export { createValidator } from "./schema.js";

@@ -18,17 +18,19 @@ describe("createRequest", () => {
     resetRequestIdCounter();
     const req = createRequest("wmp.session.create", { foo: 1 });
     expect(req.jsonrpc).toBe("2.0");
-    expect(req.id).toBe("req-1");
+    expect(req.id).toMatch(/^req-[A-Za-z0-9_-]+$/);
+    expect(req.id).toHaveLength(26); // "req-" + 22 base64url chars = 128 bits
     expect(req.method).toBe("wmp.session.create");
     expect(req.params).toEqual({ foo: 1 });
   });
 
-  it("increments IDs", () => {
+  it("generates unique IDs", () => {
     resetRequestIdCounter();
     const r1 = createRequest("a", {});
     const r2 = createRequest("b", {});
-    expect(r1.id).toBe("req-1");
-    expect(r2.id).toBe("req-2");
+    expect(r1.id).not.toBe(r2.id);
+    expect(r1.id).toMatch(/^req-/);
+    expect(r2.id).toMatch(/^req-/);
   });
 });
 

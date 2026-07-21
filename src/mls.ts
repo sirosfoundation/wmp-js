@@ -295,12 +295,28 @@ export class NoopMLSHandler implements MLSHandler {
   }
 }
 
+export interface NoopMLSProviderOptions {
+  /** Explicit opt-in required to use the plaintext TLS-only provider. */
+  explicitlyInsecure: true;
+}
+
 /**
  * NoopMLSProvider implements MLSProvider for TLS-only sessions.
  * Messages pass through unencrypted, relying on transport-level TLS.
+ *
+ * IMPORTANT: This provider does NOT perform encryption. It requires
+ * explicitlyInsecure: true to reduce the risk of accidental misuse.
  */
 export class NoopMLSProvider implements MLSProvider {
   private groups = new Map<string, { epoch: number }>();
+
+  constructor(opts: NoopMLSProviderOptions) {
+    if (!opts?.explicitlyInsecure) {
+      throw new Error(
+        "NoopMLSProvider performs no encryption; set explicitlyInsecure: true to opt in",
+      );
+    }
+  }
 
   async generateKeyPackage(cipherSuite: number): Promise<KeyPackage> {
     return {

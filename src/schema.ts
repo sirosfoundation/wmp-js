@@ -61,8 +61,9 @@ export interface Validator {
  * Create a schema validator by loading schemas from the filesystem.
  *
  * @param schemaDir Path to the wmp/schema directory containing the JSON Schema files.
+ * @param strict When true, unknown methods/responses are reported as validation errors.
  */
-export function createValidator(schemaDir: string): Validator {
+export function createValidator(schemaDir: string, strict = false): Validator {
   const ajv = new Ajv2020({
     strict: false,
     allErrors: true,
@@ -113,13 +114,21 @@ export function createValidator(schemaDir: string): Validator {
   return {
     validateMethod(method: string, message: unknown): ValidationError[] | null {
       const schema = METHOD_SCHEMAS[method];
-      if (!schema) return null; // No schema for this method.
+      if (!schema) {
+        return strict
+          ? [{ path: "/", message: `No schema defined for method ${method}` }]
+          : null;
+      }
       return validate(schema, message);
     },
 
     validateResponse(method: string, message: unknown): ValidationError[] | null {
       const schema = RESPONSE_SCHEMAS[method];
-      if (!schema) return null;
+      if (!schema) {
+        return strict
+          ? [{ path: "/", message: `No response schema defined for method ${method}` }]
+          : null;
+      }
       return validate(schema, message);
     },
 

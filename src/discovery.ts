@@ -62,8 +62,23 @@ export function extractDomain(identifier: string): string {
   }
   if (identifier.startsWith("did:web:")) {
     const rest = identifier.slice("did:web:".length);
-    const domain = rest.split(":")[0];
-    return decodeURIComponent(domain);
+    let domain: string;
+    try {
+      domain = decodeURIComponent(rest.split(":")[0]);
+    } catch {
+      return "";
+    }
+    // Reject empty, overly long, or malformed hostnames.
+    if (
+      !domain ||
+      domain.length > 253 ||
+      !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/i.test(
+        domain,
+      )
+    ) {
+      return "";
+    }
+    return domain;
   }
   return "";
 }
