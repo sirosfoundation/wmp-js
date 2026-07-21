@@ -10,9 +10,9 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { Peer, type Handler } from "../src/peer.js";
-import type { Transport, TransportEvents, TransportEventName } from "../src/transport.js";
-import { WMPError, type Message, type Request, type Response, type RPCError } from "../src/jsonrpc.js";
+import { WMPError, type Request, type Response, type RPCError } from "../src/jsonrpc.js";
 import { Method } from "../src/types.js";
+import { MockTransport } from "./mock-transport.js";
 
 // ---------------------------------------------------------------------------
 // Test vector types
@@ -54,41 +54,6 @@ function loadInteropVectors(): InteropVector[] {
   }
   const data = readFileSync(path, "utf8");
   return JSON.parse(data) as InteropVector[];
-}
-
-// ---------------------------------------------------------------------------
-// Mock transport — in-memory, synchronous
-// ---------------------------------------------------------------------------
-
-class MockTransport implements Transport {
-  private listeners = new Map<string, Set<(...args: unknown[]) => void>>();
-  sent: Message[] = [];
-  closed = false;
-
-  async send(msg: Message): Promise<void> {
-    this.sent.push(msg);
-  }
-
-  close(): void {
-    this.closed = true;
-  }
-
-  on<K extends TransportEventName>(event: K, listener: TransportEvents[K]): void {
-    let set = this.listeners.get(event);
-    if (!set) {
-      set = new Set();
-      this.listeners.set(event, set);
-    }
-    set.add(listener as (...args: unknown[]) => void);
-  }
-
-  off<K extends TransportEventName>(event: K, listener: TransportEvents[K]): void {
-    this.listeners.get(event)?.delete(listener as (...args: unknown[]) => void);
-  }
-
-  receive(msg: Message): void {
-    this.listeners.get("message")?.forEach((fn) => fn(msg));
-  }
 }
 
 // ---------------------------------------------------------------------------
