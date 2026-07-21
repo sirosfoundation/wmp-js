@@ -86,6 +86,26 @@ export interface DecodeOptions {
 const DEFAULT_MAX_SIZE = 4 * 1024 * 1024;
 const DEFAULT_MAX_DEPTH = 32;
 
+function parseJSONRPC(data: string, maxSize: number, maxDepth: number): unknown {
+  if (data.length > maxSize) {
+    throw new Error("JSON-RPC message exceeds maximum size");
+  }
+
+  try {
+    return JSON.parse(data, (_key, value) => {
+      if (value !== null && typeof value === "object") {
+        checkDepth(value, 1, maxDepth);
+      }
+      return value;
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("depth")) {
+      throw err;
+    }
+    throw new Error("Invalid JSON-RPC payload");
+  }
+}
+
 function checkDepth(value: unknown, depth: number, maxDepth: number): void {
   if (depth > maxDepth) {
     throw new Error("JSON-RPC message exceeds maximum nesting depth");
@@ -106,24 +126,7 @@ export function decodeMessage(data: string, opts?: DecodeOptions): Message {
   const maxSize = opts?.maxSize ?? DEFAULT_MAX_SIZE;
   const maxDepth = opts?.maxDepth ?? DEFAULT_MAX_DEPTH;
 
-  if (data.length > maxSize) {
-    throw new Error("JSON-RPC message exceeds maximum size");
-  }
-
-  let obj: unknown;
-  try {
-    obj = JSON.parse(data, (_key, value) => {
-      if (value !== null && typeof value === "object") {
-        checkDepth(value, 1, maxDepth);
-      }
-      return value;
-    });
-  } catch (err) {
-    if (err instanceof Error && err.message.includes("depth")) {
-      throw err;
-    }
-    throw new Error("Invalid JSON-RPC payload");
-  }
+  const obj = parseJSONRPC(data, maxSize, maxDepth);
 
   if (obj === null || typeof obj !== "object" || (obj as Message).jsonrpc !== "2.0") {
     throw new Error("Invalid JSON-RPC version");
@@ -136,24 +139,7 @@ export function decodeBatch(data: string, opts?: DecodeOptions): Message[] {
   const maxSize = opts?.maxSize ?? DEFAULT_MAX_SIZE;
   const maxDepth = opts?.maxDepth ?? DEFAULT_MAX_DEPTH;
 
-  if (data.length > maxSize) {
-    throw new Error("JSON-RPC message exceeds maximum size");
-  }
-
-  let obj: unknown;
-  try {
-    obj = JSON.parse(data, (_key, value) => {
-      if (value !== null && typeof value === "object") {
-        checkDepth(value, 1, maxDepth);
-      }
-      return value;
-    });
-  } catch (err) {
-    if (err instanceof Error && err.message.includes("depth")) {
-      throw err;
-    }
-    throw new Error("Invalid JSON-RPC payload");
-  }
+  const obj = parseJSONRPC(data, maxSize, maxDepth);
 
   if (Array.isArray(obj)) {
     return obj.map((item) => {
