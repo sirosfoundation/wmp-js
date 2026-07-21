@@ -3,7 +3,6 @@ import {
   decodeMessage,
   decodeBatch,
   createRequest,
-  WMPError,
 } from "../src/jsonrpc.js";
 import { Peer } from "../src/peer.js";
 import { WebSocketTransport } from "../src/transport.js";

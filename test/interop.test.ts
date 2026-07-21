@@ -12,7 +12,7 @@ import { resolve } from "node:path";
 import { Peer, type Handler } from "../src/peer.js";
 import type { Transport, TransportEvents, TransportEventName } from "../src/transport.js";
 import { WMPError, type Message, type Request, type Response, type RPCError } from "../src/jsonrpc.js";
-import { Method, ErrorCode } from "../src/types.js";
+import { Method } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
 // Test vector types
