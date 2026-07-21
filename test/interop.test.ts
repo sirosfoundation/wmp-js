@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { Peer, type Handler } from "../src/peer.js";
 import type { Transport, TransportEvents, TransportEventName } from "../src/transport.js";
@@ -42,7 +42,16 @@ interface InteropVector {
 }
 
 function loadInteropVectors(): InteropVector[] {
-  const path = resolve(__dirname, "../../wmp/vectors/interop.json");
+  const candidates = [
+    resolve(__dirname, "../../wmp/vectors/interop.json"),
+    resolve(process.cwd(), "../wmp/vectors/interop.json"),
+  ];
+  const path = candidates.find((p) => existsSync(p));
+  if (!path) {
+    throw new Error(
+      `interop.json not found; searched ${candidates.join(", ")}`
+    );
+  }
   const data = readFileSync(path, "utf8");
   return JSON.parse(data) as InteropVector[];
 }

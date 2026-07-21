@@ -6,16 +6,12 @@ import {
   WMPError,
 } from "../src/jsonrpc.js";
 import { Peer } from "../src/peer.js";
-import { WebSocketTransport, HttpSseTransport } from "../src/transport.js";
-import { StdioTransport, UnixSocketTransport } from "../src/native.js";
+import { WebSocketTransport } from "../src/transport.js";
+import { StdioTransport } from "../src/native.js";
 import { NoopMLSProvider } from "../src/mls.js";
-import {
-  createInvitation,
-  parseInvitationURI,
-  verifyInvitation,
-} from "../src/invitation.js";
+import { createInvitation, verifyInvitation } from "../src/invitation.js";
 import { extractDomain } from "../src/discovery.js";
-import { OpenID4xProfile, OID4FlowType } from "../src/openid4x.js";
+import { OpenID4xProfile } from "../src/openid4x.js";
 import { join } from "node:path";
 import { createValidator } from "../src/schema.js";
 
