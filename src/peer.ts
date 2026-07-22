@@ -217,6 +217,7 @@ export class Peer implements PeerContext {
     auth?: { type: string; token?: string; [key: string]: unknown };
     sender?: string;
     ttl?: number;
+    invitationNonce?: string;
   }): Promise<SessionCreateResult> {
     const wmp: Metadata = { version: VERSION, sender: opts.sender };
     const params: SessionCreateParams = {
@@ -226,6 +227,7 @@ export class Peer implements PeerContext {
       security: opts.security ?? { mode: "tls" },
       ttl: opts.ttl,
       auth: opts.auth,
+      invitation_nonce: opts.invitationNonce,
     };
     const result = await this.call<SessionCreateResult>(
       Method.SessionCreate,
