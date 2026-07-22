@@ -27,6 +27,7 @@ import {
   type FlowHandler,
   Registry,
 } from "./profile.js";
+import { type ValidationError } from "./schema.js";
 import {
   type Metadata,
   type SessionCreateParams,
@@ -119,6 +120,15 @@ export interface PeerOptions {
   callTimeout?: number;
   /** Handler for incoming method calls. */
   handler?: Handler;
+  /** Optional validator for incoming request parameters. */
+  validator?: {
+    validateMethod(method: string, params: unknown): ValidationError[] | null;
+  };
+  /** Optional authorization hook called before dispatching incoming requests/notifications. */
+  authorize?: (
+    method: string,
+    params: unknown,
+  ) => boolean | Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,11 +145,15 @@ export class Peer implements PeerContext {
   private negotiatedVersion?: string;
   private resumptionToken?: string;
   private closed = false;
+  private validator?: PeerOptions["validator"];
+  private authorize?: PeerOptions["authorize"];
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
     this.handler = opts?.handler ?? {};
     this.callTimeout = opts?.callTimeout ?? 30_000;
+    this.validator = opts?.validator;
+    this.authorize = opts?.authorize;
 
     // Wire up transport events.
     this.transport.on("message", (msg: Message) => this.dispatch(msg));
@@ -203,6 +217,7 @@ export class Peer implements PeerContext {
     auth?: { type: string; token?: string; [key: string]: unknown };
     sender?: string;
     ttl?: number;
+    invitationNonce?: string;
   }): Promise<SessionCreateResult> {
     const wmp: Metadata = { version: VERSION, sender: opts.sender };
     const params: SessionCreateParams = {
@@ -212,19 +227,27 @@ export class Peer implements PeerContext {
       security: opts.security ?? { mode: "tls" },
       ttl: opts.ttl,
       auth: opts.auth,
+      invitation_nonce: opts.invitationNonce,
     };
     const result = await this.call<SessionCreateResult>(
       Method.SessionCreate,
       params,
     );
-    if (result.wmp?.session_id) {
-      this.sessionId = result.wmp.session_id;
-      // Propagate session ID to transport for header/URL binding.
-      this.bindSessionToTransport(result.wmp.session_id);
+    if (!result.wmp?.session_id || typeof result.wmp.session_id !== "string") {
+      throw new WMPError(
+        ErrorCode.SessionNotFound,
+        "session.create response missing session_id",
+      );
     }
-    if (result.wmp?.version) {
-      this.negotiatedVersion = result.wmp.version;
+    if (result.wmp.version && result.wmp.version !== VERSION) {
+      throw new WMPError(
+        ErrorCode.VersionNotSupported,
+        `negotiated version ${result.wmp.version} is not supported`,
+      );
     }
+    this.sessionId = result.wmp.session_id;
+    this.bindSessionToTransport(result.wmp.session_id);
+    this.negotiatedVersion = result.wmp.version ?? VERSION;
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
@@ -431,12 +454,25 @@ export class Peer implements PeerContext {
   }
 
   private handleRequest(req: Request): void {
+    const dispatch = async () => {
+      if (this.authorize) {
+        const allowed = await this.authorize(req.method, req.params);
+        if (!allowed) {
+          throw new WMPError(
+            ErrorCode.NotAuthorized,
+            `Not authorized to call ${req.method}`,
+          );
+        }
+      }
+      return this.dispatchMethod(req.method, req.params);
+    };
+
     if (isNotification(req)) {
-      this.dispatchMethod(req.method, req.params).catch(() => {
+      dispatch().catch(() => {
         /* notifications get no error response */
       });
     } else {
-      this.dispatchMethod(req.method, req.params)
+      dispatch()
         .then((result) => {
           const resp = createResponse(req.id!, result);
           return this.transport.send(resp);
@@ -453,6 +489,17 @@ export class Peer implements PeerContext {
     method: string,
     params: unknown,
   ): Promise<unknown> {
+    if (this.validator) {
+      const errors = this.validator.validateMethod(method, params);
+      if (errors) {
+        const detail = errors.map((e) => `${e.path}: ${e.message}`).join("; ");
+        throw new WMPError(
+          ErrorCode.InvalidParams,
+          `Invalid params for ${method}: ${detail}`,
+        );
+      }
+    }
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- JSON-RPC params are untyped
     const p = params as any;
 
@@ -646,8 +693,12 @@ function toRPCError(err: unknown): RPCError {
   if (err instanceof WMPError) {
     return { code: err.code, message: err.message, data: err.data };
   }
+  // Sanitize unexpected internal errors to avoid leaking implementation details.
+  if (typeof console !== "undefined" && console.error) {
+    console.error("Peer handler internal error:", err);
+  }
   return {
     code: ErrorCode.InternalError,
-    message: err instanceof Error ? err.message : String(err),
+    message: "Internal error",
   };
 }

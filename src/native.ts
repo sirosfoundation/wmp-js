@@ -41,15 +41,64 @@ class Emitter {
   }
 }
 
+/** Accumulates incoming text, splits on newlines, and decodes JSON-RPC messages. */
+class LineBuffer {
+  private buffer = "";
+  private closed = false;
+
+  constructor(
+    private maxLineLength: number,
+    private onMessage: (msg: Message) => void,
+    private onError: (err: Error) => void,
+    private onClose: () => void,
+  ) {}
+
+  append(chunk: string): void {
+    if (this.closed) return;
+    this.buffer += chunk;
+
+    if (this.buffer.length > this.maxLineLength) {
+      this.onError(new Error("Native transport line exceeds maximum length"));
+      this.close();
+      return;
+    }
+
+    const lines = this.buffer.split("\n");
+    // Last element is incomplete (may be empty string if chunk ended with \n)
+    this.buffer = lines.pop()!;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const msg = decodeMessage(trimmed);
+        this.onMessage(msg);
+      } catch (err) {
+        this.onError(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.onClose();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Stdio transport (NDJSON over stdin/stdout)
 // ---------------------------------------------------------------------------
+
+const DEFAULT_MAX_LINE_LENGTH = 1024 * 1024; // 1 MB
 
 export interface StdioTransportOptions {
   /** Readable stream for incoming messages. Default: process.stdin */
   input?: Readable;
   /** Writable stream for outgoing messages. Default: process.stdout */
   output?: Writable;
+  /** Maximum line length in characters before the transport is closed. Default: 1 MB. */
+  maxLineLength?: number;
 }
 
 /**
@@ -63,40 +112,29 @@ export interface StdioTransportOptions {
 export class StdioTransport extends Emitter implements Transport {
   private input: Readable;
   private output: Writable;
-  private buffer = "";
   private closed = false;
+  private lineBuffer: LineBuffer;
 
   constructor(opts?: StdioTransportOptions) {
     super();
     this.input = opts?.input ?? process.stdin;
     this.output = opts?.output ?? process.stdout;
+    const maxLineLength = opts?.maxLineLength ?? DEFAULT_MAX_LINE_LENGTH;
+
+    this.lineBuffer = new LineBuffer(
+      maxLineLength,
+      (msg) => this.emit("message", msg),
+      (err) => this.emit("error", err),
+      () => this.onClose(),
+    );
 
     this.input.setEncoding("utf8");
-    this.input.on("data", (chunk: string) => this.onData(chunk));
-    this.input.on("end", () => this.onClose());
+    this.input.on("data", (chunk: string) => this.lineBuffer.append(chunk));
+    this.input.on("end", () => this.lineBuffer.close());
     this.input.on("error", (err: Error) => this.emit("error", err));
 
     // Emit open on next tick (stream is already connected)
     queueMicrotask(() => this.emit("open"));
-  }
-
-  private onData(chunk: string): void {
-    this.buffer += chunk;
-    // Split on newlines — each line is a complete JSON-RPC message
-    const lines = this.buffer.split("\n");
-    // Last element is incomplete (may be empty string if chunk ended with \n)
-    this.buffer = lines.pop()!;
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const msg = decodeMessage(trimmed);
-        this.emit("message", msg);
-      } catch (err) {
-        this.emit("error", err instanceof Error ? err : new Error(String(err)));
-      }
-    }
   }
 
   private onClose(): void {
@@ -148,42 +186,38 @@ export class StdioTransport extends Emitter implements Transport {
  *   const sock = connect("/tmp/wmp.sock");
  *   const transport = new UnixSocketTransport(sock);
  */
+export interface UnixSocketTransportOptions {
+  /** Maximum line length in characters before the transport is closed. Default: 1 MB. */
+  maxLineLength?: number;
+}
+
 export class UnixSocketTransport extends Emitter implements Transport {
   private socket: Socket;
-  private buffer = "";
   private closed = false;
+  private lineBuffer: LineBuffer;
 
-  constructor(socket: Socket) {
+  constructor(socket: Socket, opts?: UnixSocketTransportOptions) {
     super();
     this.socket = socket;
+    const maxLineLength = opts?.maxLineLength ?? DEFAULT_MAX_LINE_LENGTH;
+
+    this.lineBuffer = new LineBuffer(
+      maxLineLength,
+      (msg) => this.emit("message", msg),
+      (err) => this.emit("error", err),
+      () => this.onClose(),
+    );
 
     this.socket.setEncoding("utf8");
     this.socket.on("connect", () => this.emit("open"));
-    this.socket.on("data", (chunk: string) => this.onData(chunk));
-    this.socket.on("end", () => this.onClose());
-    this.socket.on("close", () => this.onClose());
+    this.socket.on("data", (chunk: string) => this.lineBuffer.append(chunk));
+    this.socket.on("end", () => this.lineBuffer.close());
+    this.socket.on("close", () => this.lineBuffer.close());
     this.socket.on("error", (err: Error) => this.emit("error", err));
 
     // If already connected, emit open
     if (!this.socket.connecting) {
       queueMicrotask(() => this.emit("open"));
-    }
-  }
-
-  private onData(chunk: string): void {
-    this.buffer += chunk;
-    const lines = this.buffer.split("\n");
-    this.buffer = lines.pop()!;
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const msg = decodeMessage(trimmed);
-        this.emit("message", msg);
-      } catch (err) {
-        this.emit("error", err instanceof Error ? err : new Error(String(err)));
-      }
     }
   }
 

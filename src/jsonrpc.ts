@@ -39,11 +39,20 @@ export function isNotification(msg: Request): boolean {
   return msg.id === undefined || msg.id === null;
 }
 
-let nextId = 1;
+/** Generate a cryptographically random request ID. */
+function generateRequestId(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  const b64 = btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return `req-${b64}`;
+}
 
 /** Create a JSON-RPC 2.0 request. */
 export function createRequest(method: string, params: unknown): Request {
-  return { jsonrpc: "2.0", id: `req-${nextId++}`, method, params };
+  return { jsonrpc: "2.0", id: generateRequestId(), method, params };
 }
 
 /** Create a JSON-RPC 2.0 notification (no id, no response expected). */
@@ -67,18 +76,71 @@ export function createErrorResponse(
   return { jsonrpc: "2.0", id, error };
 }
 
+export interface DecodeOptions {
+  /** Maximum payload length in characters. Default: 4 MB. */
+  maxSize?: number;
+  /** Maximum object/array nesting depth. Default: 32. */
+  maxDepth?: number;
+}
+
+const DEFAULT_MAX_SIZE = 4 * 1024 * 1024;
+const DEFAULT_MAX_DEPTH = 32;
+
+function parseJSONRPC(data: string, maxSize: number, maxDepth: number): unknown {
+  if (data.length > maxSize) {
+    throw new Error("JSON-RPC message exceeds maximum size");
+  }
+
+  try {
+    return JSON.parse(data, (_key, value) => {
+      if (value !== null && typeof value === "object") {
+        checkDepth(value, 1, maxDepth);
+      }
+      return value;
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("depth")) {
+      throw err;
+    }
+    throw new Error("Invalid JSON-RPC payload");
+  }
+}
+
+function checkDepth(value: unknown, depth: number, maxDepth: number): void {
+  if (depth > maxDepth) {
+    throw new Error("JSON-RPC message exceeds maximum nesting depth");
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) checkDepth(item, depth + 1, maxDepth);
+  } else if (value !== null && typeof value === "object") {
+    for (const key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        checkDepth((value as Record<string, unknown>)[key], depth + 1, maxDepth);
+      }
+    }
+  }
+}
+
 /** Parse a raw JSON string into a Message. Throws on invalid JSON-RPC. */
-export function decodeMessage(data: string): Message {
-  const obj = JSON.parse(data);
-  if (obj.jsonrpc !== "2.0") {
+export function decodeMessage(data: string, opts?: DecodeOptions): Message {
+  const maxSize = opts?.maxSize ?? DEFAULT_MAX_SIZE;
+  const maxDepth = opts?.maxDepth ?? DEFAULT_MAX_DEPTH;
+
+  const obj = parseJSONRPC(data, maxSize, maxDepth);
+
+  if (obj === null || typeof obj !== "object" || (obj as Message).jsonrpc !== "2.0") {
     throw new Error("Invalid JSON-RPC version");
   }
   return obj as Message;
 }
 
 /** Parse raw JSON that may be a batch (array) or single message. */
-export function decodeBatch(data: string): Message[] {
-  const obj = JSON.parse(data);
+export function decodeBatch(data: string, opts?: DecodeOptions): Message[] {
+  const maxSize = opts?.maxSize ?? DEFAULT_MAX_SIZE;
+  const maxDepth = opts?.maxDepth ?? DEFAULT_MAX_DEPTH;
+
+  const obj = parseJSONRPC(data, maxSize, maxDepth);
+
   if (Array.isArray(obj)) {
     return obj.map((item) => {
       if (item.jsonrpc !== "2.0") {
@@ -87,7 +149,7 @@ export function decodeBatch(data: string): Message[] {
       return item as Message;
     });
   }
-  if (obj.jsonrpc !== "2.0") {
+  if (obj === null || typeof obj !== "object" || (obj as Message).jsonrpc !== "2.0") {
     throw new Error("Invalid JSON-RPC version");
   }
   return [obj as Message];
@@ -110,7 +172,7 @@ export class WMPError extends Error {
   }
 }
 
-/** Reset the request ID counter (for testing). */
+/** @deprecated Request IDs are now random; this function is a no-op for compatibility. */
 export function resetRequestIdCounter(): void {
-  nextId = 1;
+  // no-op: IDs are cryptographically random.
 }

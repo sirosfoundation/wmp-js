@@ -17,14 +17,15 @@ import type {
   ResolveParams,
   ResolveResult,
 } from "./types.js";
+import { Method, ErrorCode, VERSION } from "./types.js";
 import type {
   Profile,
   PeerContext,
   FlowHandler,
   ResolveHandler,
+  MethodHandler,
 } from "./profile.js";
 import { WMPError } from "./jsonrpc.js";
-import { ErrorCode, VERSION } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Credential format constants — aligned with wallet-common VerifiableCredentialFormat
@@ -397,11 +398,15 @@ export type ActionHandler = (
   params: FlowActionParams,
 ) => Promise<FlowActionResult>;
 
+export type CredentialNotificationHandler = (
+  params: CredentialNotificationParams,
+) => void | Promise<void>;
+
 export interface OpenID4xConfig {
   /** OID4VCI capability. Omit to disable issuance. */
   oid4vci?: OID4VCICapability;
 
-  /** OID4VP capability. Omit to disable presentation. */
+  /** OID4VCI capability. Omit to disable issuance. */
   oid4vp?: OID4VPCapability;
 
   /** Called when an OID4VCI flow starts. */
@@ -415,6 +420,19 @@ export interface OpenID4xConfig {
 
   /** Called when an action arrives for an OID4VP flow. */
   onVPAction?: ActionHandler;
+
+  /**
+   * Called when a validated wmp.credential.notification arrives.
+   * The notification_id is guaranteed to have been registered for an
+   * outstanding OID4VCI flow (see registerCredentialNotification).
+   */
+  onCredentialNotification?: CredentialNotificationHandler;
+
+  /**
+   * Require notification_ids to be registered before accepting
+   * wmp.credential.notification. Default: true.
+   */
+  requireRegisteredNotification?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -429,11 +447,14 @@ export interface OpenID4xConfig {
  *   const profile = new OpenID4xProfile({ oid4vci: {...}, oid4vp: {...} });
  *   peer.use(profile);
  */
-export class OpenID4xProfile implements Profile, FlowHandler, ResolveHandler {
+export class OpenID4xProfile
+  implements Profile, FlowHandler, ResolveHandler, MethodHandler
+{
   readonly name = "openid4x";
   private config: OpenID4xConfig;
   private peer?: PeerContext;
   private flowTypeMap = new Map<string, string>();
+  private registeredNotifications = new Map<string, string>(); // flow_id -> notification_id
 
   constructor(config: OpenID4xConfig) {
     this.config = config;
@@ -450,6 +471,58 @@ export class OpenID4xProfile implements Profile, FlowHandler, ResolveHandler {
 
   init(ctx: PeerContext): void {
     this.peer = ctx;
+  }
+
+  // --- MethodHandler ---
+
+  methods(): string[] {
+    if (!this.config.oid4vci) return [];
+    return [Method.CredentialNotification];
+  }
+
+  async handleMethod(method: string, params: unknown): Promise<unknown> {
+    if (method !== Method.CredentialNotification) {
+      throw new WMPError(ErrorCode.MethodNotFound, `Unknown method: ${method}`);
+    }
+
+    const p = params as CredentialNotificationParams;
+    if (!p.flow_id || !p.notification_id) {
+      throw new WMPError(
+        ErrorCode.InvalidParams,
+        "Missing flow_id or notification_id",
+      );
+    }
+
+    const requireRegistered =
+      this.config.requireRegisteredNotification ?? true;
+    if (requireRegistered) {
+      const expected = this.registeredNotifications.get(p.flow_id);
+      if (expected !== p.notification_id) {
+        throw new WMPError(
+          ErrorCode.NotAuthorized,
+          "Unknown or unexpected credential notification_id",
+        );
+      }
+    }
+
+    if (this.config.onCredentialNotification) {
+      await this.config.onCredentialNotification(p);
+    }
+
+    // Consume the notification so it cannot be replayed.
+    this.registeredNotifications.delete(p.flow_id);
+    return { wmp: p.wmp, acknowledged: true };
+  }
+
+  /**
+   * Register a notification_id that was returned for an OID4VCI flow.
+   * This allows wmp.credential.notification messages to be validated.
+   */
+  registerCredentialNotification(
+    flowId: string,
+    notificationId: string,
+  ): void {
+    this.registeredNotifications.set(flowId, notificationId);
   }
 
   // --- FlowHandler ---

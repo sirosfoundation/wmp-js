@@ -203,6 +203,54 @@ export function isInvitationExpired(inv: Invitation): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Signature verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Verify the detached JWS signature of an invitation.
+ *
+ * The verifier receives the canonical signing payload (as a Uint8Array) and
+ * the detached signature string. It must return true iff the signature is
+ * valid for the sender's public key.
+ *
+ * IMPORTANT: parseInvitationURI / parseInvitationJSON do NOT verify the
+ * signature. Callers must call verifyInvitation before trusting an invitation.
+ */
+export type InvitationVerifier = (
+  payload: Uint8Array,
+  signature: string,
+) => boolean | Promise<boolean>;
+
+/**
+ * Verify an invitation's signature and expiry.
+ *
+ * @param inv The parsed invitation.
+ * @param verifier Callback that verifies the detached JWS signature.
+ * @returns The invitation if valid.
+ * @throws Error if the invitation is expired or the signature is invalid.
+ */
+export async function verifyInvitation(
+  inv: Invitation,
+  verifier: InvitationVerifier,
+): Promise<Invitation> {
+  if (isInvitationExpired(inv)) {
+    throw new Error("invitation expired");
+  }
+  if (!inv.signature) {
+    throw new Error("invitation missing signature");
+  }
+
+  const payload = new TextEncoder().encode(
+    JSON.stringify(invitationSigningPayload(inv)),
+  );
+  const valid = await verifier(payload, inv.signature);
+  if (!valid) {
+    throw new Error("invitation signature verification failed");
+  }
+  return inv;
+}
+
+// ---------------------------------------------------------------------------
 // In-memory invitation store
 // ---------------------------------------------------------------------------
 
