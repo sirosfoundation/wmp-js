@@ -38,15 +38,11 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Verify tag matches package.json version
+      - name: Set package.json version from tag
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "::error::Tag version ($TAG_VERSION) does not match package.json version ($PKG_VERSION)"
-            exit 1
-          fi
-          echo "Publishing version $PKG_VERSION"
+          npm version "$TAG_VERSION" --no-git-tag-version
+          echo "Publishing version $TAG_VERSION"
 
       - name: Publish to npm
         run: npm publish --access public
