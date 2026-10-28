@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { isRequest, isResponse } from "../src/jsonrpc.js";
 import type { Request, Response } from "../src/jsonrpc.js";
@@ -285,8 +285,8 @@ describe("Conformance: manifest", () => {
 });
 
 describe("Conformance: vectors directory", () => {
-  it("is the directory the harness resolved (not silently empty)", () => {
-    expect(vectorsDir()).toContain("vectors");
+  it("resolves to a directory that holds the manifest (whatever it is called)", () => {
+    expect(existsSync(resolve(vectorsDir(), "manifest.json"))).toBe(true);
   });
 });
 

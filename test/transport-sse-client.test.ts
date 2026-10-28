@@ -18,7 +18,7 @@ const progress = (sid: string, flow: string, step: string) => ({
 let stub: SseStub;
 let transport: HttpSseTransport | undefined;
 
-async function setup(eventBuffer: number): Promise<{ t: HttpSseTransport; peer: Peer; got: Message[]; sid: string; lost: Error[] }> {
+async function setup(eventBuffer: number, handler: ConstructorParameters<typeof Peer>[1] extends infer O ? (O extends { handler?: infer H } ? H : never) : never = {}): Promise<{ t: HttpSseTransport; peer: Peer; got: Message[]; sid: string; lost: Error[] }> {
   stub = new SseStub({ eventBuffer, principals: { alice: AUTH, bob: "Bearer bob" } });
   await stub.start();
   FetchEventSource.instances = [];
@@ -29,7 +29,7 @@ async function setup(eventBuffer: number): Promise<{ t: HttpSseTransport; peer: 
   transport = t;
   const got: Message[] = [];
   const lost: Error[] = [];
-  const peer = new Peer(t, { onSessionLost: (e) => lost.push(e) });
+  const peer = new Peer(t, { onSessionLost: (e) => lost.push(e), handler });
   t.on("message", (m) => got.push(m));
   const res = await peer.createSession({ participants: [], capabilities: {} });
   const sid = res.wmp.session_id!;
@@ -290,5 +290,143 @@ describe("Peer", () => {
     const sent = spy.mock.calls[0][0] as { params: { last_received_id?: string } };
     expect(sent.params.last_received_id).toBe(t.lastEventId);
     expect(ErrorCode.SessionNotFound).toBe(-31000);
+  });
+});
+
+describe("terminal notifications re-sent by a resume are processed once", () => {
+  const complete = (sid: string, flow: string) => ({
+    jsonrpc: "2.0",
+    method: "wmp.flow.complete",
+    params: { wmp: { version: "0.1", session_id: sid }, flow_id: flow, result: { credentials: [] } },
+  });
+
+  it("an unrelated gap does not repeat the completion callback", async () => {
+    const onFlowComplete = vi.fn();
+    const { t, sid } = await setup(3, { onFlowComplete });
+    stub.emit(sid, complete(sid, "flow-done"));
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+
+    stub.dropConnections(sid);
+    for (let i = 0; i < 5; i++) stub.emit(sid, progress(sid, "flow-other", `s${i}`));
+    t.reconnectSSE(); // gap -> resume re-sends flow-done's terminal notification with a fresh id
+    await settle(250);
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers a terminal notification that was first discovered during recovery", async () => {
+    const onFlowComplete = vi.fn();
+    const { t, sid } = await setup(3, { onFlowComplete });
+    stub.emit(sid, progress(sid, "flow-other", "first")); // gives the client a cursor
+    await settle();
+    stub.dropConnections(sid);
+    stub.emit(sid, complete(sid, "flow-missed")); // while disconnected, then evicted by newer events
+    for (let i = 0; i < 5; i++) stub.emit(sid, progress(sid, "flow-other", `s${i}`));
+    t.reconnectSSE(); // gap -> resume re-sends flow-missed's terminal notification
+    await settle(250);
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("a new flow under a reused id is delivered again", async () => {
+    const onFlowComplete = vi.fn();
+    const { peer, t, sid } = await setup(200, { onFlowComplete });
+    stub.emit(sid, complete(sid, "f"));
+    await settle();
+    stub.emit(sid, complete(sid, "f")); // a repeat, different event id
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    void peer.startFlow("sign", "f", {}).catch(() => {}); // a new flow under the same id
+    await settle();
+    stub.emit(sid, complete(sid, "f"));
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(2);
+    expect(t.lastEventId).toBeTruthy();
+  });
+});
+
+describe("switching sessions resets replay state", () => {
+  function fakeEs() {
+    const made: { url: string; fire(id: string, data: string): void }[] = [];
+    class Fake {
+      readyState = 1;
+      onopen = null;
+      onerror = null;
+      onmessage = null;
+      private l: ((ev: MessageEvent) => void)[] = [];
+      constructor(public url: string) {
+        made.push(this);
+      }
+      addEventListener(_t: string, fn: (ev: MessageEvent) => void) {
+        this.l.push(fn);
+      }
+      fire(id: string, data: string) {
+        this.l.forEach((fn) => fn({ data, lastEventId: id } as MessageEvent));
+      }
+      close() {}
+    }
+    return { made, Ctor: Fake as unknown as typeof EventSource };
+  }
+  const msg = JSON.stringify({ jsonrpc: "2.0", method: "wmp.flow.progress", params: { wmp: { version: "0.1" }, flow_id: "f", step: "1" } });
+
+  it("drops the cursor and the seen ids when another session is bound", () => {
+    const { made, Ctor } = fakeEs();
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Ctor });
+    const got: Message[] = [];
+    t.on("message", (m) => got.push(m));
+    t.setSessionId("ses-A");
+    t.connectSSE();
+    made[0].fire("1", msg);
+    expect(t.lastEventId).toBe("1");
+    t.setSessionId("ses-B");
+    expect(t.lastEventId).toBeUndefined();
+    t.reconnectSSE();
+    expect(made[1].url).toBe("http://x/events?session_id=ses-B"); // no cursor from A
+    made[1].fire("1", msg); // the same id in session B is a new event
+    expect(got).toHaveLength(2);
+  });
+
+  it("keeps the cursor for the same session and a seeded cursor on first bind", () => {
+    const { made, Ctor } = fakeEs();
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Ctor, lastEventId: "seed" });
+    t.setSessionId("ses-A");
+    expect(t.lastEventId).toBe("seed");
+    t.connectSSE();
+    made[0].fire("2", msg);
+    t.setSessionId("ses-A");
+    expect(t.lastEventId).toBe("2");
+  });
+});
+
+describe("event stream URL", () => {
+  function urlFor(eventsUrl: string, sid?: string, cursor?: string): string {
+    const urls: string[] = [];
+    class Fake {
+      readyState = 1;
+      onopen = null;
+      onerror = null;
+      onmessage = null;
+      constructor(u: string) {
+        urls.push(u);
+      }
+      addEventListener() {}
+      close() {}
+    }
+    const t = new HttpSseTransport("http://x/wmp", eventsUrl, { EventSource: Fake as unknown as typeof EventSource });
+    if (sid) t.setSessionId(sid);
+    t.connectSSE(cursor);
+    return urls[0];
+  }
+
+  it("leaves a relative or protocol-relative URL as supplied, adding only the query", () => {
+    expect(urlFor("events", "s1")).toBe("events?session_id=s1");
+    expect(urlFor("/app/events", "s1")).toBe("/app/events?session_id=s1");
+    expect(urlFor("//stream.example/events", "s1")).toBe("//stream.example/events?session_id=s1");
+    expect(urlFor("../events", "s1")).toBe("../events?session_id=s1");
+  });
+
+  it("keeps an existing query and a fragment, encodes values, and adds both cursor names", () => {
+    expect(urlFor("/e?x=1#frag", "s 1", "c/1")).toBe("/e?x=1&session_id=s+1&last_event_id=c%2F1&lastEventId=c%2F1#frag");
+    expect(urlFor("https://h.example:8443/wmp/events", undefined, "c")).toBe("https://h.example:8443/wmp/events?last_event_id=c&lastEventId=c");
+    expect(urlFor("https://h.example/e")).toBe("https://h.example/e");
   });
 });
