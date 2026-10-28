@@ -199,23 +199,30 @@ export class Peer implements PeerContext {
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
     const req = createRequest(method, params);
     const id = req.id!;
+    // Every outgoing flow.start goes through here (the convenience method and
+    // profiles alike), so the flow's validation context is always recorded.
+    const rollback = method === Method.FlowStart ? this.beginFlow(flowIdOf(params), flowTypeOf(params), (params as { params?: unknown }).params) : noop;
 
     return new Promise<T>((resolve, reject) => {
+      const fail = (err: unknown): void => {
+        rollback(); // the start did not succeed: it must not leave a context behind
+        reject(err);
+      };
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new WMPError(ErrorCode.InternalError, `Call to ${method} timed out`));
+        fail(new WMPError(ErrorCode.InternalError, `Call to ${method} timed out`));
       }, this.callTimeout);
 
       this.pending.set(id, {
         resolve: resolve as (v: unknown) => void,
-        reject,
+        reject: fail,
         timer,
       });
 
       this.transport.send(req).catch((err) => {
         this.pending.delete(id);
         clearTimeout(timer);
-        reject(err);
+        fail(err);
       });
     });
   }
@@ -337,7 +344,6 @@ export class Peer implements PeerContext {
     params?: unknown,
     timeout?: number,
   ): Promise<FlowStartResult> {
-    this.recordFlowType(flowId, flowType, params);
     return this.call<FlowStartResult>(Method.FlowStart, {
       wmp: this.wmpMeta(),
       flow_type: flowType,
@@ -597,10 +603,19 @@ export class Peer implements PeerContext {
 
       // Flows — delegate to profile FlowHandlers first, then handler.
       case Method.FlowStart: {
-        this.recordFlowType(p.flow_id, p.flow_type, p.params);
-        const fh = this.registry.getFlowHandler(p.flow_type);
-        if (fh) return fh.startFlow(p);
-        if (this.handler.onFlowStart) return this.handler.onFlowStart(p);
+        // Rejects a duplicate active flow_id and records the flow's validation
+        // context; a start that fails leaves nothing (and no existing flow's
+        // context) changed.
+        const rollback = this.beginFlow(p?.flow_id, p?.flow_type, p?.params);
+        try {
+          const fh = this.registry.getFlowHandler(p.flow_type);
+          if (fh) return await fh.startFlow(p);
+          if (this.handler.onFlowStart) return await this.handler.onFlowStart(p);
+        } catch (err) {
+          rollback();
+          throw err;
+        }
+        rollback();
         break;
       }
 
@@ -645,7 +660,9 @@ export class Peer implements PeerContext {
 
       case Method.FlowCancel:
         if (this.handler.onFlowCancel) {
-          return this.handler.onFlowCancel(p);
+          const result = await this.handler.onFlowCancel(p);
+          if (typeof p?.flow_id === "string") this.recordedFlows.delete(p.flow_id);
+          return result;
         }
         break;
 
@@ -668,15 +685,33 @@ export class Peer implements PeerContext {
     throw new WMPError(ErrorCode.MethodNotFound, `Method not found: ${method}`);
   }
 
-  /** Flow type (and for match the query ids) by flow_id, recorded when the flow starts. Bounded. */
+  /**
+   * The validation context of every ACTIVE flow (started, not yet ended), by
+   * flow_id: its type and, for match, the ids of the verifier's query. Never
+   * evicted to make room: a new start is refused at capacity instead of
+   * weakening an existing flow's checks.
+   */
   private recordedFlows = new Map<string, { type: string; queryIds?: string[] }>();
 
-  private recordFlowType(flowId: unknown, flowType: unknown, params: unknown): void {
-    if (typeof flowId !== "string" || typeof flowType !== "string") return;
+  /**
+   * Records a starting flow and returns the function that undoes it. Refuses
+   * (-32602) a flow_id that is already active, so a second start cannot replace
+   * the context of the first, and (-31007) a start at capacity.
+   */
+  private beginFlow(flowId: unknown, flowType: unknown, params: unknown): () => void {
+    if (typeof flowId !== "string" || typeof flowType !== "string") return noop;
+    if (this.recordedFlows.has(flowId)) {
+      throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "flow_id is already active" });
+    }
+    if (this.recordedFlows.size >= MAX_ACTIVE_FLOWS) {
+      throw new WMPError(ErrorCode.RateLimited, "Too many active flows");
+    }
     const q = flowType === "match" && typeof params === "object" && params !== null ? (params as { dcql_query?: unknown }).dcql_query : undefined;
-    this.recordedFlows.delete(flowId); // re-insert as the newest
-    this.recordedFlows.set(flowId, { type: flowType, queryIds: q === undefined ? undefined : dcqlQueryIds(q) });
-    if (this.recordedFlows.size > 1024) this.recordedFlows.delete(this.recordedFlows.keys().next().value as string);
+    const rec = { type: flowType, queryIds: q === undefined ? undefined : dcqlQueryIds(q) };
+    this.recordedFlows.set(flowId, rec);
+    return () => {
+      if (this.recordedFlows.get(flowId) === rec) this.recordedFlows.delete(flowId);
+    };
   }
 
   /**
@@ -768,9 +803,27 @@ export class Peer implements PeerContext {
 // Error conversion
 // ---------------------------------------------------------------------------
 
+/** The shape a wmp.flow.complete must have before the early result check applies: flow_id and the wmp metadata object with its version. */
 function isFlowCompleteEnvelope(params: unknown): params is FlowCompleteParams {
-  return typeof params === "object" && params !== null && typeof (params as { flow_id?: unknown }).flow_id === "string";
+  if (typeof params !== "object" || params === null) return false;
+  const p = params as { flow_id?: unknown; wmp?: unknown };
+  if (typeof p.flow_id !== "string") return false;
+  const w = p.wmp as { version?: unknown } | null | undefined;
+  return typeof w === "object" && w !== null && typeof w.version === "string";
 }
+
+function flowIdOf(params: unknown): unknown {
+  return typeof params === "object" && params !== null ? (params as { flow_id?: unknown }).flow_id : undefined;
+}
+
+function flowTypeOf(params: unknown): unknown {
+  return typeof params === "object" && params !== null ? (params as { flow_type?: unknown }).flow_type : undefined;
+}
+
+const noop = (): void => {};
+
+/** Most flows a peer holds validation context for at once; a new start beyond it is refused. */
+const MAX_ACTIVE_FLOWS = 4096;
 
 function toRPCError(err: unknown): RPCError {
   if (err instanceof WMPError) {
