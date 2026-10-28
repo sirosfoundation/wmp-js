@@ -159,16 +159,19 @@ export function decodeBatch(data: string, opts?: DecodeOptions): Message[] {
 export class WMPError extends Error {
   readonly code: number;
   readonly data?: unknown;
+  /** The message as it goes on the wire (error.message), without the "wmp: rpc error" prefix of Error.message. */
+  readonly rpcMessage: string;
 
   constructor(code: number, message: string, data?: unknown) {
     super(`wmp: rpc error ${code}: ${message}`);
     this.name = "WMPError";
     this.code = code;
     this.data = data;
+    this.rpcMessage = message;
   }
 
   toRPCError(): RPCError {
-    return { code: this.code, message: this.message, data: this.data };
+    return { code: this.code, message: this.rpcMessage, data: this.data };
   }
 }
 

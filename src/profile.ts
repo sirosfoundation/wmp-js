@@ -57,6 +57,15 @@ export interface FlowHandler {
   handleProgress(params: FlowProgressParams): void;
   handleComplete(params: FlowCompleteParams): void;
   handleError(params: FlowErrorParams): void;
+
+  /**
+   * Optional (go-wmp CapabilityRequirer): the capability that MUST have been
+   * negotiated before a flow of `flowType` may start (Core 6.5, 10.3), or ""
+   * for none. A Peer refuses wmp.flow.start for a flow type whose capability is
+   * not negotiated with -31005 {"unsupported": flowType, "capability": cap}
+   * before startFlow is called. A handler that does not implement it is not gated.
+   */
+  requiredCapability?(flowType: string): string;
 }
 
 // ---------------------------------------------------------------------------

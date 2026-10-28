@@ -26,6 +26,7 @@ import type {
   MethodHandler,
 } from "./profile.js";
 import { WMPError } from "./jsonrpc.js";
+import { unsupportedError } from "./errors.js";
 
 // ---------------------------------------------------------------------------
 // Credential format constants — aligned with wallet-common VerifiableCredentialFormat
@@ -551,6 +552,18 @@ export class OpenID4xProfile
     return types;
   }
 
+  /** Each flow type needs the capability of the same name (Core 6.5 item 2; profile Section 2). */
+  requiredCapability(flowType: string): string {
+    switch (flowType) {
+      case OID4FlowType.OID4VCI:
+        return "oid4vci";
+      case OID4FlowType.OID4VP:
+        return "oid4vp";
+      default:
+        return "";
+    }
+  }
+
   async startFlow(params: FlowStartParams): Promise<FlowStartResult> {
     switch (params.flow_type) {
       case OID4FlowType.OID4VCI: {
@@ -576,7 +589,7 @@ export class OpenID4xProfile
         };
       }
       default:
-        throw new WMPError(ErrorCode.FlowError, `Unsupported flow type: ${params.flow_type}`);
+        throw unsupportedError(params.flow_type);
     }
   }
 

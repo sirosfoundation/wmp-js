@@ -29,6 +29,8 @@ import {
 } from "./profile.js";
 import { type ValidationError } from "./schema.js";
 import { CompletionResultError, validateCompletionResult } from "./completion.js";
+import { unsupportedError } from "./errors.js";
+import { SUPPORTED_VERSIONS, negotiateVersion, parseVersion, versionRejection } from "./version.js";
 import {
   type Metadata,
   type SessionCreateParams,
@@ -139,6 +141,13 @@ export interface PeerOptions {
    */
   validateCompletions?: boolean;
   /**
+   * Protocol versions this peer speaks. As a client it offers the highest and
+   * accepts a selected version that is in this list and not above the offered
+   * one (Core 2.2.2); as a responder it negotiates incoming session.create and
+   * session.resume against it. Default: ["0.1"].
+   */
+  supportedVersions?: string[];
+  /**
    * Called when the session cannot be continued after an event gap (the
    * transport saw 410 and the automatic wmp.session.resume failed or had no
    * resumption token). The application creates a new session
@@ -168,6 +177,9 @@ export class Peer implements PeerContext {
   private validateCompletions: boolean;
   private onRefusedCompletion?: PeerOptions["onRefusedCompletion"];
   private onSessionLost?: PeerOptions["onSessionLost"];
+  private supportedVersions: string[];
+  /** Capabilities negotiated for the session; undefined until known (gating then fails closed). */
+  private negotiatedCapabilities?: Capabilities;
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -178,6 +190,7 @@ export class Peer implements PeerContext {
     this.validateCompletions = opts?.validateCompletions ?? true;
     this.onRefusedCompletion = opts?.onRefusedCompletion;
     this.onSessionLost = opts?.onSessionLost;
+    this.supportedVersions = [...(opts?.supportedVersions ?? SUPPORTED_VERSIONS)];
 
     // Wire up transport events.
     this.transport.on("message", (msg: Message) => this.dispatch(msg));
@@ -190,6 +203,22 @@ export class Peer implements PeerContext {
   use(profile: Profile): void {
     this.registry.register(profile);
     profile.init(this);
+  }
+
+  /** The highest supported version (what a client offers). */
+  private offeredVersion(): string {
+    let best: string = VERSION;
+    let bestKey = -1;
+    for (const v of this.supportedVersions) {
+      const p = parseVersion(v);
+      if (!p) continue;
+      const key = p.major * 1_000_000 + p.minor;
+      if (key > bestKey) {
+        bestKey = key;
+        best = v;
+      }
+    }
+    return best;
   }
 
   /** The negotiated session ID (set after session.create). */
@@ -244,7 +273,8 @@ export class Peer implements PeerContext {
     ttl?: number;
     invitationNonce?: string;
   }): Promise<SessionCreateResult> {
-    const wmp: Metadata = { version: VERSION, sender: opts.sender };
+    const offered = this.offeredVersion();
+    const wmp: Metadata = { version: offered, sender: opts.sender };
     const params: SessionCreateParams = {
       wmp,
       participants: opts.participants,
@@ -264,15 +294,21 @@ export class Peer implements PeerContext {
         "session.create response missing session_id",
       );
     }
-    if (result.wmp.version && result.wmp.version !== VERSION) {
+    // Core 2.2.2: the responder selects the highest version it supports that
+    // is not above the offered one. Accept that, never a version this peer does
+    // not speak or one above the offer.
+    const selected = result.wmp.version;
+    if (selected && !(this.supportedVersions.includes(selected) && negotiateVersion(offered, [selected]) === selected)) {
       throw new WMPError(
         ErrorCode.VersionNotSupported,
-        `negotiated version ${result.wmp.version} is not supported`,
+        `negotiated version ${selected} is not supported`,
+        { supported_versions: this.supportedVersions },
       );
     }
     this.sessionId = result.wmp.session_id;
     this.bindSessionToTransport(result.wmp.session_id);
-    this.negotiatedVersion = result.wmp.version ?? VERSION;
+    this.negotiatedVersion = selected ?? offered;
+    this.negotiatedCapabilities = result.capabilities ?? {};
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
@@ -308,6 +344,7 @@ export class Peer implements PeerContext {
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
+    if (result.capabilities) this.negotiatedCapabilities = result.capabilities;
     return result;
   }
 
@@ -534,13 +571,24 @@ export class Peer implements PeerContext {
       // Session
       case Method.SessionCreate:
         if (this.handler.onSessionCreate) {
-          return this.handler.onSessionCreate(p);
+          // Core 2.2.2: the highest supported version not above the offer, or
+          // -32602 (malformed) / -31013 with supported_versions.
+          const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
+          if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
+          const result = await this.handler.onSessionCreate(p);
+          if (result?.wmp && !result.wmp.version) result.wmp.version = selected;
+          if (result?.capabilities) this.negotiatedCapabilities = result.capabilities;
+          return result;
         }
         break;
 
       case Method.SessionResume:
         if (this.handler.onSessionResume) {
-          return this.handler.onSessionResume(p);
+          const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
+          if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
+          const result = await this.handler.onSessionResume(p);
+          if (result?.wmp && !result.wmp.version) result.wmp.version = selected;
+          return result;
         }
         break;
 
@@ -597,9 +645,28 @@ export class Peer implements PeerContext {
       // Flows — delegate to profile FlowHandlers first, then handler.
       case Method.FlowStart: {
         const fh = this.registry.getFlowHandler(p.flow_type);
-        if (fh) return fh.startFlow(p);
-        if (this.handler.onFlowStart) return this.handler.onFlowStart(p);
-        break;
+        if (fh) {
+          // Core 10.3: a flow type whose capability was not negotiated is
+          // refused with -31005 before the profile sees it. Fails closed: with
+          // no negotiated capabilities known, nothing counts as negotiated.
+          const need = fh.requiredCapability?.(p.flow_type);
+          if (need && !(this.negotiatedCapabilities && Object.prototype.hasOwnProperty.call(this.negotiatedCapabilities, need))) {
+            throw unsupportedError(p.flow_type, { capability: need });
+          }
+          return fh.startFlow(p);
+        }
+        if (this.handler.onFlowStart) {
+          try {
+            return await this.handler.onFlowStart(p);
+          } catch (err) {
+            // A handler that does not implement this flow type: unsupported
+            // capability (Core 3.8.1), not an unknown method.
+            if (err instanceof WMPError && err.code === ErrorCode.MethodNotFound) throw unsupportedError(p.flow_type);
+            throw err;
+          }
+        }
+        // Nobody here implements this flow type.
+        throw unsupportedError(p.flow_type);
       }
 
       case Method.FlowProgress: {
@@ -761,7 +828,7 @@ export class Peer implements PeerContext {
 
 function toRPCError(err: unknown): RPCError {
   if (err instanceof WMPError) {
-    return { code: err.code, message: err.message, data: err.data };
+    return { code: err.code, message: err.rpcMessage, data: err.data };
   }
   // Sanitize unexpected internal errors to avoid leaking implementation details.
   if (typeof console !== "undefined" && console.error) {

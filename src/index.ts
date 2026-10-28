@@ -132,6 +132,10 @@ export type {
   MLSProvider,
 } from "./mls.js";
 
+// Version negotiation and errors
+export { SUPPORTED_VERSIONS, parseVersion, negotiateVersion, versionRejection } from "./version.js";
+export { unsupportedError } from "./errors.js";
+
 // Completion-result rules (OpenID4x profile 3.1.4, 3.3)
 export {
   validateCompletionResult,

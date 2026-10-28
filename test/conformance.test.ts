@@ -23,6 +23,8 @@ import {
   splitReplaySecrets,
   CompletionResultError,
 } from "../src/completion.js";
+import { Peer } from "../src/peer.js";
+import { MockTransport } from "./mock-transport.js";
 import { loadManifest, loadVectors, vectorFilesOnDisk, vectorsDir, specDir, type TestVector } from "./vectors.js";
 
 // Collect all known method names from the Method constant
@@ -406,4 +408,58 @@ describe("Conformance: flow-lifecycle vectors are executed", () => {
       else expect(JSON.parse(out.replay)).toEqual(v.input);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Behavioural execution of version negotiation and flow-type error vectors
+// ---------------------------------------------------------------------------
+
+async function respond(input: unknown, supported?: string[]): Promise<Response> {
+  const t = new MockTransport();
+  new Peer(t, {
+    supportedVersions: supported,
+    handler: {
+      // A session.create responder with no version of its own: the Peer's negotiation decides.
+      onSessionCreate: async () => ({
+        wmp: { version: "", session_id: "ses-abcdef0123" },
+        capabilities: {},
+        security: { mode: "tls" },
+      }),
+    },
+  });
+  t.receive(input as never);
+  await new Promise((r) => setTimeout(r, 10));
+  return t.sent[0] as Response;
+}
+
+describe("Conformance: version negotiation vectors run against Peer", () => {
+  const create = loadVectors("session-create.json").filter((v) => v.setup?.supported_versions);
+  const errors = loadVectors("errors.json").filter((v) => v.setup?.supported_versions && v.expected_error);
+
+  it("finds the vectors", () => {
+    expect(create.length).toBeGreaterThanOrEqual(3);
+    expect(errors.length).toBeGreaterThanOrEqual(3);
+  });
+
+  for (const v of create) {
+    it(`${v.id}: selected version`, async () => {
+      const resp = await respond(v.input, v.setup!.supported_versions);
+      const want = (v.expected_response as { result: { wmp: { version: string } } }).result.wmp.version;
+      expect((resp.result as { wmp: { version: string; session_id: string } }).wmp.version).toBe(want);
+      expect((resp.result as { wmp: { session_id: string } }).wmp.session_id).toMatch(/^ses-/);
+    });
+  }
+
+  for (const v of errors) {
+    it(`${v.id}: error response equals the vector`, async () => {
+      const resp = await respond(v.input, v.setup!.supported_versions);
+      expect(resp.error).toEqual((v.expected_error as { error: unknown }).error);
+    });
+  }
+
+  it("error-unknown-flow-type is -31005 with the unsupported flow type", async () => {
+    const v = loadVectors("errors.json").find((x) => x.id === "error-unknown-flow-type")!;
+    const resp = await respond(v.input);
+    expect(resp.error).toEqual((v.expected_error as { error: unknown }).error);
+  });
 });
