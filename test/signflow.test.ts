@@ -746,3 +746,172 @@ describe("a start whose response cannot be delivered leaves nothing behind (roun
     expect(t.sent.filter((m) => (m as Response).error?.code === -31007)).toHaveLength(0);
   }, 60_000);
 });
+
+describe("work is bound to its flow generation (round 5)", () => {
+  const cancelReq = (flowId: string) => ({ jsonrpc: "2.0" as const, id: `c-${flowId}`, method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: flowId } });
+
+  async function setupWallet(onSign: (flow: SignFlow) => void | Promise<void>, onMatch?: never) {
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }),
+        onFlowCancel: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }),
+      },
+    });
+    peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign, ...(onMatch ? { onMatch } : {}) }));
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    t.sent.length = 0;
+    return { t, peer };
+  }
+
+  it("a cancelled flow's queued callback does not run once the id was started again", async () => {
+    const seen: string[] = [];
+    const { t } = await setupWallet((flow) => {
+      seen.push(String(flow.params.nonce));
+      return flow.complete({ proof_jwt: `for-${String(flow.params.nonce)}` });
+    });
+    // the first start's response is slow, so its continuation is still queued
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const realSend = t.send.bind(t);
+    t.send = async (msg) => {
+      if ((msg as { id?: string }).id === "s-1") await gate;
+      await realSend(msg);
+    };
+    t.receive({ ...start("sign", "x", sign({ action: "generate_proof", nonce: "OLD" })), id: "s-1" });
+    await settle(30);
+    t.receive(cancelReq("x")); // the flow is cancelled: its id is free
+    await settle(30);
+    t.receive({ ...start("sign", "x", sign({ action: "generate_proof", nonce: "NEW" })), id: "s-2" });
+    await settle(30);
+    release(); // now the first response goes out and its continuation would run
+    await settle(80);
+    expect(seen).toEqual(["NEW"]); // the stale callback never ran
+    const completes = t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.complete");
+    expect(completes).toHaveLength(1);
+    expect(JSON.stringify(completes[0])).toContain("for-NEW");
+  });
+
+  it("a late terminal from a stale sub-flow is refused and leaves the replacement's record alone", async () => {
+    const flows: SignFlow[] = [];
+    const { t, peer } = await setupWallet((flow) => {
+      flows.push(flow); // answered later, by the test
+    });
+    t.receive(start("sign", "x", sign({ action: "generate_proof", nonce: "OLD" })));
+    await settle(40);
+    t.receive(cancelReq("x"));
+    await settle(30);
+    t.receive({ ...start("sign", "x", sign({ action: "generate_proof", nonce: "NEW" })), id: "s-new" });
+    await settle(40);
+    expect(flows).toHaveLength(2);
+    t.sent.length = 0;
+    await expect(flows[0].complete({ proof_jwt: "stale" })).rejects.toThrow(/no longer active/);
+    await expect(flows[0].reject()).rejects.toThrow(/no longer active/);
+    expect(t.sent).toHaveLength(0); // nothing reached the orchestrator
+    expect(peer.flowGeneration("x")).toBeDefined(); // the replacement is still registered
+    await flows[1].complete({ proof_jwt: "fresh" }); // and can finish normally
+    expect(t.sent).toHaveLength(1);
+    expect(peer.flowGeneration("x")).toBeUndefined();
+  });
+
+  it("a cancelled match flow's callback does not run", async () => {
+    const onMatch = vi.fn(() => ({ satisfiable: true }));
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: { oid4vp: {} }, security: { mode: "tls" } }),
+        onFlowCancel: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }),
+      },
+    });
+    peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onMatch }));
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const realSend = t.send.bind(t);
+    t.send = async (msg) => {
+      if ((msg as { id?: string }).id === "s-m") await gate;
+      await realSend(msg);
+    };
+    t.receive({ jsonrpc: "2.0", id: "s-m", method: "wmp.flow.start", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: "match", flow_id: "m", params: { parent_flow_id: "p", dcql_query: { credentials: [{ id: "pid" }] } } } });
+    await settle(30);
+    t.receive(cancelReq("m"));
+    await settle(30);
+    release();
+    await settle(60);
+    expect(onMatch).not.toHaveBeenCalled();
+    expect(t.sent.some((m) => (m as { method?: string }).method === "wmp.flow.complete")).toBe(false);
+  });
+
+  it("Peer.notifyFlow refuses another generation and only retires its own", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowCancel: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }) } });
+    t.receive({ jsonrpc: "2.0", id: "a", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f", params: {} } });
+    await settle();
+    const gen1 = peer.flowGeneration("f");
+    expect(gen1).toBeDefined();
+    t.receive(cancelReq("f"));
+    await settle();
+    expect(peer.flowGeneration("f")).toBeUndefined();
+    t.receive({ jsonrpc: "2.0", id: "b", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f", params: {} } });
+    await settle();
+    const gen2 = peer.flowGeneration("f");
+    expect(gen2).toBeDefined();
+    expect(gen2).not.toBe(gen1);
+    await expect(peer.notifyFlow(gen1, "wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: "f", result: {} })).rejects.toThrow();
+    expect(peer.flowGeneration("f")).toBe(gen2);
+    await peer.notifyFlow(gen2, "wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: "f", result: {} });
+    expect(peer.flowGeneration("f")).toBeUndefined();
+  });
+});
+
+describe("retiring after a slow send (round 5)", () => {
+  it("a terminal still being sent does not retire a replacement started meanwhile", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowCancel: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }) } });
+    const startReq = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f", params: {} } });
+    t.receive(startReq("a"));
+    await settle();
+    const gen1 = peer.flowGeneration("f");
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const realSend = t.send.bind(t);
+    t.send = async (m) => {
+      if ((m as { method?: string }).method === "wmp.flow.complete") await gate;
+      await realSend(m);
+    };
+    const sending = peer.notifyFlow(gen1, "wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: "f", result: {} });
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: "f" } });
+    await settle();
+    t.receive(startReq("b")); // a replacement under the same id
+    await settle();
+    const gen2 = peer.flowGeneration("f");
+    expect(gen2).toBeDefined();
+    release();
+    await sending;
+    expect(peer.flowGeneration("f")).toBe(gen2); // not retired by the old generation's send
+  });
+});
+
+describe("error results in encrypted response modes (round 5)", () => {
+  const jwe = "aaaa.x.bbbb.cccc.dddd";
+  it("a refusal needs no response_jwe, in any mode, and carries no vp_token or JWE", () => {
+    for (const mode of ["direct_post.jwt", "dc_api.jwt", "direct_post", undefined]) {
+      expect(() => validateSignResult("sign_presentation", { error: { code: "access_denied" } }, mode as never), String(mode)).not.toThrow();
+      expect(() => validateSignResult("sign_presentation", { error: { code: "x" }, response_jwe: jwe }, mode as never), String(mode)).toThrow(CompletionResultError);
+      expect(() => validateSignResult("sign_presentation", { error: { code: "x" }, vp_token: "PLAIN" }, mode as never), String(mode)).toThrow(CompletionResultError);
+    }
+  });
+
+  it("the profile can report a refusal in direct_post.jwt (not replaced by 'Sign failed')", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: (flow) => flow.complete({ error: { code: "access_denied" } }),
+    });
+    t.receive(start("sign", "enc-err", sign({ response_mode: "direct_post.jwt" })));
+    await settle(60);
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.complete", params: { result: { error: { code: "access_denied" } } } });
+  });
+});

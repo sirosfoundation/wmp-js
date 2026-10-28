@@ -36,6 +36,21 @@ export interface PeerContext {
    * must not reach the peer before the start's response.
    */
   afterResponse?(fn: () => void): void;
+
+  /**
+   * Optional: an opaque token for the flow `flowId` as it is NOW (undefined if the
+   * peer holds no active flow by that id). It changes when the flow ends and the
+   * id is started again, so work queued for one flow can tell it is stale.
+   */
+  flowGeneration?(flowId: string): object | undefined;
+
+  /**
+   * Optional: like `notify`, for a flow notification (wmp.flow.complete/error)
+   * on behalf of the flow generation `generation` (from {@link flowGeneration}).
+   * Rejects without sending when that generation is no longer the flow's, and
+   * retires the flow after the send only if it still is.
+   */
+  notifyFlow?(generation: object | undefined, method: string, params: unknown): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

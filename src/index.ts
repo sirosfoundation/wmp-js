@@ -203,6 +203,7 @@ export {
   SIGN_ACTIONS,
   MAX_PROOF_COUNT,
   SignFlow,
+  boundNotifier,
   offersTransactionData,
   transactionDataUnsupportedData,
   transactionDataUnsupportedError,

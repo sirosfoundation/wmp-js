@@ -32,11 +32,13 @@ import { dcqlQueryIds, validateMatchResult } from "./completion.js";
 import {
   CAPABILITY_TRANSACTION_DATA,
   SignFlow,
+  boundNotifier,
   completeSubFlow,
   parseMatchStartParams,
   parseSignSubFlowParams,
   rejectSubFlow,
   transactionDataUnsupportedError,
+  type FlowNotifier,
   type MatchResult,
   type MatchStartParams,
   type TransactionDataCapability,
@@ -752,8 +754,12 @@ export class OpenID4xProfile
         if (sp.transaction_data && sp.transaction_data.length > 0 && !this.config.transactionData) {
           throw transactionDataUnsupportedError();
         }
-        const flow = new SignFlow(this.peer!, params.wmp, params.flow_id, sp);
+        // Bound to THIS flow generation: if the flow is cancelled and the id started
+        // again before the callback runs or answers, nothing it does reaches the new flow.
+        const bound = boundNotifier(this.peer!, params.flow_id);
+        const flow = new SignFlow(bound, params.wmp, params.flow_id, sp);
         this.defer(async () => {
+          if (!bound.current()) return; // cancelled or replaced before the callback could run
           try {
             await this.config.onSign!(flow);
           } catch (err) {
@@ -769,7 +775,11 @@ export class OpenID4xProfile
       }
       case "match": {
         const mp = parseMatchStartParams(params.params);
-        this.defer(() => this.runMatch(params, mp));
+        const bound = boundNotifier(this.peer!, params.flow_id);
+        this.defer(async () => {
+          if (!bound.current()) return;
+          await this.runMatch(params, mp, bound);
+        });
         return { wmp: params.wmp, flow_id: params.flow_id, flow_type: params.flow_type };
       }
       default:
@@ -793,8 +803,7 @@ export class OpenID4xProfile
     else setTimeout(run, 0);
   }
 
-  private async runMatch(start: FlowStartParams, mp: MatchStartParams): Promise<void> {
-    const peer = this.peer!;
+  private async runMatch(start: FlowStartParams, mp: MatchStartParams, peer: FlowNotifier): Promise<void> {
     let result: MatchResult;
     try {
       result = await this.config.onMatch!(mp);

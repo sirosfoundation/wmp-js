@@ -349,6 +349,27 @@ export class Peer implements PeerContext {
     if (method === Method.FlowComplete || method === Method.FlowError) this.releaseFlow(flowIdOf(params));
   }
 
+  /** PeerContext: the generation token of an active flow (see {@link PeerContext.flowGeneration}). */
+  flowGeneration(flowId: string): object | undefined {
+    return this.recordedFlows.get(flowId);
+  }
+
+  /**
+   * PeerContext: send a flow notification on behalf of one flow generation. A
+   * generation that is no longer the flow's (the flow ended, was cancelled, and
+   * the id may have been started again) sends nothing and never touches the
+   * current flow's record.
+   */
+  async notifyFlow(generation: object | undefined, method: string, params: unknown): Promise<void> {
+    const id = flowIdOf(params);
+    if (typeof id === "string" && this.recordedFlows.get(id) !== generation) {
+      throw new Error("flow is no longer active");
+    }
+    await this.transport.send(createNotification(method, params));
+    // Retire the flow only if it is still the generation that sent this.
+    if (typeof id === "string" && this.recordedFlows.get(id) === generation) this.recordedFlows.delete(id);
+  }
+
   /** Drops the validation context of a flow that ended; the flow_id is free to start again. */
   private releaseFlow(flowId: unknown): void {
     if (typeof flowId === "string") this.recordedFlows.delete(flowId);

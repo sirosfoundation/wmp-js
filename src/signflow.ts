@@ -270,6 +270,21 @@ export function parseSignSubFlowParams(raw: unknown): SignSubFlowParams {
 export type FlowNotifier = Pick<PeerContext, "notify">;
 
 /**
+ * A notifier bound to ONE flow generation: its sends fail, without sending, once
+ * that flow ended (cancelled, completed, replaced under the same id), and never
+ * retire another generation's record. Falls back to plain `notify` for a
+ * PeerContext that cannot tell generations apart.
+ */
+export function boundNotifier(peer: PeerContext, flowId: string): FlowNotifier & { current(): boolean } {
+  const generation = peer.flowGeneration?.(flowId);
+  return {
+    notify: (method, params) => (peer.notifyFlow ? peer.notifyFlow(generation, method, params) : peer.notify(method, params)),
+    // Whether the flow this notifier was made for is still the active one.
+    current: () => !peer.flowGeneration || peer.flowGeneration(flowId) === generation,
+  };
+}
+
+/**
  * Ends a sub-flow successfully (wmp.flow.complete). The result is checked first
  * (default: the completion rules of {@link validateCompletionResult}; for a
  * match flow pass {@link validateMatchResult}); a result that would be refused
@@ -344,7 +359,11 @@ export function validateSignResult(action: string, result: unknown, responseMode
     // orchestrator unprotected and no later refusal can undo that (profile 7.7).
     // A plaintext mode has no use for a JWE the orchestrator cannot read.
     const encrypted = responseMode !== undefined && ENCRYPTED_RESPONSE_MODES.includes(responseMode);
-    if (encrypted) {
+    if ("error" in r) {
+      // An error result carries no presentation in any mode, and no response_jwe
+      // (profile 7.7): it reports a refusal, there is nothing to encrypt.
+      if ("vp_token" in r || "response_jwe" in r) throw new CompletionResultError("an error result carries neither vp_token nor response_jwe");
+    } else if (encrypted) {
       if ("vp_token" in r) throw new CompletionResultError("vp_token in an encrypted response mode; the response must be a response_jwe");
       if (!("response_jwe" in r)) throw new CompletionResultError("an encrypted response mode needs a response_jwe");
     } else if ("response_jwe" in r) {
