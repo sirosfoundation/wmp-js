@@ -304,7 +304,9 @@ describe("terminal notifications re-sent by a resume are processed once", () => 
 
   it("an unrelated gap does not repeat the completion callback", async () => {
     const onFlowComplete = vi.fn();
-    const { t, sid } = await setup(3, { onFlowComplete });
+    const { t, sid, peer } = await setup(3, { onFlowComplete });
+    void peer.startFlow("sign", "flow-done", {}).catch(() => {}); // a flow this client knows
+    await settle();
     stub.emit(sid, complete(sid, "flow-done"));
     await settle();
     expect(onFlowComplete).toHaveBeenCalledTimes(1);
@@ -332,6 +334,8 @@ describe("terminal notifications re-sent by a resume are processed once", () => 
   it("a new flow under a reused id is delivered again", async () => {
     const onFlowComplete = vi.fn();
     const { peer, t, sid } = await setup(200, { onFlowComplete });
+    void peer.startFlow("sign", "f", {}).catch(() => {});
+    await settle();
     stub.emit(sid, complete(sid, "f"));
     await settle();
     stub.emit(sid, complete(sid, "f")); // a repeat, different event id
@@ -453,7 +457,10 @@ describe("terminal bookkeeping (Peer)", () => {
   it("a repeated cancellation is acknowledged again without invoking the handler", async () => {
     const t = new MockTransport();
     const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }));
-    new Peer(t, { handler: { onFlowCancel } });
+    new Peer(t, { handler: { onFlowCancel, onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }) } });
+    t.receive(startReq("f1")); // a flow this peer knows
+    await settle2();
+    t.sent.length = 0;
     t.receive(cancel("f1", "c1"));
     await settle2();
     t.receive(cancel("f1", "c2")); // the re-send after a resume
@@ -480,7 +487,9 @@ describe("terminal bookkeeping (Peer)", () => {
   it("a refused completion counts as the flow's terminal (its synthesized error was delivered)", async () => {
     const t = new MockTransport();
     const onFlowError = vi.fn();
-    new Peer(t, { handler: { onFlowError } });
+    new Peer(t, { handler: { onFlowError, onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }) } });
+    t.receive(startReq("f1"));
+    await settle2();
     const bad = { jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "f1", result: { credential_response_encrypted: true, credentials: [{ credential: "x" }] } } };
     t.receive(bad);
     await settle2();
@@ -492,7 +501,7 @@ describe("terminal bookkeeping (Peer)", () => {
   it("a refused attempt to reuse a flow id keeps the old flow's terminal marker", async () => {
     const t = new MockTransport();
     const onFlowComplete = vi.fn();
-    let accept = false;
+    let accept = true;
     new Peer(t, {
       handler: {
         onFlowStart: async (p) => {
@@ -502,6 +511,9 @@ describe("terminal bookkeeping (Peer)", () => {
         onFlowComplete,
       },
     });
+    t.receive(startReq("f1")); // accepted: a flow this peer knows
+    await settle2();
+    accept = false;
     t.receive(done("f1"));
     await settle2();
     expect(onFlowComplete).toHaveBeenCalledTimes(1);
@@ -536,9 +548,14 @@ describe("terminal bookkeeping (Peer)", () => {
   it("never evicts a marker: replaying thousands of older terminals delivers nothing", async () => {
     const t = new MockTransport();
     const onFlowComplete = vi.fn();
-    new Peer(t, { handler: { onFlowComplete } });
+    new Peer(t, { handler: { onFlowComplete, onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }) } });
     const n = 4200;
-    for (let i = 0; i < n; i++) t.receive(done(`f${i}`));
+    for (let i = 0; i < n; i++) {
+      t.receive(startReq(`f${i}`));
+      await Promise.resolve();
+      await Promise.resolve();
+      t.receive(done(`f${i}`));
+    }
     await settle2();
     expect(onFlowComplete).toHaveBeenCalledTimes(n);
     for (let i = 0; i < n; i++) t.receive(done(`f${i}`)); // a resume re-sends them all
@@ -555,7 +572,10 @@ describe("cancellation and recovery bookkeeping (round 3)", () => {
   it("a flow that ended by complete still reaches the handler on its first cancel", async () => {
     const t = new MockTransport();
     const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "already_complete" }));
-    new Peer(t, { handler: { onFlowCancel, onFlowComplete: vi.fn() } });
+    new Peer(t, { handler: { onFlowCancel, onFlowComplete: vi.fn(), onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }) } });
+    t.receive({ jsonrpc: "2.0" as const, id: "s1", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f1", params: {} } });
+    await settle3();
+    t.sent.length = 0;
     t.receive(complete("f1"));
     await settle3();
     t.receive(cancel("f1", "c1"));
@@ -722,5 +742,125 @@ describe("cancellation generations (round 4)", () => {
     await settle4();
     expect(onFlowCancel).toHaveBeenCalledTimes(2);
     expect((t.sent[1] as { result: { status: string } }).result.status).toBe("cancelled");
+  });
+});
+
+describe("resumes and cancellations across sessions (round 5)", () => {
+  const settle5 = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  const cancel = (flow: string, id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: flow } });
+  const created = async (peer: Peer, t: MockTransport, sid: string, token = "rt1") => {
+    const p = peer.createSession({});
+    await settle5();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1", session_id: sid }, capabilities: {}, security: { mode: "tls" }, resumption_token: token } });
+    await p;
+  };
+
+  it("a gap while an explicit resume is pending waits for it and presents the rotated token", async () => {
+    const t = new MockTransport();
+    const lost: Error[] = [];
+    const peer = new Peer(t, { onSessionLost: (e) => lost.push(e) });
+    await created(peer, t, "ses-1");
+    t.sent.length = 0;
+    const explicit = peer.resumeSession();
+    await settle5();
+    t.emitEvent("gap"); // while the explicit resume is on the wire
+    await settle5(30);
+    const resumes = () => t.sent.filter((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string; params: { resumption_token: string } }[];
+    expect(resumes()).toHaveLength(1);
+    t.receive({ jsonrpc: "2.0", id: resumes()[0].id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, resumption_token: "rt2", security: { mode: "tls" } } });
+    await explicit;
+    await settle5(30);
+    expect(resumes()).toHaveLength(2);
+    expect(resumes()[1].params.resumption_token).toBe("rt2"); // not the consumed rt1
+    t.receive({ jsonrpc: "2.0", id: resumes()[1].id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, resumption_token: "rt3", security: { mode: "tls" } } });
+    await settle5(30);
+    expect(lost).toHaveLength(0);
+    expect(peer.token).toBe("rt3");
+  });
+
+  it("two explicit resumes in a row also use the rotated token", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    await created(peer, t, "ses-1");
+    t.sent.length = 0;
+    const a = peer.resumeSession();
+    const b = peer.resumeSession();
+    await settle5();
+    const resumes = () => t.sent.filter((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string; params: { resumption_token: string } }[];
+    expect(resumes()).toHaveLength(1);
+    t.receive({ jsonrpc: "2.0", id: resumes()[0].id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, resumption_token: "rt2", security: { mode: "tls" } } });
+    await a;
+    await settle5();
+    expect(resumes()[1].params.resumption_token).toBe("rt2");
+    t.receive({ jsonrpc: "2.0", id: resumes()[1].id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, resumption_token: "rt3", security: { mode: "tls" } } });
+    await b;
+  });
+
+  it("an unsuccessful resume result is reported through onSessionLost during recovery", async () => {
+    const t = new MockTransport();
+    const lost: Error[] = [];
+    const peer = new Peer(t, { onSessionLost: (e) => lost.push(e) });
+    await created(peer, t, "ses-1");
+    t.sent.length = 0;
+    t.emitEvent("gap");
+    await settle5();
+    const resume = t.sent.find((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string };
+    t.receive({ jsonrpc: "2.0", id: resume.id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: false, missed_messages: 0, resumption_token: "rtX", security: { mode: "tls" } } });
+    await settle5(30);
+    expect(lost).toHaveLength(1);
+    expect(peer.token).toBe("rt1"); // nothing was taken from the failed result
+  });
+
+  it("a pending cancellation does not follow the flow state into a new session", async () => {
+    const t = new MockTransport();
+    const gates: (() => void)[] = [];
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => {
+      await new Promise<void>((r) => gates.push(r));
+      return { wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" };
+    });
+    const onFlowComplete = vi.fn();
+    const peer = new Peer(t, { handler: { onFlowCancel, onFlowComplete } });
+    await created(peer, t, "ses-1");
+    t.receive(cancel("x", "c1")); // no record for x: pending
+    await settle5();
+    expect(onFlowCancel).toHaveBeenCalledTimes(1);
+    await created(peer, t, "ses-2"); // a new session resets the flow state
+    t.receive(cancel("x", "c2")); // the same id in the new session must not share the old promise
+    await settle5();
+    expect(onFlowCancel).toHaveBeenCalledTimes(2);
+    gates[0](); // the old session's handler finishes
+    await settle5();
+    void peer.startFlow("sign", "x", {}).catch(() => {}); // a flow with that id in the new session
+    await settle5();
+    t.receive({ jsonrpc: "2.0", method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "x", result: { credentials: [] } } });
+    await settle5();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1); // not suppressed as already cancelled
+    gates[1]();
+    await settle5();
+  });
+
+  it("an old session's cancellation finishing late does not re-label a flow that ended in the new session", async () => {
+    const t = new MockTransport();
+    const gates: (() => void)[] = [];
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => {
+      if (onFlowCancel.mock.calls.length === 1) await new Promise<void>((r) => gates.push(r)); // only the first, old one is slow
+      return { wmp: p.wmp, flow_id: p.flow_id, status: "cancel-handler" };
+    });
+    const peer = new Peer(t, { handler: { onFlowCancel, onFlowComplete: vi.fn() } });
+    await created(peer, t, "ses-1");
+    t.receive(cancel("x", "c1")); // pending, no record
+    await settle5();
+    await created(peer, t, "ses-2");
+    void peer.startFlow("sign", "x", {}).catch(() => {});
+    await settle5();
+    t.receive({ jsonrpc: "2.0", method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "x", result: { credentials: [] } } }); // x ended in the new session
+    await settle5();
+    gates[0](); // the old cancellation finishes now
+    await settle5();
+    t.sent.length = 0;
+    t.receive(cancel("x", "c2")); // first cancel of x in the new session: reaches the handler
+    await settle5();
+    expect(onFlowCancel).toHaveBeenCalledTimes(2);
+    expect((t.sent[0] as { result: { status: string } }).result.status).toBe("cancel-handler");
   });
 });

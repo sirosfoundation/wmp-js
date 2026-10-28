@@ -1166,11 +1166,14 @@ describe("session identity details (round 4)", () => {
     new Peer(t, {
       handler: {
         onFlowComplete,
+        onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }),
         onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }),
         onSessionResume: async () => ({ wmp: { version: "", session_id: target }, resumed: true, missed_messages: 0, security: { mode: "tls" } }),
       },
     });
     t.receive(mkCreate("c"));
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: "sf", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f", params: {} } }); // a flow this peer knows
     await settle();
     const done = { jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "f", result: { credentials: [] } } };
     t.receive(done);
@@ -1198,6 +1201,8 @@ describe("session identity details (round 4)", () => {
     await settle();
     t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" }, resumption_token: "rt" } });
     await created;
+    peer.startFlow("sign", "f", {}).catch(() => {}); // a flow this peer knows
+    await settle();
     const done = { jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "f", result: { credentials: [] } } };
     t.receive(done);
     await settle();
