@@ -446,10 +446,29 @@ export class Peer implements PeerContext {
     return result;
   }
 
-  /** Resume a previously established WMP session using a resumption token. */
+  /**
+   * Resume a previously established WMP session using a resumption token.
+   * Resumes run one at a time (explicit calls and gap recovery alike): the token
+   * is single use, so a second resume must wait for the first to store the
+   * rotated one and then present that.
+   */
   async resumeSession(opts?: {
     lastReceivedId?: string;
   }): Promise<SessionResumeResult> {
+    const previous = this.resumeChain;
+    let release!: () => void;
+    this.resumeChain = new Promise<void>((r) => (release = r));
+    await previous;
+    try {
+      return await this.resumeNow(opts);
+    } finally {
+      release();
+    }
+  }
+
+  private resumeChain: Promise<void> = Promise.resolve();
+
+  private async resumeNow(opts?: { lastReceivedId?: string }): Promise<SessionResumeResult> {
     if (!this.sessionId || !this.resumptionToken) {
       throw new Error("no session or resumption token to resume");
     }
@@ -486,8 +505,7 @@ export class Peer implements PeerContext {
       );
     }
     if (result.wmp?.session_id) {
-      // Resuming the same session keeps its flow state; another session does not.
-      if (result.wmp.session_id !== this.sessionId) this.resetFlows();
+      // (Flow state: resumeNegotiated below keeps it for the same session and drops it for another.)
       this.sessionId = result.wmp.session_id;
       this.bindSessionToTransport(result.wmp.session_id);
     }
@@ -955,14 +973,16 @@ export class Peer implements PeerContext {
             if (this.terminalSeen.get(flowId) === "cancelled") {
               return { wmp: p.wmp, flow_id: flowId, status: "cancelled" };
             }
-            // The flow generation this cancellation is for (its record, if any).
+            // The flow generation this cancellation is for: the session epoch and the
+            // flow's record (if any).
+            const gen = this.flowEpoch;
             const rec = this.recordedFlows.get(flowId);
             // A repeat for the same generation that arrives while the first is
             // still being processed shares its outcome. A replacement flow under
             // the same id is a different generation and gets its own run.
             const pending = this.cancelling.get(flowId);
-            if (pending && pending.rec === rec) return pending.run;
-            const entry: { rec: object | undefined; run: Promise<unknown> } = { rec, run: undefined as unknown as Promise<unknown> };
+            if (pending && pending.gen === gen && pending.rec === rec) return pending.run;
+            const entry: { gen: number; rec: object | undefined; run: Promise<unknown> } = { gen, rec, run: undefined as unknown as Promise<unknown> };
             entry.run = (async () => {
               // Yield first: the entry is installed before the handler can throw
               // (even synchronously), so its cleanup always sees it.
@@ -971,7 +991,7 @@ export class Peer implements PeerContext {
                 const result = await this.handler.onFlowCancel!(p);
                 // Finalize only the generation that was cancelled: if that flow
                 // ended and another started under the id meanwhile, leave it alone.
-                if (this.recordedFlows.get(flowId) === rec) this.endFlow(flowId, "cancelled");
+                if (this.flowEpoch === gen && this.recordedFlows.get(flowId) === rec) this.endFlow(flowId, "cancelled");
                 return result;
               } finally {
                 if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
@@ -1024,17 +1044,27 @@ export class Peer implements PeerContext {
     this.terminalSeen.set(flowId, kind);
   }
 
-  /** A flow ended: drop its validation context and remember how it ended. */
+  /**
+   * A flow ended: drop its validation context and, if this peer knew the flow
+   * (it was started here or by the remote peer and not yet ended), remember how
+   * it ended. A terminal message for a flow this peer never saw start is
+   * delivered as before but not remembered, so a remote peer cannot grow the
+   * history with fresh ids.
+   */
   private endFlow(flowId: unknown, kind: "ended" | "cancelled" = "ended"): void {
     if (typeof flowId !== "string") return;
-    this.recordedFlows.delete(flowId);
-    this.markTerminal(flowId, kind);
+    const known = this.recordedFlows.delete(flowId);
+    // A flow already in the history may be re-marked (a cancel of an ended flow
+    // upgrades its kind) without growing it.
+    if (known || this.terminalSeen.has(flowId)) this.markTerminal(flowId, kind);
   }
 
   /** A new or ended session: the old session's flow state does not carry over. */
   private resetFlows(): void {
+    this.flowEpoch++;
     this.recordedFlows.clear();
     this.terminalSeen.clear();
+    this.cancelling.clear(); // pending cancellations belong to the old session
   }
 
   /**
@@ -1049,6 +1079,12 @@ export class Peer implements PeerContext {
     }
     if (this.recordedFlows.size >= MAX_ACTIVE_FLOWS) {
       throw new WMPError(ErrorCode.RateLimited, "Too many active flows");
+    }
+    // The history of finished flows is bounded too, and it is never evicted (a
+    // dropped marker would weaken validation): at saturation new flows are
+    // refused until the session is renewed.
+    if (this.terminalSeen.size >= MAX_TERMINAL_HISTORY && !this.terminalSeen.has(flowId)) {
+      throw new WMPError(ErrorCode.RateLimited, "Too many finished flows in this session");
     }
     // A new flow under a reused ID is not a repeat of the old one's terminal
     // message. If the start fails the marker comes back (below).
@@ -1109,7 +1145,10 @@ export class Peer implements PeerContext {
    * belong to: a repeat for the SAME generation arriving meanwhile shares the
    * outcome; a replacement flow under the same id never does.
    */
-  private cancelling = new Map<string, { rec: object | undefined; run: Promise<unknown> }>();
+  private cancelling = new Map<string, { gen: number; rec: object | undefined; run: Promise<unknown> }>();
+
+  /** Incremented whenever the flow state is reset (session closed or replaced). */
+  private flowEpoch = 0;
 
   // Track flow_id → flow_type mapping for routing to the right FlowHandler.
   private activeFlows = new Map<string, string>();
@@ -1227,6 +1266,9 @@ const noop = (): void => {};
 
 /** Most flows a peer holds validation context for at once; a new start beyond it is refused. */
 const MAX_ACTIVE_FLOWS = 4096;
+
+/** Most finished flows remembered per session; at that point new starts are refused until the session is renewed. */
+const MAX_TERMINAL_HISTORY = 65536;
 
 function toRPCError(err: unknown): RPCError {
   if (err instanceof WMPError) {
