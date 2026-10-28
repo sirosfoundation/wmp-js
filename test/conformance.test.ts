@@ -25,6 +25,10 @@ import {
 } from "../src/completion.js";
 import { Peer } from "../src/peer.js";
 import { MockTransport } from "./mock-transport.js";
+import { parseSignSubFlowParams, parseMatchStartParams } from "../src/signflow.js";
+import { validateSelectCredentialsParams } from "../src/consent.js";
+import { ActionParamsError } from "../src/consent.js";
+import { WMPError } from "../src/jsonrpc.js";
 import { loadManifest, loadVectors, vectorFilesOnDisk, vectorsDir, specDir, type TestVector } from "./vectors.js";
 
 // Collect all known method names from the Method constant
@@ -327,7 +331,30 @@ describe("Conformance: error codes match Core §3.8", () => {
 
 interface FlowMsg {
   method?: string;
-  params?: { flow_id?: string; flow_type?: string; params?: { dcql_query?: { credentials?: { id: string }[] } }; result?: unknown };
+  params?: {
+    flow_id?: string;
+    flow_type?: string;
+    action?: string;
+    params?: { dcql_query?: { credentials?: { id: string }[] } } & Record<string, unknown>;
+    result?: unknown;
+  };
+}
+
+/** Members of sign params that the engine-blind design adds; none may be lost by parsing. */
+const ENGINE_BLIND_SIGN_MEMBERS = [
+  "credential_response_encryption", "jwe", "deferred", "response_encryption", "state",
+  "auxiliary_data_to_issuer", "credential_type", "credential_issuer",
+];
+
+/** Runs `check`, reporting whether it refused (a protocol-level refusal) or threw something else. */
+function refuses(check: () => void): boolean {
+  try {
+    check();
+    return false;
+  } catch (e) {
+    if (e instanceof CompletionResultError || e instanceof ActionParamsError || e instanceof WMPError) return true;
+    throw e;
+  }
 }
 
 function messagesOf(input: unknown): FlowMsg[] {
@@ -353,6 +380,23 @@ function runFlowChecks(v: TestVector): boolean[] {
       flowTypes.set(id, msg.params?.flow_type ?? "");
       const q = msg.params?.params?.dcql_query?.credentials;
       if (q) queryIds.set(id, q.map((c) => c.id));
+      if (msg.params?.flow_type === "sign") {
+        outcomes.push(
+          refuses(() => {
+            const parsed = parseSignSubFlowParams(msg.params!.params);
+            // Every member the engine-blind design adds survives, unchanged.
+            for (const k of ENGINE_BLIND_SIGN_MEMBERS) {
+              if (msg.params!.params && k in msg.params!.params) expect(parsed[k], `sign params member ${k} dropped`).toEqual(msg.params!.params[k]);
+            }
+          }),
+        );
+      } else if (msg.params?.flow_type === "match") {
+        outcomes.push(refuses(() => parseMatchStartParams(msg.params!.params)));
+      }
+      continue;
+    }
+    if (msg.method === "wmp.flow.action" && msg.params?.action === "select_credentials") {
+      outcomes.push(refuses(() => validateSelectCredentialsParams(msg.params!.params)));
       continue;
     }
     if (msg.method !== "wmp.flow.complete" || msg.params?.result === undefined) continue;
@@ -373,7 +417,7 @@ describe("Conformance: flow-lifecycle vectors are executed", () => {
   const vectors = loadVectors("flow-lifecycle.json");
   // must_refuse vectors whose check is not implemented yet, by method of the
   // refused message. Nothing may be added; an implemented check removes its entry.
-  const pendingMustRefuse = new Set<string>(["wmp.flow.action"]);
+  const pendingMustRefuse = new Set<string>();
 
   for (const v of vectors) {
     it(`${v.id}: ${v.must_refuse ? "is refused" : "passes the flow checks"}`, () => {
@@ -393,7 +437,7 @@ describe("Conformance: flow-lifecycle vectors are executed", () => {
 
   it("executes a substantial number of must_refuse vectors", () => {
     const executed = vectors.filter((v) => v.must_refuse && runFlowChecks(v).length > 0);
-    expect(executed.length).toBeGreaterThanOrEqual(15);
+    expect(executed.length).toBe(vectors.filter((v) => v.must_refuse).length);
   });
 
   for (const v of vectors.filter((x) => x.expected_replay !== undefined)) {

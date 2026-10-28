@@ -6,6 +6,7 @@
  */
 
 import type {
+  Capabilities,
   FlowStartParams,
   FlowStartResult,
   FlowActionParams,
@@ -27,6 +28,20 @@ import type {
 } from "./profile.js";
 import { WMPError } from "./jsonrpc.js";
 import { unsupportedError } from "./errors.js";
+import { validateMatchResult } from "./completion.js";
+import {
+  CAPABILITY_TRANSACTION_DATA,
+  SignFlow,
+  dcqlQueryIds,
+  completeSubFlow,
+  parseMatchStartParams,
+  parseSignSubFlowParams,
+  rejectSubFlow,
+  transactionDataUnsupportedError,
+  type MatchResult,
+  type MatchStartParams,
+  type TransactionDataCapability,
+} from "./signflow.js";
 
 // ---------------------------------------------------------------------------
 // Credential format constants — aligned with wallet-common VerifiableCredentialFormat
@@ -348,22 +363,35 @@ export async function withAttestation(
 }
 
 /**
- * TransactionData represents a single transaction data object from
- * the verifier's OID4VP authorization request (TS12/SCA).
+ * A single transaction data entry of the verifier's OID4VP request (EC TS12),
+ * as the orchestrator sends it in a sign_presentation sub-flow (profile
+ * Section 3.2.5).
+ *
+ * A presentation binds to `raw`, not to the object it decodes to: OID4VP 1.0
+ * (Appendix B) hashes the base64url string as received, and re-encoding the
+ * decoded object does not reproduce it. A wallet hashes `raw`
+ * ({@link transactionDataHash}), decodes it itself and refuses an entry whose
+ * other members disagree with the decoding ({@link checkTransactionDataEntry}).
  */
 export interface TransactionData {
+  /** The entry exactly as the verifier sent it: the base64url string. */
+  raw: string;
+  /** `type` of the decoded entry. */
   type: string;
-  params?: Record<string, unknown>;
-  /** Credential IDs this transaction data applies to */
-  credential_ids?: string[];
-  /** Hash algorithm for transaction_data_hashes */
-  hash_alg?: string;
+  /** `credential_ids` of the decoded entry: the DCQL credential query ids it is bound to. */
+  credential_ids: string[];
+  /** `payload` of the decoded entry (EC TS12 Section 4.2). For validation and display; never hash it. */
+  payload?: Record<string, unknown>;
   /**
    * The verifier's acceptable hash algorithms for this entry (OID4VP). An
    * array on the wire; a bare string is accepted from older peers. Read it
    * through {@link transactionDataHashesAlgs}.
    */
   transaction_data_hashes_alg?: string[] | string;
+  /** @deprecated TS12 types carry their members in `payload`. */
+  params?: Record<string, unknown>;
+  /** @deprecated Non-standard; use transaction_data_hashes_alg. */
+  hash_alg?: string;
 }
 
 /**
@@ -379,29 +407,102 @@ export function transactionDataHashesAlgs(td: Pick<TransactionData, "transaction
   return [];
 }
 
-export interface SignSubFlowParams {
-  action: string;
-  nonce: string;
-  audience: string;
-  proof_type?: string;
-  parent_flow_id: string;
-  transaction_data?: TransactionData[];
+/** One element of `credentials_to_include`: the credential query the user consented to answer, and nothing else. */
+export interface CredentialToInclude {
+  credential_query_id: string;
 }
 
+/** `credential_response_encryption` of a generate_proof request (profile 3.1.5.1). */
+export interface CredentialResponseEncryption {
+  alg: string;
+  enc: string;
+  required: boolean;
+}
+
+/**
+ * Params of a `sign` flow.start the wallet answers (Core Section 6, profile
+ * Sections 3.1.5, 3.2.5 and 7). Mirrors go-wmp openid4x.SignSubFlowParams
+ * (v0.11.0) member for member; members a peer sends that are not listed here
+ * are kept by {@link parseSignSubFlowParams}, never dropped.
+ */
+export interface SignSubFlowParams {
+  /** generate_proof, sign_presentation, decrypt_credential_response, sign_client_auth, ... */
+  action: string;
+  /** The oid4vci/oid4vp flow this sub-flow belongs to. Absent for a plain Core sign flow. */
+  parent_flow_id?: string;
+  nonce?: string;
+  audience?: string;
+  proof_type?: string;
+  /** JWT `iss` for generated proof JWTs (typically the OAuth client_id). */
+  issuer?: string;
+  /** The issuer's proof_types_supported map. */
+  proof_types_supported?: Record<string, unknown>;
+  /** Number of proofs to generate (batch size); 1 when absent. */
+  count?: number;
+  /** Verifier's response endpoint (mdoc session transcript; sign_presentation). */
+  response_uri?: string;
+  verifier_jwk_thumbprint?: string;
+  verifier_session_id?: string;
+  /** The verifier's client_metadata, verbatim (profile 7.1). */
+  client_metadata?: Record<string, unknown>;
+  /** The request as the engine validated it (profile 7.5). Carries no trust verdict. */
+  verified_request?: Record<string, unknown>;
+  /** Recipient the wallet encrypts the JARM response to (direct_post.jwt; profile 7.7). */
+  response_encryption?: Record<string, unknown>;
+  state?: string;
+  /** The OID4VP response_mode; required in the key binding JWT of an SCA presentation. */
+  response_mode?: string;
+  /** The request's transaction data, in the verifier's order. */
+  transaction_data?: TransactionData[];
+  /** The credential queries the user consented to answer; nothing but the query id of each. */
+  credentials_to_include?: CredentialToInclude[];
+  /** The handle of the select_credentials action, handed back unchanged. */
+  selection_handle?: string;
+  /** Renewal: sign with the existing key identified by this kid. */
+  reissuance_kid?: string;
+  // sign_client_auth
+  htm?: string;
+  htu?: string;
+  dpop_nonce?: string;
+  ath?: string;
+  key_id?: string;
+  attestation_challenge?: string;
+  // generate_proof extensions (profile 3.1.5.1)
+  credential_response_encryption?: CredentialResponseEncryption;
+  auxiliary_data_to_issuer?: Record<string, unknown>[];
+  credential_type?: string;
+  credential_issuer?: string;
+  // decrypt_credential_response
+  jwe?: string;
+  deferred?: boolean;
+  /** Members this library does not model are preserved. */
+  [member: string]: unknown;
+}
+
+/** Accept offer action params (OID4VCI). */
 export interface SelectionAction {
   selected_indices: number[];
   consent: boolean;
 }
 
+/**
+ * `select_credentials` action params (profile 3.2.3.1): a closed set. The
+ * orchestrator learns that the user consented and for which of the verifier's
+ * own query ids; never a credential, claim, count or free text. Build with
+ * {@link buildSelectCredentials}, check with {@link validateSelectCredentialsParams}.
+ */
 export interface ConsentAction {
-  selections: CredentialSelection[];
   consent: boolean;
+  /** At least one element when consent is true; absent or empty otherwise. */
+  selections?: CredentialSelection[];
 }
 
+/** One consented credential query and the opaque per-flow handle. Both members, nothing else. */
 export interface CredentialSelection {
-  credential_id: string;
-  credential_query_id?: string;
-  disclosed_claims: string[];
+  /** The `id` of a credential query of the verifier's request. */
+  query_id: string;
+  /** 22+ base64url characters, the same in every element: the match result's handle, or one the wallet chose. */
+  selection_handle: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -424,8 +525,33 @@ export interface OpenID4xConfig {
   /** OID4VCI capability. Omit to disable issuance. */
   oid4vci?: OID4VCICapability;
 
-  /** OID4VCI capability. Omit to disable issuance. */
+  /** OID4VP capability. Omit to disable presentation. */
   oid4vp?: OID4VPCapability;
+
+  /**
+   * transaction_data capability (profile 2.3). Offer it only if the wallet does
+   * everything profile 3.2.5 requires: hash `raw`, validate and display the
+   * decoded entry, fail closed. Omit to not advertise it; a sign sub-flow that
+   * carries transaction_data is then refused with -31005.
+   */
+  transactionData?: TransactionDataCapability;
+
+  /**
+   * Called for each `sign` sub-flow the orchestrator starts (generate_proof,
+   * sign_presentation, decrypt_credential_response, ...), after the start was
+   * validated and answered. Answer through the SignFlow: complete(), reject()
+   * (-31006 rejected), fail() or unsupportedTransactionData(). A throw ends the
+   * sub-flow with wmp.flow.error. Without it the profile does not handle `sign`.
+   */
+  onSign?: (flow: SignFlow) => void | Promise<void>;
+
+  /**
+   * Answers a `match` flow (profile 3.3): evaluate the DCQL query locally and
+   * return the closed result. Throw {@link SubFlowRejectedError} when the user
+   * declines; any other throw answers satisfiable=false, code "error". The result
+   * is validated before it is sent. Needs `oid4vp`.
+   */
+  onMatch?: (params: MatchStartParams) => MatchResult | Promise<MatchResult>;
 
   /** Called when an OID4VCI flow starts. */
   onVCIStart?: FlowStartHandler;
@@ -451,6 +577,14 @@ export interface OpenID4xConfig {
    * wmp.credential.notification. Default: true.
    */
   requireRegisteredNotification?: boolean;
+}
+
+/** Thrown from `onMatch` when the user declines: the match flow ends with -31006 rejected. */
+export class SubFlowRejectedError extends Error {
+  constructor() {
+    super("sub-flow rejected");
+    this.name = "SubFlowRejectedError";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +618,28 @@ export class OpenID4xProfile
     const caps: string[] = [];
     if (this.config.oid4vci) caps.push("oid4vci");
     if (this.config.oid4vp) caps.push("oid4vp");
+    if (this.config.transactionData) caps.push(CAPABILITY_TRANSACTION_DATA);
+    return caps;
+  }
+
+  /**
+   * The capability descriptors for session negotiation (mirror of go-wmp
+   * CapabilityDescriptors): "oid4vci", "oid4vp" and "transaction_data", each
+   * present only when configured, required list members as [] rather than
+   * missing. Throws for a transaction_data descriptor that lists no version:
+   * it would advertise a capability no peer can use.
+   */
+  capabilityDescriptors(): Capabilities {
+    const caps: Capabilities = {};
+    const c = this.config;
+    if (c.oid4vci) caps.oid4vci = { ...c.oid4vci, supported_grants: c.oid4vci.supported_grants ?? [], supported_formats: c.oid4vci.supported_formats ?? [] };
+    if (c.oid4vp) caps.oid4vp = { ...c.oid4vp, supported_response_modes: c.oid4vp.supported_response_modes ?? [], supported_formats: c.oid4vp.supported_formats ?? [] };
+    if (c.transactionData) {
+      if (!Array.isArray(c.transactionData.versions) || c.transactionData.versions.length === 0) {
+        throw new Error("openid4x: transaction_data descriptor lists no versions");
+      }
+      caps[CAPABILITY_TRANSACTION_DATA] = { ...c.transactionData };
+    }
     return caps;
   }
 
@@ -549,6 +705,8 @@ export class OpenID4xProfile
     const types: string[] = [];
     if (this.config.oid4vci) types.push(OID4FlowType.OID4VCI);
     if (this.config.oid4vp) types.push(OID4FlowType.OID4VP);
+    if (this.config.onSign) types.push("sign");
+    if (this.config.onMatch && this.config.oid4vp) types.push("match");
     return types;
   }
 
@@ -558,6 +716,7 @@ export class OpenID4xProfile
       case OID4FlowType.OID4VCI:
         return "oid4vci";
       case OID4FlowType.OID4VP:
+      case "match": // a nested flow of an oid4vp flow, defined for the oid4vp capability (profile 3.3)
         return "oid4vp";
       default:
         return "";
@@ -588,9 +747,59 @@ export class OpenID4xProfile
           flow_type: params.flow_type,
         };
       }
+      case "sign": {
+        const sp = parseSignSubFlowParams(params.params);
+        // Transaction data the wallet did not offer to process: refuse, never sign without binding.
+        if (sp.transaction_data && sp.transaction_data.length > 0 && !this.config.transactionData) {
+          throw transactionDataUnsupportedError();
+        }
+        const flow = new SignFlow(this.peer!, params.wmp, params.flow_id, sp);
+        this.defer(async () => {
+          try {
+            await this.config.onSign!(flow);
+          } catch (err) {
+            // A fixed message: whatever the callback threw may carry credential data.
+            if (err instanceof WMPError) await flow.fail(err.code, err.rpcMessage, err.data);
+            else await flow.fail(ErrorCode.FlowError, "Sign failed");
+          }
+        });
+        return { wmp: params.wmp, flow_id: params.flow_id, flow_type: params.flow_type };
+      }
+      case "match": {
+        const mp = parseMatchStartParams(params.params);
+        this.defer(() => this.runMatch(params, mp));
+        return { wmp: params.wmp, flow_id: params.flow_id, flow_type: params.flow_type };
+      }
       default:
         throw unsupportedError(params.flow_type);
     }
+  }
+
+  /** Runs after the flow.start response was sent, so the completion never overtakes it. */
+  private defer(fn: () => Promise<void>): void {
+    setTimeout(() => {
+      fn().catch(() => {
+        /* the answer could not be sent: the orchestrator's flow timeout applies */
+      });
+    }, 0);
+  }
+
+  private async runMatch(start: FlowStartParams, mp: MatchStartParams): Promise<void> {
+    const peer = this.peer!;
+    let result: MatchResult;
+    try {
+      result = await this.config.onMatch!(mp);
+      validateMatchResult(result, dcqlQueryIds(mp.dcql_query));
+    } catch (err) {
+      if (err instanceof SubFlowRejectedError) {
+        await rejectSubFlow(peer, start.wmp, start.flow_id);
+        return;
+      }
+      // The wallet could not evaluate the query (or produced a result the
+      // orchestrator would refuse): code is the whole reason, never the cause.
+      result = { satisfiable: false, code: "error" };
+    }
+    await completeSubFlow(peer, start.wmp, start.flow_id, result, (r) => validateMatchResult(r, dcqlQueryIds(mp.dcql_query)));
   }
 
   async handleAction(params: FlowActionParams): Promise<FlowActionResult> {

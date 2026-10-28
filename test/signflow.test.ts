@@ -1,0 +1,415 @@
+import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import {
+  CAPABILITY_TRANSACTION_DATA,
+  checkTransactionDataEntry,
+  completeSubFlow,
+  decodeTransactionData,
+  offersTransactionData,
+  parseMatchStartParams,
+  parseSignSubFlowParams,
+  rejectSubFlow,
+  transactionDataHash,
+  transactionDataUnsupportedData,
+  transactionDataUnsupportedError,
+  unsupportedTransactionData,
+} from "../src/signflow.js";
+import { OpenID4xProfile, SubFlowRejectedError } from "../src/openid4x.js";
+import { CompletionResultError } from "../src/completion.js";
+import { Peer } from "../src/peer.js";
+import { WMPError, type Response } from "../src/jsonrpc.js";
+import { ErrorCode } from "../src/types.js";
+import { MockTransport } from "./mock-transport.js";
+import { vectorsDir } from "./vectors.js";
+
+const H = "Zm9yLXRoZS13YWxsZXQtb25seQ";
+const enc = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+const raw = enc({ type: "urn:eudi:sca:payment:1", credential_ids: ["pay"], payload: { transaction_id: "tx-1" } });
+const entry = (extra: Record<string, unknown> = {}) => ({ raw, type: "urn:eudi:sca:payment:1", credential_ids: ["pay"], payload: { transaction_id: "tx-1" }, ...extra });
+
+const sign = (extra: Record<string, unknown> = {}) => ({
+  action: "sign_presentation",
+  nonce: "n",
+  audience: "x509_san_dns:shop.example.com",
+  parent_flow_id: "flow-vp-001",
+  ...extra,
+});
+
+function code(fn: () => unknown): number | undefined {
+  try {
+    fn();
+  } catch (e) {
+    return (e as WMPError).code;
+  }
+  return undefined;
+}
+
+describe("transaction_data hashing (spec vectors)", () => {
+  const file = JSON.parse(readFileSync(resolve(vectorsDir(), "openid4x/transaction-data-hashes.json"), "utf8")) as {
+    vectors: { name: string; raw: string; json: string; hashes: Record<string, string>; noncanonical: boolean }[];
+  };
+
+  it("loads the vectors", () => {
+    expect(file.vectors.length).toBeGreaterThanOrEqual(10);
+  });
+
+  for (const v of file.vectors) {
+    it(`${v.name}: hash of raw for every algorithm`, () => {
+      for (const [alg, want] of Object.entries(v.hashes)) {
+        expect(transactionDataHash(v.raw, alg), `${v.name} ${alg}`).toBe(want);
+      }
+      // raw decodes to the documented json; re-serializing it must NOT be what is hashed
+      expect(Buffer.from(v.raw, "base64url").toString("utf8")).toBe(v.json);
+      // Where re-serializing the decoded object changes the bytes, hashing it would bind something else.
+      const reserialized = Buffer.from(JSON.stringify(JSON.parse(v.json))).toString("base64url");
+      if (reserialized !== v.raw) expect(transactionDataHash(reserialized, "sha-256")).not.toBe(v.hashes["sha-256"]);
+    });
+  }
+
+  it("refuses an algorithm it cannot compute and a non-ASCII raw", () => {
+    expect(() => transactionDataHash("abc", "md5")).toThrow();
+    expect(() => transactionDataHash("abcé")).toThrow();
+    expect(transactionDataHash("abc")).toBe(transactionDataHash("abc", "sha-256"));
+  });
+});
+
+describe("checkTransactionDataEntry", () => {
+  it("accepts a consistent entry and returns the decoded object", () => {
+    expect(checkTransactionDataEntry(entry()).type).toBe("urn:eudi:sca:payment:1");
+    expect(decodeTransactionData(raw).payload).toEqual({ transaction_id: "tx-1" });
+  });
+  it("refuses members that disagree with raw", () => {
+    expect(code(() => checkTransactionDataEntry(entry({ type: "urn:other" })))).toBe(-32602);
+    expect(code(() => checkTransactionDataEntry(entry({ credential_ids: ["other"] })))).toBe(-32602);
+    expect(code(() => checkTransactionDataEntry(entry({ payload: { transaction_id: "tx-2" } })))).toBe(-32602);
+    expect(code(() => checkTransactionDataEntry(entry({ transaction_data_hashes_alg: ["sha-512"] })))).toBe(-32602);
+  });
+  it("compares hash algorithms ignoring array vs bare string", () => {
+    const r = enc({ type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256"] });
+    expect(() => checkTransactionDataEntry({ raw: r, type: "t", credential_ids: ["a"], transaction_data_hashes_alg: "sha-256" })).not.toThrow();
+  });
+  it("refuses a raw that is not base64url JSON object", () => {
+    for (const bad of ["!!!", "e30=", "bnVsbA", enc([1]), "A"]) {
+      expect(code(() => decodeTransactionData(bad)), bad).toBe(-32602);
+    }
+  });
+});
+
+describe("parseSignSubFlowParams", () => {
+  it("accepts the documented shapes and keeps unknown members", () => {
+    const p = parseSignSubFlowParams(sign({ response_mode: "direct_post", credentials_to_include: [{ credential_query_id: "pay" }], selection_handle: H, transaction_data: [entry()], future_member: { a: 1 } }));
+    expect(p.future_member).toEqual({ a: 1 });
+    expect(p.transaction_data).toHaveLength(1);
+    expect(() => parseSignSubFlowParams({ action: "generate_proof", audience: "x", credential_response_encryption: { alg: "ECDH-ES", enc: "A256GCM", required: true } })).not.toThrow();
+    expect(() => parseSignSubFlowParams({ action: "decrypt_credential_response", parent_flow_id: "p", jwe: "a.b.c.d.e", deferred: false })).not.toThrow();
+  });
+
+  it("refuses unknown action, malformed members, the old credentials_to_include shape", () => {
+    const cases: [string, unknown][] = [
+      ["not object", []],
+      ["no action", {}],
+      ["unknown action", { action: "no-such-action" }],
+      ["empty parent", sign({ parent_flow_id: "" })],
+      ["nonce not string", sign({ nonce: 5 })],
+      ["client_metadata not object", sign({ client_metadata: [] })],
+      ["count 0", { action: "generate_proof", count: 0 }],
+      ["count too big", { action: "generate_proof", count: 257 }],
+      ["count float", { action: "generate_proof", count: 1.5 }],
+      ["deferred string", { action: "decrypt_credential_response", deferred: "no" }],
+      ["bad handle", sign({ selection_handle: "x" })],
+      ["old credentials_to_include", sign({ credentials_to_include: [{ credential_id: "c", credential_query_id: "pay", disclosed_claims: ["a"] }] })],
+      ["credentials_to_include id only", sign({ credentials_to_include: [{ credential_id: "c" }] })],
+      ["sign_presentation without nonce", { action: "sign_presentation", audience: "a" }],
+      ["cre bad", { action: "generate_proof", credential_response_encryption: { alg: 1 } }],
+      ["aux not objects", { action: "generate_proof", auxiliary_data_to_issuer: ["x"] }],
+      ["td not array", sign({ transaction_data: {} })],
+      ["td entry type", sign({ response_mode: "x", transaction_data: [entry({ type: 5 })] })],
+      ["td entry creds", sign({ response_mode: "x", transaction_data: [entry({ credential_ids: "pay" })] })],
+      ["td alg empty array", sign({ response_mode: "x", transaction_data: [entry({ transaction_data_hashes_alg: [] })] })],
+      ["td alg empty string", sign({ response_mode: "x", transaction_data: [entry({ transaction_data_hashes_alg: "" })] })],
+      ["td disagrees with raw", sign({ response_mode: "x", transaction_data: [entry({ type: "urn:other" })] })],
+      ["td without response_mode", sign({ transaction_data: [entry()] })],
+    ];
+    for (const [name, c] of cases) expect(code(() => parseSignSubFlowParams(c)), name).toBe(-32602);
+  });
+
+  it("answers -31005 unsupported transaction_data for an entry without raw", () => {
+    for (const e of [{ type: "t", credential_ids: ["a"] }, entry({ raw: "" })]) {
+      try {
+        parseSignSubFlowParams(sign({ response_mode: "x", transaction_data: [e] }));
+        throw new Error("not refused");
+      } catch (err) {
+        expect((err as WMPError).code).toBe(-31005);
+        expect((err as WMPError).data).toEqual({ unsupported: "transaction_data" });
+      }
+    }
+  });
+
+  it("accepts a bare-string transaction_data_hashes_alg", () => {
+    const r = enc({ type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256"] });
+    const e = { raw: r, type: "t", credential_ids: ["a"], transaction_data_hashes_alg: "sha-256" };
+    expect(() => parseSignSubFlowParams(sign({ response_mode: "x", transaction_data: [e] }))).not.toThrow();
+  });
+});
+
+describe("parseMatchStartParams", () => {
+  it("validates parent_flow_id and dcql_query", () => {
+    expect(parseMatchStartParams({ parent_flow_id: "p", dcql_query: { credentials: [] } }).parent_flow_id).toBe("p");
+    for (const b of [{}, { parent_flow_id: "p" }, { dcql_query: {} }, { parent_flow_id: "p", dcql_query: [] }, { parent_flow_id: "p", dcql_query: {}, verified_request: 1 }, null]) {
+      expect(code(() => parseMatchStartParams(b))).toBe(-32602);
+    }
+  });
+});
+
+describe("transaction_data capability", () => {
+  it("offersTransactionData reads what the peer offered", () => {
+    expect(offersTransactionData({ transaction_data: { versions: [1] } })).toBe(true);
+    expect(offersTransactionData({ transaction_data: { versions: [2] } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [2, 1] } })).toBe(true);
+    expect(offersTransactionData({ transaction_data: { versions: "1" } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: {} })).toBe(false);
+    expect(offersTransactionData({ transaction_data: "x" })).toBe(false);
+    expect(offersTransactionData({})).toBe(false);
+    expect(offersTransactionData(undefined)).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [2] } }, 2)).toBe(true);
+    expect(CAPABILITY_TRANSACTION_DATA).toBe("transaction_data");
+  });
+
+  it("unsupported data/error: unsupported always present, redirect_uri additive", () => {
+    expect(transactionDataUnsupportedData()).toEqual({ unsupported: "transaction_data" });
+    expect(transactionDataUnsupportedData("https://v.example/cb?x")).toEqual({ unsupported: "transaction_data", redirect_uri: "https://v.example/cb?x" });
+    const e = transactionDataUnsupportedError("https://v.example/cb");
+    expect(e.code).toBe(-31005);
+    expect(e.data).toEqual({ unsupported: "transaction_data", redirect_uri: "https://v.example/cb" });
+  });
+});
+
+describe("answer helpers", () => {
+  const wmp = { version: "0.1", session_id: "ses-1", sender: "x509:san:dns:orch" };
+  it("completeSubFlow sends flow.complete with only version and session", async () => {
+    const notify = vi.fn(async () => {});
+    await completeSubFlow({ notify }, wmp, "f1", { proof_jwt: "eyJ" });
+    expect(notify).toHaveBeenCalledWith("wmp.flow.complete", { wmp: { version: "0.1", session_id: "ses-1" }, flow_id: "f1", result: { proof_jwt: "eyJ" } });
+  });
+  it("completeSubFlow does not send a non-conforming result", async () => {
+    const notify = vi.fn(async () => {});
+    await expect(completeSubFlow({ notify }, wmp, "f1", { credential_count: 1, transaction_id: "t" })).rejects.toBeInstanceOf(CompletionResultError);
+    expect(notify).not.toHaveBeenCalled();
+  });
+  it("rejectSubFlow is -31006 with data.reason rejected", async () => {
+    const notify = vi.fn(async () => {});
+    await rejectSubFlow({ notify }, wmp, "f1");
+    expect(notify).toHaveBeenCalledWith("wmp.flow.error", { wmp: { version: "0.1", session_id: "ses-1" }, flow_id: "f1", code: -31006, message: "declined", data: { reason: "rejected" } });
+  });
+  it("unsupportedTransactionData is -31005 with data.unsupported", async () => {
+    const notify = vi.fn(async () => {});
+    await unsupportedTransactionData({ notify }, wmp, "f1");
+    expect(notify).toHaveBeenCalledWith("wmp.flow.error", { wmp: { version: "0.1", session_id: "ses-1" }, flow_id: "f1", code: -31005, message: "Capability not supported", data: { unsupported: "transaction_data" } });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The profile end to end over a Peer
+// ---------------------------------------------------------------------------
+
+const settle = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+
+function start(type: string, flowId: string, params: unknown) {
+  return { jsonrpc: "2.0" as const, id: `s-${flowId}`, method: "wmp.flow.start", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: type, flow_id: flowId, params } };
+}
+
+async function walletPeer(config: ConstructorParameters<typeof OpenID4xProfile>[0], caps: Record<string, unknown> = { oid4vp: {}, oid4vci: {} }) {
+  const t = new MockTransport();
+  const peer = new Peer(t, {
+    handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: caps, security: { mode: "tls" } }) },
+  });
+  peer.use(new OpenID4xProfile(config));
+  t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+  await settle();
+  t.sent.length = 0;
+  return { t, peer };
+}
+
+describe("OpenID4xProfile as sign responder", () => {
+  it("answers the start, then lets the callback complete the sub-flow (after the response)", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: async (flow) => {
+        expect(flow.params.action).toBe("generate_proof");
+        await flow.complete({ proof_jwt: "eyJ" });
+      },
+    });
+    t.receive(start("sign", "flow-1-sign", { action: "generate_proof", nonce: "n", audience: "a", proof_type: "jwt", parent_flow_id: "flow-1" }));
+    await settle();
+    expect((t.sent[0] as Response).result).toMatchObject({ flow_id: "flow-1-sign", flow_type: "sign" });
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.complete", params: { flow_id: "flow-1-sign", result: { proof_jwt: "eyJ" } } });
+  });
+
+  it("refuses a malformed start with -32602 and never calls the callback", async () => {
+    const onSign = vi.fn();
+    const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign });
+    t.receive(start("sign", "f", { action: "no-such-action" }));
+    await settle();
+    expect((t.sent[0] as Response).error?.code).toBe(-32602);
+    expect(onSign).not.toHaveBeenCalled();
+  });
+
+  it("lets the callback reject the sub-flow", async () => {
+    const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign: (flow) => flow.reject() });
+    t.receive(start("sign", "f", sign()));
+    await settle();
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.error", params: { code: -31006, data: { reason: "rejected" } } });
+  });
+
+  it("ends the sub-flow with a fixed error when the callback throws something unexpected", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: () => {
+        throw new Error("secret detail: refresh_token=abc");
+      },
+    });
+    t.receive(start("sign", "f", sign()));
+    await settle();
+    const err = t.sent[1] as { method: string; params: { code: number; message: string } };
+    expect(err.method).toBe("wmp.flow.error");
+    expect(err.params.code).toBe(-31006);
+    expect(JSON.stringify(err)).not.toContain("secret");
+    expect(JSON.stringify(err)).not.toContain("refresh_token");
+  });
+
+  it("passes a WMPError the callback throws through", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: () => {
+        throw new WMPError(ErrorCode.InvalidParams, "bad nonce", { reason: "nonce" });
+      },
+    });
+    t.receive(start("sign", "f", sign()));
+    await settle();
+    expect(t.sent[1]).toMatchObject({ params: { code: -32602, message: "bad nonce", data: { reason: "nonce" } } });
+  });
+
+  it("refuses transaction_data with -31005 unless the capability is configured", async () => {
+    const onSign = vi.fn();
+    const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign });
+    t.receive(start("sign", "f", sign({ response_mode: "direct_post", transaction_data: [entry()] })));
+    await settle();
+    expect((t.sent[0] as Response).error).toEqual({ code: -31005, message: "Capability not supported", data: { unsupported: "transaction_data" } });
+    expect(onSign).not.toHaveBeenCalled();
+
+    const onSign2 = vi.fn();
+    const w2 = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, transactionData: { versions: [1], hash_algs: ["sha-256"] }, onSign: onSign2 });
+    w2.t.receive(start("sign", "f", sign({ response_mode: "direct_post", transaction_data: [entry()] })));
+    await settle();
+    expect((w2.t.sent[0] as Response).error).toBeUndefined();
+    expect(onSign2).toHaveBeenCalled();
+  });
+
+  it("does not handle sign without onSign: -31005", async () => {
+    const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] } });
+    t.receive(start("sign", "f", sign()));
+    await settle();
+    expect((t.sent[0] as Response).error).toEqual({ code: -31005, message: "Capability not supported", data: { unsupported: "sign" } });
+  });
+});
+
+describe("OpenID4xProfile as match responder", () => {
+  const q = { credentials: [{ id: "pid", format: "dc+sd-jwt" }] };
+
+  it("completes with the closed result", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onMatch: (p) => {
+        expect(p.dcql_query).toEqual(q);
+        return { satisfiable: true, satisfiable_query_ids: ["pid"], selection_handle: H };
+      },
+    });
+    t.receive(start("match", "flow-vp-1-match", { parent_flow_id: "flow-vp-1", dcql_query: q }));
+    await settle();
+    expect((t.sent[0] as Response).result).toMatchObject({ flow_type: "match" });
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.complete", params: { flow_id: "flow-vp-1-match", result: { satisfiable: true, satisfiable_query_ids: ["pid"], selection_handle: H } } });
+  });
+
+  it("never sends credential data: a result with extra members becomes satisfiable=false, code error", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onMatch: () => ({ satisfiable: true, claims: { family_name: "Svensson" } }) as never,
+    });
+    t.receive(start("match", "m", { parent_flow_id: "p", dcql_query: q }));
+    await settle();
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.complete", params: { result: { satisfiable: false, code: "error" } } });
+    expect(JSON.stringify(t.sent)).not.toContain("Svensson");
+  });
+
+  it("an id that is not in the query becomes code error", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onMatch: () => ({ satisfiable: true, satisfiable_query_ids: ["other"] }),
+    });
+    t.receive(start("match", "m", { parent_flow_id: "p", dcql_query: q }));
+    await settle();
+    expect(t.sent[1]).toMatchObject({ params: { result: { satisfiable: false, code: "error" } } });
+  });
+
+  it("a throw answers code error without the cause; a rejection is -31006 rejected", async () => {
+    const a = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onMatch: () => {
+        throw new Error("secret detail");
+      },
+    });
+    a.t.receive(start("match", "m", { parent_flow_id: "p", dcql_query: q }));
+    await settle();
+    expect(a.t.sent[1]).toMatchObject({ params: { result: { satisfiable: false, code: "error" } } });
+    expect(JSON.stringify(a.t.sent)).not.toContain("secret");
+
+    const b = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onMatch: () => {
+        throw new SubFlowRejectedError();
+      },
+    });
+    b.t.receive(start("match", "m", { parent_flow_id: "p", dcql_query: q }));
+    await settle();
+    expect(b.t.sent[1]).toMatchObject({ method: "wmp.flow.error", params: { code: -31006, data: { reason: "rejected" } } });
+  });
+
+  it("is gated on the oid4vp capability and needs oid4vp configured", async () => {
+    const onMatch = vi.fn();
+    const w = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onMatch }, { oid4vci: {} });
+    w.t.receive(start("match", "m", { parent_flow_id: "p", dcql_query: q }));
+    await settle();
+    expect((w.t.sent[0] as Response).error).toEqual({ code: -31005, message: "Capability not supported", data: { unsupported: "match", capability: "oid4vp" } });
+    expect(onMatch).not.toHaveBeenCalled();
+    expect(new OpenID4xProfile({ onMatch }).flowTypes()).not.toContain("match");
+  });
+
+  it("refuses a malformed start with -32602", async () => {
+    const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onMatch: () => ({ satisfiable: true }) });
+    t.receive(start("match", "m", { parent_flow_id: "p" }));
+    await settle();
+    expect((t.sent[0] as Response).error?.code).toBe(-32602);
+  });
+});
+
+describe("OpenID4xProfile capability descriptors", () => {
+  it("emits each configured capability with [] for empty required lists", () => {
+    const p = new OpenID4xProfile({
+      oid4vci: { supported_grants: ["authorization_code"] } as never,
+      oid4vp: { supported_response_modes: ["direct_post"], supported_formats: ["dc+sd-jwt"] },
+      transactionData: { versions: [1], hash_algs: ["sha-256"] },
+    });
+    expect(p.capabilityDescriptors()).toEqual({
+      oid4vci: { supported_grants: ["authorization_code"], supported_formats: [] },
+      oid4vp: { supported_response_modes: ["direct_post"], supported_formats: ["dc+sd-jwt"] },
+      transaction_data: { versions: [1], hash_algs: ["sha-256"] },
+    });
+    expect(p.capabilities()).toEqual(["oid4vci", "oid4vp", "transaction_data"]);
+    expect(new OpenID4xProfile({}).capabilityDescriptors()).toEqual({});
+  });
+
+  it("refuses a transaction_data descriptor without versions", () => {
+    expect(() => new OpenID4xProfile({ transactionData: { versions: [] } }).capabilityDescriptors()).toThrow();
+  });
+});
