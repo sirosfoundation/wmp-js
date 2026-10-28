@@ -214,6 +214,7 @@ export {
   completeSubFlow,
   failSubFlow,
   rejectSubFlow,
+  validateSignResult,
   unsupportedTransactionData,
 } from "./signflow.js";
 export type { TransactionDataCapability, MatchStartParams, MatchResult, FlowNotifier } from "./signflow.js";

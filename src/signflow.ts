@@ -5,7 +5,7 @@
  */
 
 import { sha256, sha384, sha512 } from "@noble/hashes/sha2.js";
-import { validateCompletionResult } from "./completion.js";
+import { CompletionResultError, validateCompletionResult } from "./completion.js";
 import { isSelectionHandle } from "./consent.js";
 import { unsupportedError } from "./errors.js";
 import { WMPError } from "./jsonrpc.js";
@@ -40,8 +40,13 @@ export interface TransactionDataCapability {
  * which would read as support the peer never claimed.
  */
 export function offersTransactionData(caps: Capabilities | undefined, version: number = TRANSACTION_DATA_VERSION_1): boolean {
-  const c = caps?.[CAPABILITY_TRANSACTION_DATA] as { versions?: unknown } | undefined;
-  return Array.isArray(c?.versions) && (c.versions as unknown[]).some((v) => v === version);
+  const raw: unknown = caps !== undefined && Object.prototype.hasOwnProperty.call(caps, CAPABILITY_TRANSACTION_DATA) ? caps[CAPABILITY_TRANSACTION_DATA] : undefined;
+  // A malformed descriptor is not an offer: fail closed on every member we know.
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
+  const c = raw as { versions?: unknown; hash_algs?: unknown };
+  if (!Array.isArray(c.versions) || c.versions.length === 0 || !c.versions.every((v) => Number.isInteger(v) && (v as number) >= 1)) return false;
+  if (c.hash_algs !== undefined && (!Array.isArray(c.hash_algs) || !c.hash_algs.every((a) => typeof a === "string" && a !== ""))) return false;
+  return c.versions.includes(version);
 }
 
 /**
@@ -315,6 +320,30 @@ function meta(wmp: Metadata): Metadata {
   return { version: wmp.version || VERSION, ...(wmp.session_id ? { session_id: wmp.session_id } : {}) };
 }
 
+/** The members a decrypt_credential_response result may carry: control members only. */
+const DECRYPT_RESULT_MEMBERS = ["credential_count", "transaction_id", "interval", "error"];
+
+/**
+ * Checks the result of a sign sub-flow before it is sent: the completion rules
+ * and, per action, what must never reach the orchestrator. A
+ * decrypt_credential_response result carries control members only
+ * (credential_count or transaction_id with an optional interval, or an error):
+ * the decrypted credentials and their metadata stay in the wallet (profile
+ * 3.1.5.1), so any other member, credentials and credential_metadata first,
+ * refuses the result.
+ */
+export function validateSignResult(action: string, result: unknown): void {
+  validateCompletionResult(result);
+  if (action !== "decrypt_credential_response") return;
+  const r = result as Record<string, unknown>;
+  for (const k of Object.keys(r)) {
+    if (!DECRYPT_RESULT_MEMBERS.includes(k)) throw new CompletionResultError("decryption result carries a member outside the control set");
+  }
+  if (!("credential_count" in r) && !("transaction_id" in r) && !("error" in r)) {
+    throw new CompletionResultError("decryption result carries no credential_count, transaction_id or error");
+  }
+}
+
 /** The sub-flow a wallet was asked to answer, with the means to answer it. */
 export class SignFlow {
   constructor(
@@ -326,7 +355,7 @@ export class SignFlow {
 
   /** Completes with the sign result (e.g. `{ proof_jwt }`, `{ response_jwe }`). */
   complete(result: unknown): Promise<void> {
-    return completeSubFlow(this.peer, this.wmp, this.flowId, result);
+    return completeSubFlow(this.peer, this.wmp, this.flowId, result, (r) => validateSignResult(this.params.action, r));
   }
 
   /** Declines the sub-flow (-31006, reason rejected). */

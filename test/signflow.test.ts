@@ -17,6 +17,7 @@ import {
 } from "../src/signflow.js";
 import { OpenID4xProfile, SubFlowRejectedError } from "../src/openid4x.js";
 import { CompletionResultError } from "../src/completion.js";
+import { validateSignResult } from "../src/signflow.js";
 import { Peer } from "../src/peer.js";
 import { WMPError, type Response } from "../src/jsonrpc.js";
 import { ErrorCode } from "../src/types.js";
@@ -185,6 +186,17 @@ describe("transaction_data capability", () => {
     expect(offersTransactionData({ transaction_data: "x" })).toBe(false);
     expect(offersTransactionData({})).toBe(false);
     expect(offersTransactionData(undefined)).toBe(false);
+    // malformed descriptors are not offers, whatever else they say
+    expect(offersTransactionData({ transaction_data: { versions: [1, "2"] } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [1], hash_algs: 42 } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [1], hash_algs: ["sha-256", 7] } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [1], hash_algs: [""] } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [1.5, 1] } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [] } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [0, 1] } })).toBe(false);
+    expect(offersTransactionData({ transaction_data: [1] })).toBe(false);
+    expect(offersTransactionData({ transaction_data: null as never })).toBe(false);
+    expect(offersTransactionData({ transaction_data: { versions: [1], hash_algs: ["sha-256"] } })).toBe(true);
     expect(offersTransactionData({ transaction_data: { versions: [2] } }, 2)).toBe(true);
     expect(CAPABILITY_TRANSACTION_DATA).toBe("transaction_data");
   });
@@ -462,5 +474,63 @@ describe("the sub-flow's terminal notification never overtakes the flow.start re
     t.receive(start("sign", "f", { action: "nope" }));
     await settle(60);
     expect(onSign).not.toHaveBeenCalled();
+  });
+});
+
+describe("decrypt_credential_response results carry control members only", () => {
+  it("validateSignResult", () => {
+    for (const ok of [{ credential_count: 1 }, { transaction_id: "t" }, { transaction_id: "t", interval: 5 }, { error: { code: "x" } }]) {
+      expect(() => validateSignResult("decrypt_credential_response", ok), JSON.stringify(ok)).not.toThrow();
+    }
+    for (const bad of [
+      {},
+      { credentials: [{ credential: "TOP-SECRET" }] },
+      { credentials: [{ format: "dc+sd-jwt" }] },
+      { credential_metadata: { display: [] } },
+      { credential_count: 1, credentials: [] },
+      { credential_count: 1, extra: 1 },
+      { proof_jwt: "eyJ" },
+    ]) {
+      expect(() => validateSignResult("decrypt_credential_response", bad), JSON.stringify(bad)).toThrow(CompletionResultError);
+    }
+    // other actions keep only the general rules
+    expect(() => validateSignResult("generate_proof", { proof_jwt: "eyJ", credentials: [] })).not.toThrow();
+  });
+
+  it("the profile never sends decrypted credentials to the orchestrator", async () => {
+    const { t } = await walletPeer({
+      oid4vci: { supported_grants: [], supported_formats: [] },
+      onSign: (flow) => flow.complete({ credentials: [{ format: "dc+sd-jwt", credential: "TOP-SECRET-CREDENTIAL" }] }),
+    });
+    t.receive(start("sign", "dec-1", { action: "decrypt_credential_response", parent_flow_id: "p", jwe: "a.b.c.d.e", deferred: false }));
+    await settle();
+    expect(JSON.stringify(t.sent)).not.toContain("TOP-SECRET");
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.error", params: { code: -31006 } }); // the sub-flow fails, fixed message
+  });
+
+  it("the profile sends the control result", async () => {
+    const { t } = await walletPeer({
+      oid4vci: { supported_grants: [], supported_formats: [] },
+      onSign: (flow) => flow.complete({ credential_count: 2 }),
+    });
+    t.receive(start("sign", "dec-1", { action: "decrypt_credential_response", parent_flow_id: "p", jwe: "a.b.c.d.e" }));
+    await settle();
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.complete", params: { result: { credential_count: 2 } } });
+  });
+});
+
+describe("flow.start in notification form", () => {
+  it("is dropped: nothing runs and nothing is queued for a later start", async () => {
+    const onSign = vi.fn();
+    const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign });
+    const note = { jsonrpc: "2.0" as const, method: "wmp.flow.start", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: "sign", flow_id: "dup", params: sign() } };
+    t.receive(note as never);
+    await settle(60);
+    expect(onSign).not.toHaveBeenCalled();
+    expect(t.sent).toHaveLength(0);
+    // a real start under the same id runs the continuation exactly once
+    t.receive(start("sign", "dup", sign()));
+    await settle(60);
+    expect(onSign).toHaveBeenCalledTimes(1);
   });
 });

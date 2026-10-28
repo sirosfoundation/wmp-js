@@ -637,11 +637,16 @@ export class Peer implements PeerContext {
     };
 
     if (isNotification(req)) {
+      // wmp.flow.start is a request: its response is what lets a profile queue
+      // work for after it (afterResponse). In notification form no response can
+      // ever be sent, so it is dropped instead of dispatched.
+      if (req.method === Method.FlowStart) return;
       dispatch().catch(() => {
         /* notifications get no error response */
       });
     } else {
-      const flowKey = req.method === Method.FlowStart ? flowIdOf(req.params) : undefined;
+      const startedFlow = req.method === Method.FlowStart ? flowIdOf(req.params) : undefined;
+      const flowKey = typeof startedFlow === "string" ? startedFlow : undefined;
       dispatch()
         .then(async (result) => {
           const resp = createResponse(req.id!, result);
@@ -1063,11 +1068,6 @@ export class Peer implements PeerContext {
 // ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
-
-function flowIdOf(params: unknown): string | undefined {
-  const id = typeof params === "object" && params !== null ? (params as { flow_id?: unknown }).flow_id : undefined;
-  return typeof id === "string" ? id : undefined;
-}
 
 function isFlowIdEnvelope(params: unknown): params is { flow_id: string } {
   return typeof params === "object" && params !== null && typeof (params as { flow_id?: unknown }).flow_id === "string";
