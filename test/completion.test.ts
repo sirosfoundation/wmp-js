@@ -759,3 +759,51 @@ describe("Peer: finished flows, malformed envelopes and sessions (round 4)", () 
     expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.start")).toHaveLength(2);
   });
 });
+
+describe("Peer: bounded terminal history (round 5)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 10));
+  const complete = (flowId: string) => ({ jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: flowId, result: { credentials: [] } } });
+  const start = (id: string, flowId: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: flowId, params: {} } });
+
+  it("a terminal message for a flow never started here is delivered but not remembered", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const peer = new Peer(t, { handler: { onFlowComplete } });
+    t.receive(complete("never-started"));
+    t.receive(complete("never-started"));
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(2); // as before: unknown flows are the handler's business
+    expect((peer as unknown as { terminalSeen: Map<string, string> }).terminalSeen.size).toBe(0);
+  });
+
+  it("a remote peer cannot grow the history with fresh ids", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowComplete: vi.fn() } });
+    for (let i = 0; i < 5000; i++) t.receive(complete(`fresh-${i}`));
+    await settle();
+    expect((peer as unknown as { terminalSeen: Map<string, string> }).terminalSeen.size).toBe(0);
+  });
+
+  it("at saturation new flows are refused instead of evicting a marker; an old id can still be reused", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const peer = new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowComplete } });
+    const seen = (peer as unknown as { terminalSeen: Map<string, string> }).terminalSeen;
+    for (let i = 0; i < 65535; i++) seen.set(`old-${i}`, "ended");
+    t.receive(start("s1", "last")); // the 65536th
+    await settle();
+    t.receive(complete("last"));
+    await settle();
+    expect(seen.size).toBe(65536);
+    t.receive(start("s2", "one-more")); // refused: the history is full
+    await settle();
+    expect((t.sent.at(-1) as Response).error?.code).toBe(-31007);
+    t.receive(start("s3", "old-0")); // reuse of an id already in the history is allowed (it does not grow it)
+    await settle();
+    expect((t.sent.at(-1) as Response).error).toBeUndefined();
+    // nothing was evicted: a repeat of an old terminal is still a repeat
+    t.receive(complete("old-1"));
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+  });
+});

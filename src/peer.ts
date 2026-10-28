@@ -741,11 +741,17 @@ export class Peer implements PeerContext {
     this.terminalSeen.set(flowId, kind);
   }
 
-  /** A flow ended: drop its validation context and remember how it ended. */
+  /**
+   * A flow ended: drop its validation context and, if this peer knew the flow
+   * (it was started here or by the remote peer and not yet ended), remember how
+   * it ended. A terminal message for a flow this peer never saw start is
+   * delivered as before but not remembered, so a remote peer cannot grow the
+   * history with fresh ids.
+   */
   private endFlow(flowId: unknown, kind: "ended" | "cancelled" = "ended"): void {
     if (typeof flowId !== "string") return;
-    this.recordedFlows.delete(flowId);
-    this.markTerminal(flowId, kind);
+    const known = this.recordedFlows.delete(flowId);
+    if (known) this.markTerminal(flowId, kind);
   }
 
   /** A new or ended session: the old session's flow state does not carry over. */
@@ -766,6 +772,12 @@ export class Peer implements PeerContext {
     }
     if (this.recordedFlows.size >= MAX_ACTIVE_FLOWS) {
       throw new WMPError(ErrorCode.RateLimited, "Too many active flows");
+    }
+    // The history of finished flows is bounded too, and it is never evicted (a
+    // dropped marker would weaken validation): at saturation new flows are
+    // refused until the session is renewed.
+    if (this.terminalSeen.size >= MAX_TERMINAL_HISTORY && !this.terminalSeen.has(flowId)) {
+      throw new WMPError(ErrorCode.RateLimited, "Too many finished flows in this session");
     }
     // A new flow under a reused ID is not a repeat of the old one's terminal
     // message. If the start fails the marker comes back (below).
@@ -898,6 +910,9 @@ const noop = (): void => {};
 
 /** Most flows a peer holds validation context for at once; a new start beyond it is refused. */
 const MAX_ACTIVE_FLOWS = 4096;
+
+/** Most finished flows remembered per session; at that point new starts are refused until the session is renewed. */
+const MAX_TERMINAL_HISTORY = 65536;
 
 function toRPCError(err: unknown): RPCError {
   if (err instanceof WMPError) {
