@@ -104,7 +104,9 @@ export function validateSelectCredentialsParams(params: unknown, ctx: SelectCred
   const seen = new Set<string>();
   let handle: string | undefined;
   const out: CredentialSelection[] = [];
-  sel.forEach((s: unknown, i: number) => {
+  // Every index, holes of a sparse array included (forEach would skip them): a hole is not a selection.
+  for (let i = 0; i < sel.length; i++) {
+    const s: unknown = sel[i];
     if (!isObj(s)) refuse(`selections[${i}] is not an object`);
     for (const k of Object.keys(s)) {
       if (k !== "query_id" && k !== "selection_handle") refuse(`selections[${i}] carries a member outside the closed set`);
@@ -117,7 +119,7 @@ export function validateSelectCredentialsParams(params: unknown, ctx: SelectCred
     if (handle !== undefined && s.selection_handle !== handle) refuse("selection_handle differs between elements");
     handle = s.selection_handle;
     out.push({ query_id: s.query_id, selection_handle: s.selection_handle });
-  });
+  }
   if (ctx.matchHandle !== undefined && handle !== ctx.matchHandle) refuse("selection_handle differs from the match result's handle");
   return { consent: true, selections: out };
 }
@@ -132,7 +134,7 @@ export function buildSelectCredentials(
   ctx: SelectCredentialsContext = {},
 ): ConsentAction {
   const params = decision.consent
-    ? { consent: true, selections: decision.queryIds.map((q) => ({ query_id: q, selection_handle: decision.selectionHandle })) }
+    ? { consent: true, selections: Array.from(decision.queryIds, (q) => ({ query_id: q, selection_handle: decision.selectionHandle })) } // visits holes too
     : { consent: false };
   return validateSelectCredentialsParams(params, ctx);
 }

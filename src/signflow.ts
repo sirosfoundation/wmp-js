@@ -320,6 +320,9 @@ function meta(wmp: Metadata): Metadata {
   return { version: wmp.version || VERSION, ...(wmp.session_id ? { session_id: wmp.session_id } : {}) };
 }
 
+/** Response modes in which the wallet encrypts the response (profile 7.7). */
+const ENCRYPTED_RESPONSE_MODES = ["direct_post.jwt", "dc_api.jwt"];
+
 /** The members a decrypt_credential_response result may carry: control members only. */
 const DECRYPT_RESULT_MEMBERS = ["credential_count", "transaction_id", "interval", "error"];
 
@@ -332,10 +335,24 @@ const DECRYPT_RESULT_MEMBERS = ["credential_count", "transaction_id", "interval"
  * 3.1.5.1), so any other member, credentials and credential_metadata first,
  * refuses the result.
  */
-export function validateSignResult(action: string, result: unknown): void {
+export function validateSignResult(action: string, result: unknown, responseMode?: string): void {
   validateCompletionResult(result);
-  if (action !== "decrypt_credential_response") return;
   const r = result as Record<string, unknown>;
+  if (action === "sign_presentation") {
+    // An encrypted response mode: the wallet builds and encrypts the response
+    // itself and answers with response_jwe; a plaintext vp_token would reach the
+    // orchestrator unprotected and no later refusal can undo that (profile 7.7).
+    // A plaintext mode has no use for a JWE the orchestrator cannot read.
+    const encrypted = responseMode !== undefined && ENCRYPTED_RESPONSE_MODES.includes(responseMode);
+    if (encrypted) {
+      if ("vp_token" in r) throw new CompletionResultError("vp_token in an encrypted response mode; the response must be a response_jwe");
+      if (!("response_jwe" in r)) throw new CompletionResultError("an encrypted response mode needs a response_jwe");
+    } else if ("response_jwe" in r) {
+      throw new CompletionResultError("response_jwe in a response mode that is not encrypted");
+    }
+    return;
+  }
+  if (action !== "decrypt_credential_response") return;
   for (const k of Object.keys(r)) {
     if (!DECRYPT_RESULT_MEMBERS.includes(k)) throw new CompletionResultError("decryption result carries a member outside the control set");
   }
@@ -344,8 +361,10 @@ export function validateSignResult(action: string, result: unknown): void {
   }
 }
 
-/** The sub-flow a wallet was asked to answer, with the means to answer it. */
+/** The sub-flow a wallet was asked to answer, with the means to answer it. A sub-flow ends once. */
 export class SignFlow {
+  private done = false;
+
   constructor(
     private peer: FlowNotifier,
     private wmp: Metadata,
@@ -353,24 +372,48 @@ export class SignFlow {
     readonly params: SignSubFlowParams,
   ) {}
 
+  /** True once a terminal message (complete, reject, fail) was sent for this sub-flow. */
+  get ended(): boolean {
+    return this.done;
+  }
+
+  /**
+   * Sends at most one terminal message. The sub-flow counts as ended from the
+   * moment the send starts (a concurrent second terminal is refused); if the
+   * message is not sent (a result that fails validation, a transport error) it
+   * counts as not ended, so the caller can still answer another way.
+   */
+  private async terminal(send: () => Promise<void>): Promise<void> {
+    if (this.done) throw new Error("sub-flow already ended");
+    this.done = true;
+    try {
+      await send();
+    } catch (err) {
+      this.done = false;
+      throw err;
+    }
+  }
+
   /** Completes with the sign result (e.g. `{ proof_jwt }`, `{ response_jwe }`). */
   complete(result: unknown): Promise<void> {
-    return completeSubFlow(this.peer, this.wmp, this.flowId, result, (r) => validateSignResult(this.params.action, r));
+    return this.terminal(() =>
+      completeSubFlow(this.peer, this.wmp, this.flowId, result, (r) => validateSignResult(this.params.action, r, this.params.response_mode)),
+    );
   }
 
   /** Declines the sub-flow (-31006, reason rejected). */
   reject(message?: string): Promise<void> {
-    return rejectSubFlow(this.peer, this.wmp, this.flowId, message);
+    return this.terminal(() => rejectSubFlow(this.peer, this.wmp, this.flowId, message));
   }
 
   /** Fails the sub-flow without refusing it. */
   fail(code: number, message: string, data?: unknown): Promise<void> {
-    return failSubFlow(this.peer, this.wmp, this.flowId, code, message, data);
+    return this.terminal(() => failSubFlow(this.peer, this.wmp, this.flowId, code, message, data));
   }
 
   /** Cannot process the request's transaction_data (-31005). */
   unsupportedTransactionData(): Promise<void> {
-    return unsupportedTransactionData(this.peer, this.wmp, this.flowId);
+    return this.terminal(() => unsupportedTransactionData(this.peer, this.wmp, this.flowId));
   }
 }
 

@@ -757,6 +757,9 @@ export class OpenID4xProfile
           try {
             await this.config.onSign!(flow);
           } catch (err) {
+            // The callback already ended the sub-flow (and then threw in cleanup):
+            // a second terminal could end another flow that took the id since.
+            if (flow.ended) return;
             // A fixed message: whatever the callback threw may carry credential data.
             if (err instanceof WMPError) await flow.fail(err.code, err.rpcMessage, err.data);
             else await flow.fail(ErrorCode.FlowError, "Sign failed");

@@ -329,7 +329,7 @@ export class Peer implements PeerContext {
    * {@link afterResponse} belong to that request alone, so a start that fails
    * (for example a duplicate) can only discard its own.
    */
-  private afterTarget?: (() => void)[];
+  private afterTarget?: AfterResponse;
 
   /**
    * PeerContext: queue `fn` to run once the response to the flow.start being
@@ -337,7 +337,7 @@ export class Peer implements PeerContext {
    * response to wait for, and `fn` runs on a zero-delay timer instead.
    */
   afterResponse(fn: () => void): void {
-    if (this.afterTarget) this.afterTarget.push(fn);
+    if (this.afterTarget) this.afterTarget.fns.push(fn);
     else setTimeout(fn, 0);
   }
 
@@ -692,8 +692,9 @@ export class Peer implements PeerContext {
   }
 
   private handleRequest(req: Request): void {
-    // Continuations the handler queued for after this request's response.
-    const after: (() => void)[] = [];
+    // What the handler queued for after this request's response, and how to undo
+    // the flow it started if that response cannot be delivered.
+    const after: AfterResponse = { fns: [] };
     const dispatch = async () => {
       if (this.authorize) {
         const allowed = await this.authorize(req.method, req.params);
@@ -721,7 +722,7 @@ export class Peer implements PeerContext {
           const resp = createResponse(req.id!, result);
           await this.transport.send(resp);
           // Only now may anything the handler queued for after the response go out.
-          for (const fn of after.splice(0)) {
+          for (const fn of after.fns.splice(0)) {
             try {
               fn();
             } catch {
@@ -730,7 +731,8 @@ export class Peer implements PeerContext {
           }
         })
         .catch((err) => {
-          after.length = 0; // this request's continuations only: they never run
+          after.fns.length = 0; // this request's continuations only: they never run
+          after.undo?.(); // the start was acknowledged by nobody: it must not leave a flow behind
           const rpcErr = toRPCError(err);
           const resp = createErrorResponse(req.id!, rpcErr);
           return this.transport.send(resp);
@@ -741,7 +743,7 @@ export class Peer implements PeerContext {
   private async dispatchMethod(
     method: string,
     params: unknown,
-    after?: (() => void)[],
+    after?: AfterResponse,
   ): Promise<unknown> {
     // A repeat of a terminal message already processed (or refused): ignored.
     // Only checked here; a flow is marked once its message passed validation.
@@ -928,6 +930,8 @@ export class Peer implements PeerContext {
         // context; a start that fails leaves nothing (and no existing flow's
         // context) changed.
         const rollback = this.beginFlow(p?.flow_id, p?.flow_type, p?.params);
+        // If the response to this start cannot be delivered, handleRequest undoes it too.
+        if (after) after.undo = rollback;
         try {
           // The handler may queue continuations for after the response; they go
           // to THIS request's queue (the window is the synchronous invocation).
@@ -1251,6 +1255,12 @@ function isFlowCompleteEnvelope(params: unknown): params is FlowCompleteParams {
 
 function flowIdOf(params: unknown): unknown {
   return typeof params === "object" && params !== null ? (params as { flow_id?: unknown }).flow_id : undefined;
+}
+
+/** Per request: continuations to run after its response was sent, and the undo for the flow it started. */
+interface AfterResponse {
+  fns: (() => void)[];
+  undo?: () => void;
 }
 
 /** A resume result that arrived after its session was closed or replaced. */

@@ -16,6 +16,7 @@ import {
   unsupportedTransactionData,
 } from "../src/signflow.js";
 import { OpenID4xProfile, SubFlowRejectedError } from "../src/openid4x.js";
+import { SignFlow } from "../src/signflow.js";
 import { CompletionResultError } from "../src/completion.js";
 import { validateSignResult } from "../src/signflow.js";
 import { Peer } from "../src/peer.js";
@@ -584,5 +585,164 @@ describe("finished sub-flows free their slot", () => {
     const errors = t.sent.filter((m) => (m as Response).error);
     expect(errors).toHaveLength(0);
     expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.complete" || (m as { method?: string }).method === "wmp.flow.error")).toHaveLength(4100);
+  }, 60_000);
+});
+
+describe("a sub-flow ends once (round 4)", () => {
+  const mk = () => {
+    const notify = vi.fn(async () => {});
+    const flow = new SignFlow({ notify }, { version: "0.1", session_id: "ses-1" }, "f1", { action: "generate_proof" } as never);
+    return { notify, flow };
+  };
+
+  it("a second terminal is refused", async () => {
+    const { notify, flow } = mk();
+    await flow.complete({ proof_jwt: "eyJ" });
+    expect(flow.ended).toBe(true);
+    await expect(flow.complete({ proof_jwt: "x" })).rejects.toThrow(/already ended/);
+    await expect(flow.reject()).rejects.toThrow(/already ended/);
+    await expect(flow.fail(-31006, "x")).rejects.toThrow(/already ended/);
+    await expect(flow.unsupportedTransactionData()).rejects.toThrow(/already ended/);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("two concurrent terminals: one is sent", async () => {
+    const { notify, flow } = mk();
+    const results = await Promise.allSettled([flow.complete({ proof_jwt: "a" }), flow.reject()]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("a result that fails validation, or a failed send, does not end the sub-flow", async () => {
+    const { notify, flow } = mk();
+    await expect(flow.complete({ credential_count: 1, transaction_id: "t" })).rejects.toBeInstanceOf(CompletionResultError);
+    expect(flow.ended).toBe(false);
+    notify.mockRejectedValueOnce(new Error("transport down"));
+    await expect(flow.reject()).rejects.toThrow("transport down");
+    expect(flow.ended).toBe(false);
+    await flow.fail(-31006, "x"); // still possible
+    expect(flow.ended).toBe(true);
+  });
+
+  it("the profile sends no second terminal when the callback ended the sub-flow and then threw", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: async (flow) => {
+        await flow.complete({ proof_jwt: "eyJ" });
+        throw new Error("cleanup failed");
+      },
+    });
+    t.receive(start("sign", "once", sign({ action: "generate_proof" })));
+    await settle(60);
+    const terminals = t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.complete" || (m as { method?: string }).method === "wmp.flow.error");
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({ method: "wmp.flow.complete" });
+  });
+});
+
+describe("sign_presentation results follow the response mode (profile 7.7)", () => {
+  const jwe = "aaaa.x.bbbb.cccc.dddd";
+  it("an encrypted mode needs response_jwe and never carries a vp_token", () => {
+    for (const mode of ["direct_post.jwt", "dc_api.jwt"]) {
+      expect(() => validateSignResult("sign_presentation", { response_jwe: jwe }, mode), mode).not.toThrow();
+      expect(() => validateSignResult("sign_presentation", { vp_token: "PLAINTEXT-VP" }, mode), mode).toThrow(CompletionResultError);
+      expect(() => validateSignResult("sign_presentation", { vp_token: "x", response_jwe: jwe }, mode), mode).toThrow(CompletionResultError);
+      expect(() => validateSignResult("sign_presentation", {}, mode), mode).toThrow(CompletionResultError);
+    }
+  });
+
+  it("a plaintext or unspecified mode takes a vp_token and refuses a JWE", () => {
+    for (const mode of ["direct_post", "dc_api", undefined]) {
+      expect(() => validateSignResult("sign_presentation", { vp_token: "x" }, mode as never), String(mode)).not.toThrow();
+      expect(() => validateSignResult("sign_presentation", { response_jwe: jwe }, mode as never), String(mode)).toThrow(CompletionResultError);
+    }
+  });
+
+  it("the profile never sends a plaintext vp_token for direct_post.jwt", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: (flow) => flow.complete({ vp_token: "PLAINTEXT-VP-TOKEN" }),
+    });
+    t.receive(start("sign", "enc", sign({ response_mode: "direct_post.jwt" })));
+    await settle(60);
+    expect(JSON.stringify(t.sent)).not.toContain("PLAINTEXT-VP-TOKEN");
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.error", params: { code: -31006 } });
+  });
+
+  it("the profile sends the response_jwe for direct_post.jwt", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: (flow) => flow.complete({ response_jwe: jwe }),
+    });
+    t.receive(start("sign", "enc", sign({ response_mode: "direct_post.jwt" })));
+    await settle(60);
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.complete", params: { result: { response_jwe: jwe } } });
+  });
+});
+
+describe("sparse arrays are not selections (round 4)", () => {
+  it("validate and build refuse holes", async () => {
+    const { validateSelectCredentialsParams, buildSelectCredentials, ActionParamsError } = await import("../src/consent.js");
+    // eslint-disable-next-line no-sparse-arrays
+    expect(() => validateSelectCredentialsParams({ consent: true, selections: new Array(1) })).toThrow(ActionParamsError);
+    const holey: unknown[] = [{ query_id: "pid", selection_handle: H }];
+    holey[2] = { query_id: "mdl", selection_handle: H }; // index 1 is a hole
+    expect(() => validateSelectCredentialsParams({ consent: true, selections: holey })).toThrow(ActionParamsError);
+    expect(() => buildSelectCredentials({ consent: true, queryIds: new Array(1), selectionHandle: H })).toThrow(ActionParamsError);
+    expect(() => buildSelectCredentials({ consent: true, queryIds: ["pid"], selectionHandle: H })).not.toThrow();
+  });
+});
+
+describe("a start whose response cannot be delivered leaves nothing behind (round 4)", () => {
+  it("rolls the flow back and never runs the continuation; the id can be started again", async () => {
+    const onSign = vi.fn(async (flow: { complete(r: unknown): Promise<void> }) => {
+      await flow.complete({ proof_jwt: "eyJ" });
+    });
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }) } });
+    peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign: onSign as never }));
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    t.sent.length = 0;
+    const realSend = t.send.bind(t);
+    let failed = 0;
+    t.send = async (msg) => {
+      const m = msg as { id?: string; result?: unknown };
+      if (m.id === "s-flaky" && m.result !== undefined && failed++ === 0) throw new Error("POST failed"); // the first response send fails
+      await realSend(msg);
+    };
+    t.receive(start("sign", "flaky", sign({ action: "generate_proof" })));
+    await settle(60);
+    expect(onSign).not.toHaveBeenCalled(); // the continuation never ran
+    expect(t.sent.find((m) => (m as { id?: string }).id === "s-flaky")).toMatchObject({ error: expect.anything() }); // the failure was reported
+    // the same id is free again: not a duplicate
+    t.receive({ ...start("sign", "flaky", sign({ action: "generate_proof" })), id: "s-flaky-2" });
+    await settle(60);
+    expect(t.sent.find((m) => (m as { id?: string }).id === "s-flaky-2")).toMatchObject({ result: expect.anything() });
+    expect(onSign).toHaveBeenCalledTimes(1);
+  });
+
+  it("repeated delivery failures do not exhaust the active-flow limit", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }) } });
+    peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign: () => {} }));
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    const realSend = t.send.bind(t);
+    const seen = new Set<string>();
+    t.send = async (msg) => {
+      const m = msg as { id?: string; result?: unknown };
+      if (m.id && m.result !== undefined && m.id.startsWith("r") && !seen.has(m.id)) {
+        seen.add(m.id);
+        throw new Error("POST failed");
+      }
+      await realSend(msg);
+    };
+    for (let i = 0; i < 4100; i++) {
+      t.receive({ ...start("sign", `fl-${i}`, sign({ action: "generate_proof" })), id: `r${i}` });
+      await new Promise((r) => setImmediate(r));
+    }
+    await settle(50);
+    expect(t.sent.filter((m) => (m as Response).error?.code === -31007)).toHaveLength(0);
   }, 60_000);
 });
