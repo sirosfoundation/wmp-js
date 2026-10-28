@@ -194,6 +194,14 @@ export class Peer implements PeerContext {
   async notify(method: string, params: unknown): Promise<void> {
     const msg = createNotification(method, params);
     await this.transport.send(msg);
+    // This peer ended the flow (complete or error, sent by the convenience
+    // methods and by profiles alike): its validation context is no longer needed.
+    if (method === Method.FlowComplete || method === Method.FlowError) this.releaseFlow(flowIdOf(params));
+  }
+
+  /** Drops the validation context of a flow that ended; the flow_id is free to start again. */
+  private releaseFlow(flowId: unknown): void {
+    if (typeof flowId === "string") this.recordedFlows.delete(flowId);
   }
 
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
@@ -214,7 +222,11 @@ export class Peer implements PeerContext {
       }, this.callTimeout);
 
       this.pending.set(id, {
-        resolve: resolve as (v: unknown) => void,
+        resolve: ((v: unknown) => {
+          // A cancelled flow has ended: release its context (shared by the convenience method and profiles).
+          if (method === Method.FlowCancel) this.releaseFlow(flowIdOf(params));
+          (resolve as (v: unknown) => void)(v);
+        }),
         reject: fail,
         timer,
       });
