@@ -2,9 +2,11 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { HttpSseTransport } from "../src/transport.js";
 import { Peer } from "../src/peer.js";
 import { ErrorCode, Method } from "../src/types.js";
+import { WMPError } from "../src/jsonrpc.js";
 import type { Message } from "../src/jsonrpc.js";
 import { SseStub } from "./support/sse-stub.js";
 import { FetchEventSource } from "./support/eventsource.js";
+import { MockTransport } from "./mock-transport.js";
 
 const AUTH = "Bearer alice";
 const settle = (ms = 80) => new Promise((r) => setTimeout(r, ms));
@@ -424,9 +426,123 @@ describe("event stream URL", () => {
     expect(urlFor("../events", "s1")).toBe("../events?session_id=s1");
   });
 
+  it("drops cursor parameters the supplied URL carried when there is no cursor, keeps the others", () => {
+    expect(urlFor("/e?last_event_id=old&lastEventId=old&x=1", "s1")).toBe("/e?x=1&session_id=s1");
+    expect(urlFor("/e?last_event_id=old&x=1", "s1", "new")).toBe("/e?x=1&session_id=s1&last_event_id=new&lastEventId=new");
+  });
+
   it("keeps an existing query and a fragment, encodes values, and adds both cursor names", () => {
     expect(urlFor("/e?x=1#frag", "s 1", "c/1")).toBe("/e?x=1&session_id=s+1&last_event_id=c%2F1&lastEventId=c%2F1#frag");
     expect(urlFor("https://h.example:8443/wmp/events", undefined, "c")).toBe("https://h.example:8443/wmp/events?last_event_id=c&lastEventId=c");
     expect(urlFor("https://h.example/e")).toBe("https://h.example/e");
+  });
+});
+
+describe("terminal bookkeeping (Peer)", () => {
+  const settle2 = () => new Promise((r) => setTimeout(r, 10));
+  const done = (flow: string, kind: "complete" | "error" = "complete") => ({
+    jsonrpc: "2.0" as const,
+    method: kind === "complete" ? "wmp.flow.complete" : "wmp.flow.error",
+    params: kind === "complete"
+      ? { wmp: { version: "0.1" }, flow_id: flow, result: { credentials: [] } }
+      : { wmp: { version: "0.1" }, flow_id: flow, code: -31006, message: "x" },
+  });
+  const cancel = (flow: string, id = "c") => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: flow } });
+  const startReq = (flow: string) => ({ jsonrpc: "2.0" as const, id: `s-${flow}`, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "sign", flow_id: flow, params: {} } });
+
+  it("a repeated cancellation is acknowledged again without invoking the handler", async () => {
+    const t = new MockTransport();
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }));
+    new Peer(t, { handler: { onFlowCancel } });
+    t.receive(cancel("f1", "c1"));
+    await settle2();
+    t.receive(cancel("f1", "c2")); // the re-send after a resume
+    await settle2();
+    expect(onFlowCancel).toHaveBeenCalledTimes(1);
+    expect(t.sent).toHaveLength(2);
+    expect((t.sent[1] as { result: { status: string } }).result.status).toBe("cancelled");
+  });
+
+  it("a notification the validator rejected does not make the flow terminal", async () => {
+    const t = new MockTransport();
+    const onFlowError = vi.fn();
+    let reject = true;
+    new Peer(t, { handler: { onFlowError }, validator: { validateMethod: () => (reject ? [{ path: "", message: "bad" }] : null) } });
+    t.receive(done("f1", "error"));
+    await settle2();
+    expect(onFlowError).not.toHaveBeenCalled();
+    reject = false;
+    t.receive(done("f1", "error")); // the valid one is not discarded as a repeat
+    await settle2();
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+  });
+
+  it("a refused completion counts as the flow's terminal (its synthesized error was delivered)", async () => {
+    const t = new MockTransport();
+    const onFlowError = vi.fn();
+    new Peer(t, { handler: { onFlowError } });
+    const bad = { jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "f1", result: { credential_response_encrypted: true, credentials: [{ credential: "x" }] } } };
+    t.receive(bad);
+    await settle2();
+    t.receive(bad);
+    await settle2();
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+  });
+
+  it("a refused attempt to reuse a flow id keeps the old flow's terminal marker", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    let accept = false;
+    new Peer(t, {
+      handler: {
+        onFlowStart: async (p) => {
+          if (!accept) throw new WMPError(ErrorCode.InvalidParams, "no");
+          return { wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type };
+        },
+        onFlowComplete,
+      },
+    });
+    t.receive(done("f1"));
+    await settle2();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    t.receive(startReq("f1")); // refused
+    await settle2();
+    t.receive(done("f1")); // the old flow's terminal, re-sent by a resume
+    await settle2();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    accept = true;
+    t.receive(startReq("f1")); // accepted: a new flow under the id
+    await settle2();
+    t.receive(done("f1"));
+    await settle2();
+    expect(onFlowComplete).toHaveBeenCalledTimes(2);
+  });
+
+  it("an accepted replacement flow's terminal may arrive before its start response", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const peer = new Peer(t, { handler: { onFlowComplete } });
+    t.receive(done("f1"));
+    await settle2();
+    const started = peer.startFlow("sign", "f1", {});
+    await settle2();
+    t.receive(done("f1")); // the replacement's completion, ahead of the response
+    await settle2();
+    expect(onFlowComplete).toHaveBeenCalledTimes(2);
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1" }, flow_id: "f1", flow_type: "sign" } });
+    await started;
+  });
+
+  it("never evicts a marker: replaying thousands of older terminals delivers nothing", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    new Peer(t, { handler: { onFlowComplete } });
+    const n = 4200;
+    for (let i = 0; i < n; i++) t.receive(done(`f${i}`));
+    await settle2();
+    expect(onFlowComplete).toHaveBeenCalledTimes(n);
+    for (let i = 0; i < n; i++) t.receive(done(`f${i}`)); // a resume re-sends them all
+    await settle2();
+    expect(onFlowComplete).toHaveBeenCalledTimes(n);
   });
 });

@@ -284,6 +284,11 @@ export class HttpSseTransport extends Emitter implements Transport {
     const base = qAt < 0 ? noHash : noHash.slice(0, qAt);
     const params = new URLSearchParams(qAt < 0 ? "" : noHash.slice(qAt + 1));
     if (this.sessionId) params.set("session_id", this.sessionId);
+    // The cursor names are reserved: whatever the supplied URL carried, only the
+    // current cursor (none after a 410) goes out, or the recovery request would
+    // draw the same 410 again.
+    params.delete("last_event_id");
+    params.delete("lastEventId");
     if (cursor) {
       params.set("last_event_id", cursor);
       params.set("lastEventId", cursor);
