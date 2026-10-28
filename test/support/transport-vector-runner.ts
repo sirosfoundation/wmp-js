@@ -223,7 +223,11 @@ export async function runTransportVector(input: unknown, ctl: Controls): Promise
             const expectedEvents = (ex.events as unknown[] | undefined) ?? [];
             checkEvents(subst(expectedEvents, vars) as unknown[], await opened.take(expectedEvents.length), vars, where);
           } else {
+            // Not an event stream. That is only right where the vector says so.
             expect(opened.status, `${where}: status`).toBe(ex.status);
+            expect(ex.stream === false || ex.status !== 200, `${where}: expected an event stream, got a ${opened.status} ${opened.contentType} response`).toBe(true);
+            if (ex.content_type) expect(opened.contentType, `${where}: content_type`).toContain(String(ex.content_type));
+            if (ex.body !== undefined) matches(ex.body, opened.text ? JSON.parse(opened.text) : undefined, vars, `${where}.body`);
             if (step.label) labelled.set(step.label, opened);
             if (step.same_response_as) {
               const prev = labelled.get(step.same_response_as)!;

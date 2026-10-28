@@ -267,3 +267,110 @@ describe("Peer refuses non-conforming completions", () => {
     expect(onFlowComplete).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("Peer: match flows and validator ordering", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 10));
+  const complete = (flowId: string, result?: unknown) => ({
+    jsonrpc: "2.0" as const,
+    method: "wmp.flow.complete",
+    params: { wmp: { version: "0.1" }, flow_id: flowId, ...(result === undefined ? {} : { result }) },
+  });
+  const query = { credentials: [{ id: "pid" }, { id: "mdl" }] };
+
+  async function matchPeer(opts: ConstructorParameters<typeof Peer>[1] = {}) {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const onFlowError = vi.fn();
+    const peer = new Peer(t, { ...opts, handler: { onFlowComplete, onFlowError } });
+    // the flow starts from this peer, so its type is recorded
+    const p = peer.startFlow("match", "m1", { parent_flow_id: "p", dcql_query: query });
+    p.catch(() => {});
+    return { t, peer, onFlowComplete, onFlowError };
+  }
+
+  it("applies the closed match set by the recorded flow type: extra members are refused", async () => {
+    const { t, onFlowComplete, onFlowError } = await matchPeer();
+    t.receive(complete("m1", { satisfiable: true, claims: { name: "secret" } }));
+    await settle();
+    expect(onFlowComplete).not.toHaveBeenCalled();
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(onFlowError.mock.calls)).not.toContain("secret");
+  });
+
+  it("refuses a match completion with no result, and a query id the query does not have", async () => {
+    for (const result of [undefined, { satisfiable: true, satisfiable_query_ids: ["other"] }]) {
+      const { t, onFlowComplete, onFlowError } = await matchPeer();
+      t.receive(complete("m1", result));
+      await settle();
+      expect(onFlowComplete).not.toHaveBeenCalled();
+      expect(onFlowError).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("delivers a conforming match result", async () => {
+    const { t, onFlowComplete } = await matchPeer();
+    t.receive(complete("m1", { satisfiable: true, satisfiable_query_ids: ["pid"] }));
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("also records the type of an incoming flow.start", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const onFlowError = vi.fn();
+    new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowComplete, onFlowError } });
+    t.receive({ jsonrpc: "2.0", id: "s", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "match", flow_id: "m2", params: { dcql_query: query } } });
+    await settle();
+    t.receive(complete("m2", { satisfiable: true, vct: "urn:eudi:pid:1" }));
+    await settle();
+    expect(onFlowComplete).not.toHaveBeenCalled();
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+  });
+
+  it("a flow that is not a match flow is not held to the match set, and an unknown flow gets the general rules", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    new Peer(t, { handler: { onFlowComplete } });
+    t.receive(complete("other", { satisfiable: true, anything: 1 })); // no recorded type: never decided by the members
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a non-conforming completion even when the generic validator rejects the message", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const onFlowError = vi.fn();
+    const onRefusedCompletion = vi.fn();
+    new Peer(t, {
+      handler: { onFlowComplete, onFlowError },
+      onRefusedCompletion,
+      validator: { validateMethod: () => [{ path: "", message: "rejected by test validator" }] },
+    });
+    t.receive(complete("f1", { credential_response_encrypted: true, credentials: [{ credential: "LEAK" }] }));
+    await settle();
+    expect(onRefusedCompletion).toHaveBeenCalledTimes(1);
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+    expect(onFlowComplete).not.toHaveBeenCalled();
+  });
+
+  it("still drops a conforming completion the validator rejects, and honours authorize", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const onRefusedCompletion = vi.fn();
+    new Peer(t, { handler: { onFlowComplete }, onRefusedCompletion, validator: { validateMethod: () => [{ path: "", message: "no" }] } });
+    t.receive(complete("f1", { credentials: [] }));
+    await settle();
+    expect(onFlowComplete).not.toHaveBeenCalled();
+    expect(onRefusedCompletion).not.toHaveBeenCalled();
+
+    // not authorized: authorization comes first, so nothing is delivered, reported or synthesized
+    const t2 = new MockTransport();
+    const refused2 = vi.fn();
+    const err2 = vi.fn();
+    new Peer(t2, { handler: { onFlowError: err2 }, onRefusedCompletion: refused2, authorize: () => false });
+    t2.receive(complete("f1", { credential_response_encrypted: true, credentials: [{ credential: "x" }] }));
+    await settle();
+    expect(refused2).not.toHaveBeenCalled();
+    expect(err2).not.toHaveBeenCalled();
+  });
+});

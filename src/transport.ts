@@ -237,6 +237,13 @@ export class HttpSseTransport extends Emitter implements Transport {
    * - `session_id` query parameter on SSE connections
    */
   setSessionId(sessionId: string): void {
+    if (this.sessionId !== undefined && this.sessionId !== sessionId) {
+      // Event IDs are unique only within a session: another session's cursor
+      // would draw a 410 and its seen IDs could swallow this session's events.
+      this.cursor = undefined;
+      this.seenIds.clear();
+      this.pendingGap = false;
+    }
     this.sessionId = sessionId;
   }
 
@@ -268,15 +275,21 @@ export class HttpSseTransport extends Emitter implements Transport {
   private streamUrl(cursor?: string): string {
     // session_id (required for tenant routing) and the cursor. The cursor goes
     // as last_event_id (Transport Section 4.3.3) and, for servers that predate
-    // that name, as lastEventId.
-    const u = new URL(this.eventsUrl, "http://placeholder.invalid");
-    const relative = !/^[a-z][a-z0-9+.-]*:/i.test(this.eventsUrl);
-    if (this.sessionId) u.searchParams.set("session_id", this.sessionId);
+    // that name, as lastEventId. Only the query string is touched: a relative
+    // URL ("events", "/x", "//host/x") must resolve exactly as it was supplied.
+    const hashAt = this.eventsUrl.indexOf("#");
+    const hash = hashAt < 0 ? "" : this.eventsUrl.slice(hashAt);
+    const noHash = hashAt < 0 ? this.eventsUrl : this.eventsUrl.slice(0, hashAt);
+    const qAt = noHash.indexOf("?");
+    const base = qAt < 0 ? noHash : noHash.slice(0, qAt);
+    const params = new URLSearchParams(qAt < 0 ? "" : noHash.slice(qAt + 1));
+    if (this.sessionId) params.set("session_id", this.sessionId);
     if (cursor) {
-      u.searchParams.set("last_event_id", cursor);
-      u.searchParams.set("lastEventId", cursor);
+      params.set("last_event_id", cursor);
+      params.set("lastEventId", cursor);
     }
-    return relative ? u.pathname + u.search : u.toString();
+    const query = params.toString();
+    return base + (query ? `?${query}` : "") + hash;
   }
 
   private openStream(cursor: string | undefined): void {

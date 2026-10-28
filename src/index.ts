@@ -140,6 +140,7 @@ export { unsupportedError } from "./errors.js";
 export {
   validateCompletionResult,
   validateMatchResult,
+  dcqlQueryIds,
   splitReplaySecrets,
   redactedMembers,
   CompletionResultError,

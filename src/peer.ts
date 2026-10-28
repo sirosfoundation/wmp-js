@@ -28,7 +28,7 @@ import {
   Registry,
 } from "./profile.js";
 import { type ValidationError } from "./schema.js";
-import { CompletionResultError, validateCompletionResult } from "./completion.js";
+import { CompletionResultError, dcqlQueryIds, validateCompletionResult, validateMatchResult } from "./completion.js";
 import { unsupportedError } from "./errors.js";
 import { SUPPORTED_VERSIONS, negotiateVersion, parseVersion, versionRejection } from "./version.js";
 import {
@@ -306,6 +306,7 @@ export class Peer implements PeerContext {
       );
     }
     this.sessionId = result.wmp.session_id;
+    this.terminalSeen.clear(); // a new session: flow state of the old one does not carry over
     this.bindSessionToTransport(result.wmp.session_id);
     this.negotiatedVersion = selected ?? offered;
     this.negotiatedCapabilities = result.capabilities ?? {};
@@ -373,6 +374,7 @@ export class Peer implements PeerContext {
       reason,
     });
     this.sessionId = undefined;
+    this.terminalSeen.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -386,6 +388,7 @@ export class Peer implements PeerContext {
     params?: unknown,
     timeout?: number,
   ): Promise<FlowStartResult> {
+    this.recordFlowType(flowId, flowType, params);
     return this.call<FlowStartResult>(Method.FlowStart, {
       wmp: this.wmpMeta(),
       flow_type: flowType,
@@ -553,6 +556,23 @@ export class Peer implements PeerContext {
     method: string,
     params: unknown,
   ): Promise<unknown> {
+    if ((method === Method.FlowComplete || method === Method.FlowError) && isFlowIdEnvelope(params)) {
+      if (this.terminalSeen.has(params.flow_id)) return undefined; // a repeat from a resume
+      this.markTerminal(params.flow_id);
+    }
+
+    // A completion that breaks the result rules is refused before the generic
+    // validator runs: a notification the validator rejected would be dropped
+    // silently and the receiving handler would never learn that the flow failed.
+    // Authorization (handleRequest) and the envelope shape are still checked.
+    if (method === Method.FlowComplete && this.validateCompletions && isFlowCompleteEnvelope(params)) {
+      const refusal = this.completionRefusal(params);
+      if (refusal) {
+        this.refuseCompletion(params, refusal);
+        return undefined;
+      }
+    }
+
     if (this.validator) {
       const errors = this.validator.validateMethod(method, params);
       if (errors) {
@@ -593,6 +613,7 @@ export class Peer implements PeerContext {
         break;
 
       case Method.SessionClose:
+        this.terminalSeen.clear();
         if (this.handler.onSessionClose) {
           this.handler.onSessionClose(p);
         }
@@ -644,6 +665,7 @@ export class Peer implements PeerContext {
 
       // Flows — delegate to profile FlowHandlers first, then handler.
       case Method.FlowStart: {
+        this.recordFlowType(p.flow_id, p.flow_type, p.params);
         const fh = this.registry.getFlowHandler(p.flow_type);
         if (fh) {
           // Core 10.3: a flow type whose capability was not negotiated is
@@ -687,15 +709,7 @@ export class Peer implements PeerContext {
       }
 
       case Method.FlowComplete: {
-        if (this.validateCompletions && p.result !== undefined) {
-          try {
-            validateCompletionResult(p.result);
-          } catch (err) {
-            if (!(err instanceof CompletionResultError)) throw err;
-            this.refuseCompletion(p, err);
-            return undefined;
-          }
-        }
+        this.recordedFlows.delete(p.flow_id);
         const fh = this.flowHandlerForId(p.flow_id);
         if (fh) { fh.handleComplete(p); return undefined; }
         if (this.handler.onFlowComplete) {
@@ -706,6 +720,7 @@ export class Peer implements PeerContext {
       }
 
       case Method.FlowError: {
+        this.recordedFlows.delete(p.flow_id);
         const fh = this.flowHandlerForId(p.flow_id);
         if (fh) { fh.handleError(p); return undefined; }
         if (this.handler.onFlowError) {
@@ -740,12 +755,43 @@ export class Peer implements PeerContext {
     throw new WMPError(ErrorCode.MethodNotFound, `Method not found: ${method}`);
   }
 
+  /** Flow type (and for match the query ids) by flow_id, recorded when the flow starts. Bounded. */
+  private recordedFlows = new Map<string, { type: string; queryIds?: string[] }>();
+
+  private recordFlowType(flowId: unknown, flowType: unknown, params: unknown): void {
+    if (typeof flowId !== "string" || typeof flowType !== "string") return;
+    this.terminalSeen.delete(flowId); // a new flow under a reused ID
+    const q = flowType === "match" && typeof params === "object" && params !== null ? (params as { dcql_query?: unknown }).dcql_query : undefined;
+    this.recordedFlows.delete(flowId); // re-insert as the newest
+    this.recordedFlows.set(flowId, { type: flowType, queryIds: q === undefined ? undefined : dcqlQueryIds(q) });
+    if (this.recordedFlows.size > 1024) this.recordedFlows.delete(this.recordedFlows.keys().next().value as string);
+  }
+
+  /**
+   * The violation of a completion's result, if any. The check is selected by the
+   * flow type recorded when the flow started, never by members of the result
+   * (openid4x 3.3.3): a match flow's result is the closed set, and a match
+   * completion without a result is refused too.
+   */
+  private completionRefusal(p: FlowCompleteParams): CompletionResultError | undefined {
+    const rec = this.recordedFlows.get(p.flow_id);
+    try {
+      if (rec?.type === "match") validateMatchResult(p.result, rec.queryIds);
+      else if (p.result !== undefined) validateCompletionResult(p.result);
+    } catch (err) {
+      if (err instanceof CompletionResultError) return err;
+      throw err;
+    }
+    return undefined;
+  }
+
   /**
    * A non-conforming completion is not delivered. The flow ends as failed: a
    * synthesized wmp.flow.error, carrying neither the result nor the violation
    * text, goes to whoever would have received the completion or the error.
    */
   private refuseCompletion(p: FlowCompleteParams, err: CompletionResultError): void {
+    this.recordedFlows.delete(p.flow_id);
     this.onRefusedCompletion?.(p.flow_id, err);
     const synthesized: FlowErrorParams = {
       wmp: p.wmp,
@@ -756,6 +802,21 @@ export class Peer implements PeerContext {
     const fh = this.flowHandlerForId(p.flow_id);
     if (fh) fh.handleError(synthesized);
     else this.handler.onFlowError?.(synthesized);
+  }
+
+  /**
+   * Flows whose terminal notification (complete / error) this peer already
+   * processed. A resume re-sends terminal notifications with fresh event IDs, so
+   * transport-level dedupe cannot recognise them; "a client that already
+   * processed the terminal notification of a flow ignores the repeat"
+   * (Transport 4.3.4). Per session: cleared when the session changes or ends,
+   * and for a flow ID when a new flow starts under it. Bounded.
+   */
+  private terminalSeen = new Set<string>();
+
+  private markTerminal(flowId: string): void {
+    this.terminalSeen.add(flowId);
+    if (this.terminalSeen.size > 4096) this.terminalSeen.delete(this.terminalSeen.values().next().value as string);
   }
 
   // Track flow_id → flow_type mapping for routing to the right FlowHandler.
@@ -825,6 +886,14 @@ export class Peer implements PeerContext {
 // ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
+
+function isFlowIdEnvelope(params: unknown): params is { flow_id: string } {
+  return typeof params === "object" && params !== null && typeof (params as { flow_id?: unknown }).flow_id === "string";
+}
+
+function isFlowCompleteEnvelope(params: unknown): params is FlowCompleteParams {
+  return typeof params === "object" && params !== null && typeof (params as { flow_id?: unknown }).flow_id === "string";
+}
 
 function toRPCError(err: unknown): RPCError {
   if (err instanceof WMPError) {

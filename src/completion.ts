@@ -231,6 +231,12 @@ export function validateMatchResult(result: unknown, queryIds?: readonly string[
   }
 }
 
+/** The `id` of each credential query of a DCQL query (for {@link validateMatchResult}). */
+export function dcqlQueryIds(query: unknown): string[] {
+  const creds = isObj(query) ? query.credentials : undefined;
+  return Array.isArray(creds) ? creds.filter((c): c is { id: string } => isObj(c) && typeof c.id === "string").map((c) => c.id) : [];
+}
+
 /**
  * The secret members a replayed completion reports as withheld, or [] when it
  * reports none. A client MUST treat each as unrecoverable: it did not
