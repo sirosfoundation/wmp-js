@@ -694,14 +694,31 @@ export class Peer implements PeerContext {
 
       case Method.FlowCancel:
         if (this.handler.onFlowCancel) {
-          // A cancellation already processed (a resume re-sends it with a fresh
-          // event ID) is acknowledged again without invoking the handler.
-          if (typeof p?.flow_id === "string" && this.terminalSeen.has(p.flow_id)) {
-            return { wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" };
+          const flowId: unknown = p?.flow_id;
+          if (typeof flowId === "string") {
+            // A cancellation already processed (a resume re-sends it with a fresh
+            // event ID) is acknowledged again without invoking the handler. Only a
+            // CANCELLED flow: one that ended by complete/error reaches the handler.
+            if (this.terminalSeen.get(flowId) === "cancelled") {
+              return { wmp: p.wmp, flow_id: flowId, status: "cancelled" };
+            }
+            // A repeat that arrives while the first is still being processed
+            // shares its outcome instead of repeating its side effects.
+            const pending = this.cancelling.get(flowId);
+            if (pending) return pending;
+            const run = (async () => {
+              try {
+                const result = await this.handler.onFlowCancel!(p);
+                this.endFlow(flowId, "cancelled");
+                return result;
+              } finally {
+                this.cancelling.delete(flowId); // a failure leaves a retry possible
+              }
+            })();
+            this.cancelling.set(flowId, run);
+            return run;
           }
-          const result = await this.handler.onFlowCancel(p);
-          this.endFlow(p?.flow_id);
-          return result;
+          return this.handler.onFlowCancel(p);
         }
         break;
 
@@ -748,13 +765,19 @@ export class Peer implements PeerContext {
     // A new flow under a reused ID is not a repeat of the old one's terminal
     // notification. If the start fails the marker comes back: the old flow's
     // terminal must not be delivered twice because a reuse attempt was refused.
-    const hadTerminal = this.terminalSeen.delete(flowId);
+    const hadTerminal = this.terminalSeen.get(flowId);
+    this.terminalSeen.delete(flowId);
     const q = flowType === "match" && typeof params === "object" && params !== null ? (params as { dcql_query?: unknown }).dcql_query : undefined;
     const rec = { type: flowType, queryIds: q === undefined ? undefined : dcqlQueryIds(q) };
     this.recordedFlows.set(flowId, rec);
     return () => {
-      if (this.recordedFlows.get(flowId) === rec) this.recordedFlows.delete(flowId);
-      if (hadTerminal) this.terminalSeen.add(flowId);
+      // Only while this start's own record is still the flow's: if the
+      // replacement already ended (its terminal arrived before the start
+      // response), or another flow took the id, the marker belongs to them.
+      if (this.recordedFlows.get(flowId) === rec) {
+        this.recordedFlows.delete(flowId);
+        if (hadTerminal !== undefined) this.terminalSeen.set(flowId, hadTerminal);
+      }
     };
   }
 
@@ -806,17 +829,20 @@ export class Peer implements PeerContext {
    * marker would let a later resume deliver that flow's callbacks again; the set
    * lives as long as the session.
    */
-  private terminalSeen = new Set<string>();
+  private terminalSeen = new Map<string, "ended" | "cancelled">();
 
-  private markTerminal(flowId: string): void {
-    this.terminalSeen.add(flowId);
+  /** Cancellations being processed, by flow_id: a repeat arriving meanwhile shares the outcome. */
+  private cancelling = new Map<string, Promise<unknown>>();
+
+  private markTerminal(flowId: string, kind: "ended" | "cancelled" = "ended"): void {
+    this.terminalSeen.set(flowId, kind);
   }
 
-  /** A flow ended (complete, error or cancel): drop its validation context and remember its terminal. */
-  private endFlow(flowId: unknown): void {
+  /** A flow ended (complete, error or cancel): drop its validation context and remember how it ended. */
+  private endFlow(flowId: unknown, kind: "ended" | "cancelled" = "ended"): void {
     if (typeof flowId !== "string") return;
     this.recordedFlows.delete(flowId);
-    this.markTerminal(flowId);
+    this.markTerminal(flowId, kind);
   }
 
   // Track flow_id → flow_type mapping for routing to the right FlowHandler.
@@ -862,14 +888,27 @@ export class Peer implements PeerContext {
    * resume fails, the session is lost.
    */
   private onTransportGap(): void {
-    if (!this.sessionId || !this.resumptionToken) {
-      this.onSessionLost?.(new Error("event gap and no resumption token to resume with"));
-      return;
-    }
-    this.resumeSession().catch((err: unknown) => {
-      this.onSessionLost?.(err instanceof Error ? err : new Error(String(err)));
+    // Recoveries run one at a time: a second resume sent before the first one's
+    // response arrived would present the token the first already rotated. A gap
+    // that arrives while one is queued adds nothing (the queued one covers it).
+    if (this.recoveryQueued) return;
+    this.recoveryQueued = true;
+    this.recovery = this.recovery.then(async () => {
+      this.recoveryQueued = false;
+      if (!this.sessionId || !this.resumptionToken) {
+        this.onSessionLost?.(new Error("event gap and no resumption token to resume with"));
+        return;
+      }
+      try {
+        await this.resumeSession();
+      } catch (err: unknown) {
+        this.onSessionLost?.(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
+
+  private recovery: Promise<void> = Promise.resolve();
+  private recoveryQueued = false;
 
   private onTransportClose(): void {
     if (!this.closed) {

@@ -3,7 +3,7 @@ import { HttpSseTransport } from "../src/transport.js";
 import { Peer } from "../src/peer.js";
 import { ErrorCode, Method } from "../src/types.js";
 import { WMPError } from "../src/jsonrpc.js";
-import type { Message } from "../src/jsonrpc.js";
+import type { Message, Response } from "../src/jsonrpc.js";
 import { SseStub } from "./support/sse-stub.js";
 import { FetchEventSource } from "./support/eventsource.js";
 import { MockTransport } from "./mock-transport.js";
@@ -544,5 +544,103 @@ describe("terminal bookkeeping (Peer)", () => {
     for (let i = 0; i < n; i++) t.receive(done(`f${i}`)); // a resume re-sends them all
     await settle2();
     expect(onFlowComplete).toHaveBeenCalledTimes(n);
+  });
+});
+
+describe("cancellation and recovery bookkeeping (round 3)", () => {
+  const settle3 = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  const cancel = (flow: string, id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: flow } });
+  const complete = (flow: string) => ({ jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: flow, result: { credentials: [] } } });
+
+  it("a flow that ended by complete still reaches the handler on its first cancel", async () => {
+    const t = new MockTransport();
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "already_complete" }));
+    new Peer(t, { handler: { onFlowCancel, onFlowComplete: vi.fn() } });
+    t.receive(complete("f1"));
+    await settle3();
+    t.receive(cancel("f1", "c1"));
+    await settle3();
+    expect(onFlowCancel).toHaveBeenCalledTimes(1);
+    expect((t.sent[0] as { result: { status: string } }).result.status).toBe("already_complete");
+    t.receive(cancel("f1", "c2")); // a repeat of a cancellation that was processed
+    await settle3();
+    expect(onFlowCancel).toHaveBeenCalledTimes(1);
+    expect((t.sent[1] as { result: { status: string } }).result.status).toBe("cancelled");
+  });
+
+  it("concurrent cancellations of one flow run the handler once and share the outcome; a failure allows a retry", async () => {
+    const t = new MockTransport();
+    let release!: () => void;
+    let gate = new Promise<void>((r) => (release = r));
+    let fail = true;
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => {
+      await gate;
+      if (fail) throw new WMPError(ErrorCode.FlowError, "boom");
+      return { wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" };
+    });
+    new Peer(t, { handler: { onFlowCancel } });
+    t.receive(cancel("f1", "c1"));
+    t.receive(cancel("f1", "c2"));
+    await settle3();
+    expect(onFlowCancel).toHaveBeenCalledTimes(1);
+    release();
+    await settle3();
+    expect(t.sent.map((m) => (m as Response).error?.code)).toEqual([-31006, -31006]); // both see the failure
+    // retry is possible after the failure
+    fail = false;
+    gate = Promise.resolve();
+    t.receive(cancel("f1", "c3"));
+    await settle3();
+    expect(onFlowCancel).toHaveBeenCalledTimes(2);
+    expect((t.sent[2] as { result: { status: string } }).result.status).toBe("cancelled");
+  });
+
+  it("a failed start does not restore a marker over a flow that took the id", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const peer = new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowComplete } });
+    t.receive(complete("f")); // the old flow ended: marker
+    await settle3();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    const first = peer.startFlow("sign", "f", {}); // reuse attempt 1, response pending
+    first.catch(() => {});
+    await settle3();
+    t.receive(complete("f")); // the replacement completes before its start response
+    await settle3();
+    expect(onFlowComplete).toHaveBeenCalledTimes(2);
+    t.receive({ jsonrpc: "2.0", id: "s2", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "sign", flow_id: "f", params: {} } }); // another flow takes the id
+    await settle3();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, error: { code: -31005, message: "x" } }); // attempt 1 fails late
+    await settle3();
+    t.receive(complete("f")); // the newer flow's completion is delivered, not discarded as a repeat
+    await settle3();
+    expect(onFlowComplete).toHaveBeenCalledTimes(3);
+  });
+
+  it("gaps that arrive while a resume is pending do not send a second resume with the rotated token", async () => {
+    const t = new MockTransport();
+    const lost: Error[] = [];
+    const peer = new Peer(t, { onSessionLost: (e) => lost.push(e) });
+    const created = peer.createSession({});
+    await settle3();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" }, resumption_token: "rt1" } });
+    await created;
+    t.sent.length = 0;
+    t.emitEvent("gap");
+    await settle3(); // the first resume is on the wire
+    t.emitEvent("gap"); // while it is pending: queued behind it
+    t.emitEvent("gap"); // coalesced with the queued one
+    await settle3();
+    const resumes = () => t.sent.filter((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string; params: { resumption_token: string } }[];
+    expect(resumes()).toHaveLength(1);
+    expect(resumes()[0].params.resumption_token).toBe("rt1");
+    t.receive({ jsonrpc: "2.0", id: resumes()[0].id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, resumption_token: "rt2", security: { mode: "tls" } } });
+    await settle3(30);
+    expect(resumes()).toHaveLength(2); // the one follow-up, with the rotated token
+    expect(resumes()[1].params.resumption_token).toBe("rt2");
+    t.receive({ jsonrpc: "2.0", id: resumes()[1].id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, resumption_token: "rt3", security: { mode: "tls" } } });
+    await settle3(30);
+    expect(lost).toHaveLength(0);
+    expect(peer.token).toBe("rt3");
   });
 });
