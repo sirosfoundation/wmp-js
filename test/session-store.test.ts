@@ -52,10 +52,22 @@ describe("MemorySessionStore", () => {
     expect((await s.get("none"))?.id).toBe("none");
   });
 
+  it("treats an empty expiry as malformed, so expired; also for the token expiry", async () => {
+    const s = new MemorySessionStore();
+    await s.create(sess("empty", { expiresAt: "" }));
+    await s.create(sess("tok", { resumptionToken: "t1", resumptionTokenExpiresAt: "" }));
+    expect(await s.get("empty")).toBeUndefined();
+    expect(isSessionExpired(sess("x", { expiresAt: "" }))).toBe(true);
+    expect(await code(s.rotateResumptionToken("tok", "t1", "t2"))).toBe("token_expired");
+  });
+
   it("compares expiry as instants, not strings (offset form)", () => {
-    // 2000-01-01T00:00:00+14:00 is 1999-12-31T10:00:00Z: well in the past, but
-    // lexically greater than any "2025-..." Z string.
-    expect(isSessionExpired(sess("x", { expiresAt: "2000-01-01T00:00:00+14:00" }))).toBe(true);
+    // 2000-01-01T00:00:00+14:00 is the instant 1999-12-31T10:00:00Z. At a fixed
+    // "now" of 1999-12-31T20:00:00Z it has passed; the string "1999-12-31T20:..."
+    // sorts BEFORE "2000-01-01T00:..." so a lexical comparison says it has not.
+    const deadline = "2000-01-01T00:00:00+14:00";
+    expect(isSessionExpired(sess("x", { expiresAt: deadline }), Date.parse("1999-12-31T20:00:00Z"))).toBe(true);
+    expect(isSessionExpired(sess("x", { expiresAt: deadline }), Date.parse("1999-12-31T05:00:00Z"))).toBe(false);
   });
 
   it("list and getByMetadata skip expired sessions", async () => {

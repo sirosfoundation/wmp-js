@@ -48,11 +48,12 @@ export class SessionStoreError extends Error {
 }
 
 /**
- * True when the instant `at` is past `deadline`. An absent deadline never
- * expires; a deadline that does not parse counts as expired (fail closed).
+ * True when `now` is past `deadline`. Only an absent (undefined) deadline never
+ * expires; a deadline that does not parse, an empty string included, counts as
+ * expired (fail closed).
  */
 function pastDeadline(deadline: string | undefined, now: number): boolean {
-  if (deadline === undefined || deadline === "") return false;
+  if (deadline === undefined) return false;
   const t = Date.parse(deadline);
   return Number.isNaN(t) || now > t;
 }

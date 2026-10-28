@@ -136,6 +136,7 @@ export type {
 export {
   validateCompletionResult,
   validateMatchResult,
+  dcqlQueryIds,
   splitReplaySecrets,
   redactedMembers,
   CompletionResultError,
