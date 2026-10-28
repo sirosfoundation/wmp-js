@@ -178,8 +178,11 @@ export class Peer implements PeerContext {
   private onRefusedCompletion?: PeerOptions["onRefusedCompletion"];
   private onSessionLost?: PeerOptions["onSessionLost"];
   private supportedVersions: string[];
-  /** Capabilities negotiated for the session; undefined until known (gating then fails closed). */
-  private negotiatedCapabilities?: Capabilities;
+  /**
+   * Capabilities negotiated for a session, bound to that session's ID; undefined
+   * until known or after the session ends (gating then fails closed).
+   */
+  private negotiated?: { sessionId?: string; capabilities: Capabilities };
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -203,6 +206,25 @@ export class Peer implements PeerContext {
   use(profile: Profile): void {
     this.registry.register(profile);
     profile.init(this);
+  }
+
+  private setNegotiated(sessionId: string | undefined, capabilities: Capabilities | undefined): void {
+    this.negotiated = { sessionId, capabilities: capabilities ?? {} };
+  }
+
+  /** A capability update/list result replaces the cached set of the current session. */
+  private refreshNegotiated(sessionId: string | undefined, capabilities: unknown): void {
+    if (typeof capabilities === "object" && capabilities !== null && !Array.isArray(capabilities)) {
+      this.setNegotiated(sessionId ?? this.negotiated?.sessionId, capabilities as Capabilities);
+    }
+  }
+
+  /** Whether `capability` was negotiated for the session the request names (fail closed). */
+  private hasNegotiated(capability: string, requestSession: unknown): boolean {
+    const n = this.negotiated;
+    if (!n) return false;
+    if (typeof requestSession === "string" && n.sessionId !== undefined && requestSession !== n.sessionId) return false;
+    return Object.prototype.hasOwnProperty.call(n.capabilities, capability);
   }
 
   /** The highest supported version (what a client offers). */
@@ -246,7 +268,12 @@ export class Peer implements PeerContext {
       }, this.callTimeout);
 
       this.pending.set(id, {
-        resolve: resolve as (v: unknown) => void,
+        resolve: ((v: unknown) => {
+          if (method === Method.CapabilityUpdate || method === Method.CapabilityList) {
+            this.refreshNegotiated(this.sessionId, (v as { capabilities?: unknown } | undefined)?.capabilities);
+          }
+          (resolve as (v: unknown) => void)(v);
+        }),
         reject,
         timer,
       });
@@ -298,7 +325,7 @@ export class Peer implements PeerContext {
     // is not above the offered one. Accept that, never a version this peer does
     // not speak or one above the offer.
     const selected = result.wmp.version;
-    if (selected && !(this.supportedVersions.includes(selected) && negotiateVersion(offered, [selected]) === selected)) {
+    if (!selected || !(this.supportedVersions.includes(selected) && negotiateVersion(offered, [selected]) === selected)) {
       throw new WMPError(
         ErrorCode.VersionNotSupported,
         `negotiated version ${selected} is not supported`,
@@ -308,8 +335,8 @@ export class Peer implements PeerContext {
     this.sessionId = result.wmp.session_id;
     this.terminalSeen.clear(); // a new session: flow state of the old one does not carry over
     this.bindSessionToTransport(result.wmp.session_id);
-    this.negotiatedVersion = selected ?? offered;
-    this.negotiatedCapabilities = result.capabilities ?? {};
+    this.negotiatedVersion = selected;
+    this.setNegotiated(result.wmp.session_id, result.capabilities);
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
@@ -335,17 +362,29 @@ export class Peer implements PeerContext {
       Method.SessionResume,
       params,
     );
+    // Validate before mutating any session state: a resume that selects a
+    // version this peer does not speak, or one above what it offered, is a lost
+    // session (the caller creates a new one), not a silent switch.
+    const selected = result.wmp?.version;
+    if (selected !== undefined) {
+      const offered = params.wmp.version;
+      if (!selected || !(this.supportedVersions.includes(selected) && negotiateVersion(offered, [selected]) === selected)) {
+        throw new WMPError(
+          ErrorCode.VersionNotSupported,
+          `negotiated version ${selected} is not supported`,
+          { supported_versions: this.supportedVersions },
+        );
+      }
+    }
     if (result.wmp?.session_id) {
       this.sessionId = result.wmp.session_id;
       this.bindSessionToTransport(result.wmp.session_id);
     }
-    if (result.wmp?.version) {
-      this.negotiatedVersion = result.wmp.version;
-    }
+    if (selected) this.negotiatedVersion = selected;
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
-    if (result.capabilities) this.negotiatedCapabilities = result.capabilities;
+    if (result.capabilities) this.setNegotiated(this.sessionId, result.capabilities);
     return result;
   }
 
@@ -370,10 +409,11 @@ export class Peer implements PeerContext {
   async closeSession(reason = "complete"): Promise<void> {
     if (!this.sessionId) return;
     await this.notify(Method.SessionClose, {
-      wmp: { version: VERSION, session_id: this.sessionId },
+      wmp: { version: this.negotiatedVersion ?? VERSION, session_id: this.sessionId },
       reason,
     });
     this.sessionId = undefined;
+    this.negotiated = undefined;
     this.terminalSeen.clear();
   }
 
@@ -596,8 +636,13 @@ export class Peer implements PeerContext {
           const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
           if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
           const result = await this.handler.onSessionCreate(p);
-          if (result?.wmp && !result.wmp.version) result.wmp.version = selected;
-          if (result?.capabilities) this.negotiatedCapabilities = result.capabilities;
+          if (result) {
+            // The negotiated version is the one that goes on the wire, whatever the handler wrote.
+            result.wmp = { ...result.wmp, version: selected };
+            this.negotiatedVersion = selected;
+            // A new session: what it granted replaces what the previous one did (nothing if it omits them).
+            this.setNegotiated(result.wmp.session_id, result.capabilities);
+          }
           return result;
         }
         break;
@@ -607,13 +652,18 @@ export class Peer implements PeerContext {
           const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
           if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
           const result = await this.handler.onSessionResume(p);
-          if (result?.wmp && !result.wmp.version) result.wmp.version = selected;
+          if (result) {
+            result.wmp = { ...result.wmp, version: selected };
+            this.negotiatedVersion = selected;
+            if (result.capabilities) this.setNegotiated(result.wmp.session_id ?? p?.session_id, result.capabilities);
+          }
           return result;
         }
         break;
 
       case Method.SessionClose:
         this.terminalSeen.clear();
+        this.negotiated = undefined;
         if (this.handler.onSessionClose) {
           this.handler.onSessionClose(p);
         }
@@ -653,13 +703,18 @@ export class Peer implements PeerContext {
       // Capabilities
       case Method.CapabilityUpdate:
         if (this.handler.onCapabilityUpdate) {
-          return this.handler.onCapabilityUpdate(p);
+          const result = await this.handler.onCapabilityUpdate(p);
+          // The update changed what the session grants: later flow starts are gated by it.
+          this.refreshNegotiated(p?.wmp?.session_id, result?.capabilities);
+          return result;
         }
         break;
 
       case Method.CapabilityList:
         if (this.handler.onCapabilityList) {
-          return this.handler.onCapabilityList(p);
+          const result = await this.handler.onCapabilityList(p);
+          this.refreshNegotiated(p?.wmp?.session_id, result?.capabilities);
+          return result;
         }
         break;
 
@@ -672,7 +727,7 @@ export class Peer implements PeerContext {
           // refused with -31005 before the profile sees it. Fails closed: with
           // no negotiated capabilities known, nothing counts as negotiated.
           const need = fh.requiredCapability?.(p.flow_type);
-          if (need && !(this.negotiatedCapabilities && Object.prototype.hasOwnProperty.call(this.negotiatedCapabilities, need))) {
+          if (need && !this.hasNegotiated(need, p.wmp?.session_id)) {
             throw unsupportedError(p.flow_type, { capability: need });
           }
           return fh.startFlow(p);
