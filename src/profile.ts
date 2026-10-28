@@ -27,6 +27,14 @@ export interface PeerContext {
 
   /** Send a JSON-RPC request and wait for the response. */
   call<T = unknown>(method: string, params: unknown): Promise<T>;
+
+  /**
+   * Optional: run `fn` after the response to the wmp.flow.start currently being
+   * handled for `flowId` was sent. Nothing runs if that start is answered with
+   * an error. Lets a profile send a notification for a flow that must not reach
+   * the peer before the start's response.
+   */
+  afterResponse?(flowId: string, fn: () => void): void;
 }
 
 // ---------------------------------------------------------------------------

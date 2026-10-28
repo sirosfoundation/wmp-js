@@ -211,7 +211,6 @@ export {
   checkTransactionDataEntry,
   parseSignSubFlowParams,
   parseMatchStartParams,
-  dcqlQueryIds,
   completeSubFlow,
   failSubFlow,
   rejectSubFlow,

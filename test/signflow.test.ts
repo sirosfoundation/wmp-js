@@ -69,6 +69,10 @@ describe("transaction_data hashing (spec vectors)", () => {
 
   it("refuses an algorithm it cannot compute and a non-ASCII raw", () => {
     expect(() => transactionDataHash("abc", "md5")).toThrow();
+    // names inherited from Object.prototype are not algorithms
+    for (const name of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"]) {
+      expect(() => transactionDataHash("abc", name), name).toThrow();
+    }
     expect(() => transactionDataHash("abcé")).toThrow();
     expect(transactionDataHash("abc")).toBe(transactionDataHash("abc", "sha-256"));
   });
@@ -85,6 +89,15 @@ describe("checkTransactionDataEntry", () => {
     expect(code(() => checkTransactionDataEntry(entry({ payload: { transaction_id: "tx-2" } })))).toBe(-32602);
     expect(code(() => checkTransactionDataEntry(entry({ transaction_data_hashes_alg: ["sha-512"] })))).toBe(-32602);
   });
+  it("does not let a malformed element of the decoded list hide a disagreement", () => {
+    const r = enc({ type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256", 7] });
+    expect(code(() => checkTransactionDataEntry({ raw: r, type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256"] }))).toBe(-32602);
+    const r2 = enc({ type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256"] });
+    expect(code(() => checkTransactionDataEntry({ raw: r2, type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256", ""] }))).toBe(-32602);
+    expect(code(() => checkTransactionDataEntry({ raw: r2, type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256", "sha-256"] }))).toBe(-32602);
+    expect(() => checkTransactionDataEntry({ raw: r2, type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256"] })).not.toThrow();
+  });
+
   it("compares hash algorithms ignoring array vs bare string", () => {
     const r = enc({ type: "t", credential_ids: ["a"], transaction_data_hashes_alg: ["sha-256"] });
     expect(() => checkTransactionDataEntry({ raw: r, type: "t", credential_ids: ["a"], transaction_data_hashes_alg: "sha-256" })).not.toThrow();
@@ -411,5 +424,43 @@ describe("OpenID4xProfile capability descriptors", () => {
 
   it("refuses a transaction_data descriptor without versions", () => {
     expect(() => new OpenID4xProfile({ transactionData: { versions: [] } }).capabilityDescriptors()).toThrow();
+  });
+});
+
+describe("the sub-flow's terminal notification never overtakes the flow.start response", () => {
+  it("waits for the response send to complete, however slow it is", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: { oid4vp: {}, oid4vci: {} }, security: { mode: "tls" } }) },
+    });
+    peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign: (flow) => flow.complete({ proof_jwt: "eyJ" }) }));
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+
+    // From here the response to flow.start is slow, as an HTTP POST can be.
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const realSend = t.send.bind(t);
+    t.send = async (msg) => {
+      const m = msg as { id?: string; method?: string };
+      if (m.id !== undefined && m.method === undefined) await gate;
+      order.push(m.method ?? "response");
+      await realSend(msg);
+    };
+    t.receive(start("sign", "flow-9", sign({ action: "generate_proof", nonce: "n", audience: "a" })));
+    await settle(60);
+    expect(order).toEqual([]); // not even the completion went out while the response is pending
+    release();
+    await settle(60);
+    expect(order).toEqual(["response", "wmp.flow.complete"]);
+  });
+
+  it("does not run the continuation when the start is answered with an error", async () => {
+    const onSign = vi.fn();
+    const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign });
+    t.receive(start("sign", "f", { action: "nope" }));
+    await settle(60);
+    expect(onSign).not.toHaveBeenCalled();
   });
 });

@@ -28,11 +28,10 @@ import type {
 } from "./profile.js";
 import { WMPError } from "./jsonrpc.js";
 import { unsupportedError } from "./errors.js";
-import { validateMatchResult } from "./completion.js";
+import { dcqlQueryIds, validateMatchResult } from "./completion.js";
 import {
   CAPABILITY_TRANSACTION_DATA,
   SignFlow,
-  dcqlQueryIds,
   completeSubFlow,
   parseMatchStartParams,
   parseSignSubFlowParams,
@@ -754,7 +753,7 @@ export class OpenID4xProfile
           throw transactionDataUnsupportedError();
         }
         const flow = new SignFlow(this.peer!, params.wmp, params.flow_id, sp);
-        this.defer(async () => {
+        this.defer(params.flow_id, async () => {
           try {
             await this.config.onSign!(flow);
           } catch (err) {
@@ -767,7 +766,7 @@ export class OpenID4xProfile
       }
       case "match": {
         const mp = parseMatchStartParams(params.params);
-        this.defer(() => this.runMatch(params, mp));
+        this.defer(params.flow_id, () => this.runMatch(params, mp));
         return { wmp: params.wmp, flow_id: params.flow_id, flow_type: params.flow_type };
       }
       default:
@@ -775,13 +774,20 @@ export class OpenID4xProfile
     }
   }
 
-  /** Runs after the flow.start response was sent, so the completion never overtakes it. */
-  private defer(fn: () => Promise<void>): void {
-    setTimeout(() => {
+  /**
+   * Runs `fn` after the flow.start response has been sent, so the sub-flow's
+   * terminal notification can never overtake it. The Peer reports when the
+   * response send resolved (for HTTP: when its POST completed); a PeerContext
+   * without that falls back to a zero-delay timer.
+   */
+  private defer(flowId: string, fn: () => Promise<void>): void {
+    const run = (): void => {
       fn().catch(() => {
         /* the answer could not be sent: the orchestrator's flow timeout applies */
       });
-    }, 0);
+    };
+    if (this.peer?.afterResponse) this.peer.afterResponse(flowId, run);
+    else setTimeout(run, 0);
   }
 
   private async runMatch(start: FlowStartParams, mp: MatchStartParams): Promise<void> {

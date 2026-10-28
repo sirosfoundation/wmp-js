@@ -252,6 +252,27 @@ export class Peer implements PeerContext {
   // PeerContext implementation (for profiles)
   // -------------------------------------------------------------------------
 
+  private afterResponse_ = new Map<string, (() => void)[]>();
+
+  /** PeerContext: queue `fn` to run once the response to the current flow.start for `flowId` was sent. */
+  afterResponse(flowId: string, fn: () => void): void {
+    const q = this.afterResponse_.get(flowId) ?? [];
+    q.push(fn);
+    this.afterResponse_.set(flowId, q);
+  }
+
+  private runAfterResponse(flowId: string): void {
+    const q = this.afterResponse_.get(flowId);
+    this.afterResponse_.delete(flowId);
+    for (const fn of q ?? []) {
+      try {
+        fn();
+      } catch {
+        /* a queued continuation must not break the dispatcher */
+      }
+    }
+  }
+
   async notify(method: string, params: unknown): Promise<void> {
     const msg = createNotification(method, params);
     await this.transport.send(msg);
@@ -579,12 +600,16 @@ export class Peer implements PeerContext {
         /* notifications get no error response */
       });
     } else {
+      const flowKey = req.method === Method.FlowStart ? flowIdOf(req.params) : undefined;
       dispatch()
-        .then((result) => {
+        .then(async (result) => {
           const resp = createResponse(req.id!, result);
-          return this.transport.send(resp);
+          await this.transport.send(resp);
+          // Only now may anything the handler queued for after the response go out.
+          if (flowKey !== undefined) this.runAfterResponse(flowKey);
         })
         .catch((err) => {
+          if (flowKey !== undefined) this.afterResponse_.delete(flowKey);
           const rpcErr = toRPCError(err);
           const resp = createErrorResponse(req.id!, rpcErr);
           return this.transport.send(resp);
@@ -941,6 +966,11 @@ export class Peer implements PeerContext {
 // ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
+
+function flowIdOf(params: unknown): string | undefined {
+  const id = typeof params === "object" && params !== null ? (params as { flow_id?: unknown }).flow_id : undefined;
+  return typeof id === "string" ? id : undefined;
+}
 
 function isFlowIdEnvelope(params: unknown): params is { flow_id: string } {
   return typeof params === "object" && params !== null && typeof (params as { flow_id?: unknown }).flow_id === "string";

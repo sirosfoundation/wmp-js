@@ -5,7 +5,7 @@
  */
 
 import { sha256, sha384, sha512 } from "@noble/hashes/sha2.js";
-import { validateCompletionResult, validateMatchResult } from "./completion.js";
+import { validateCompletionResult } from "./completion.js";
 import { isSelectionHandle } from "./consent.js";
 import { unsupportedError } from "./errors.js";
 import { WMPError } from "./jsonrpc.js";
@@ -62,14 +62,15 @@ export function transactionDataUnsupportedError(redirectUri?: string): WMPError 
 // transaction_data hashing and entry checks (profile 3.2.5)
 // ---------------------------------------------------------------------------
 
-const HASHES: Record<string, (b: Uint8Array) => Uint8Array> = {
-  "sha-256": sha256,
-  "sha-384": sha384,
-  "sha-512": sha512,
-};
+// A Map, not an object: "constructor" or "toString" must not name an algorithm.
+const HASHES = new Map<string, (b: Uint8Array) => Uint8Array>([
+  ["sha-256", sha256],
+  ["sha-384", sha384],
+  ["sha-512", sha512],
+]);
 
 /** Hash algorithms {@link transactionDataHash} computes. */
-export const TRANSACTION_DATA_HASH_ALGS: readonly string[] = Object.keys(HASHES);
+export const TRANSACTION_DATA_HASH_ALGS: readonly string[] = [...HASHES.keys()];
 
 function toBase64Url(bytes: Uint8Array): string {
   let bin = "";
@@ -94,7 +95,7 @@ function fromBase64Url(s: string): Uint8Array {
  * not ASCII.
  */
 export function transactionDataHash(raw: string, alg: string = "sha-256"): string {
-  const h = HASHES[alg];
+  const h = HASHES.get(alg);
   if (!h) throw new Error(`unsupported transaction_data hash algorithm`);
   // eslint-disable-next-line no-control-regex
   if (!/^[\u0000-\u007f]*$/.test(raw)) throw new Error("transaction_data raw is not ASCII");
@@ -113,9 +114,13 @@ function deepEqual(a: unknown, b: unknown): boolean {
   return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
 }
 
-function algsOf(v: unknown): string[] {
-  if (typeof v === "string") return v === "" ? [] : [v];
-  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && x !== "") : [];
+/**
+ * A transaction_data_hashes_alg as a list for comparison: a bare string becomes a
+ * one-element list; anything else is kept as it is, malformed elements included,
+ * so a disagreement hidden in a bad element cannot pass.
+ */
+function algList(v: unknown): unknown {
+  return typeof v === "string" ? [v] : v;
 }
 
 /**
@@ -143,7 +148,7 @@ export function checkTransactionDataEntry(entry: TransactionData): Record<string
   if (d.type !== entry.type) throw invalidParams("transaction_data type disagrees with raw");
   if (!deepEqual(d.credential_ids, entry.credential_ids)) throw invalidParams("transaction_data credential_ids disagree with raw");
   if (entry.payload !== undefined && !deepEqual(d.payload, entry.payload)) throw invalidParams("transaction_data payload disagrees with raw");
-  if (entry.transaction_data_hashes_alg !== undefined && !deepEqual(algsOf(d.transaction_data_hashes_alg), algsOf(entry.transaction_data_hashes_alg))) {
+  if (entry.transaction_data_hashes_alg !== undefined && !deepEqual(algList(d.transaction_data_hashes_alg), algList(entry.transaction_data_hashes_alg))) {
     throw invalidParams("transaction_data_hashes_alg disagrees with raw");
   }
   return d;
@@ -370,9 +375,4 @@ export function parseMatchStartParams(raw: unknown): MatchStartParams {
     if (raw[k] !== undefined && !isObj(raw[k])) throw invalidParams(`${k} is not an object`);
   }
   return { ...(raw as unknown as MatchStartParams) };
-}
-
-/** The `id` of each credential query of a DCQL query. */
-export function dcqlQueryIds(query: MatchStartParams["dcql_query"]): string[] {
-  return Array.isArray(query.credentials) ? query.credentials.filter((c) => isObj(c) && typeof c.id === "string").map((c) => c.id) : [];
 }
