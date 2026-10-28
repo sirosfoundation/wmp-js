@@ -182,9 +182,33 @@ export class Peer implements PeerContext {
    * Capabilities negotiated for a session, bound to that session's ID; undefined
    * until known or after the session ends (gating then fails closed).
    */
-  private negotiated?: { sessionId?: string; capabilities: Capabilities; appliedSeq: number };
-  /** Orders capability operations: a snapshot older than the one already applied never replaces it. */
-  private capSeq = 0;
+  private negotiated?: { sessionId?: string; capabilities: Capabilities };
+
+  /**
+   * Operations that must not overlap, one chain per kind: outgoing capability
+   * operations, incoming capability handlers, incoming session create/resume.
+   * They finish in the order they started, so the last to finish is also the
+   * latest word and an older snapshot can never replace a newer one. (Outgoing
+   * and incoming are separate chains: each side waits on the other's answer, and
+   * one shared chain could deadlock two peers calling each other.)
+   */
+  private chains: Record<"out" | "in" | "session", Promise<void>> = {
+    out: Promise.resolve(),
+    in: Promise.resolve(),
+    session: Promise.resolve(),
+  };
+
+  private async serialized<T>(kind: "out" | "in" | "session", fn: () => Promise<T>): Promise<T> {
+    const previous = this.chains[kind];
+    let release!: () => void;
+    this.chains[kind] = new Promise<void>((r) => (release = r));
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -220,44 +244,49 @@ export class Peer implements PeerContext {
   /** A new session: what it granted replaces what the previous one did (nothing if it omits them). */
   private beginSession(sessionId: string | undefined, capabilities: Capabilities | undefined): void {
     this.lifecycle++;
-    this.negotiated = { sessionId, capabilities: capabilities ?? {}, appliedSeq: this.capSeq };
-    this.terminalSeen.clear(); // flow state of the old session does not carry over
+    // A copy: the grant must not change when the caller's (or handler's) object does.
+    this.negotiated = { sessionId, capabilities: { ...capabilities } };
+    this.resetFlows(); // flow state of the old session does not carry over
   }
 
   private endSession(): void {
     this.lifecycle++;
     this.negotiated = undefined;
-    this.terminalSeen.clear();
+    this.resetFlows();
   }
 
   /**
-   * A resume of `sessionId`. Capabilities the result lists replace the cache; an
-   * omitted set is kept only for the SAME session, otherwise the cache becomes
-   * empty (the other session's grant must not carry over).
+   * A resume of `sessionId`. The SAME session keeps its identity: capabilities
+   * the result lists replace its grant, an omitted set leaves it, and neither the
+   * lifecycle nor the flow state changes. Another session is a replacement: its
+   * grant is what the result lists (nothing if omitted), the lifecycle moves on
+   * and the old session's flow state is dropped.
    */
   private resumeNegotiated(sessionId: string | undefined, capabilities: Capabilities | undefined): void {
-    if (capabilities === undefined && this.negotiated && this.negotiated.sessionId === sessionId) return;
+    const n = this.negotiated;
+    if (n && n.sessionId === sessionId) {
+      if (capabilities !== undefined) n.capabilities = { ...capabilities };
+      return;
+    }
     this.lifecycle++;
-    this.negotiated = { sessionId, capabilities: capabilities ?? {}, appliedSeq: this.capSeq };
+    this.negotiated = { sessionId, capabilities: { ...capabilities } };
+    this.resetFlows();
   }
 
   /**
    * A capability update/list result replaces the cached set, but only of an
    * existing session that is still the one it was requested under: `gen` and
-   * `sessionId` are what was current when the request went out (or the handler
-   * was entered), so a late result cannot recreate a closed session's grant or
-   * overwrite a newer session's.
+   * `sessionId` are what was current when the operation started, so a late result
+   * cannot recreate a closed session's grant or overwrite a newer session's.
+   * Operations of one kind never overlap (see `chains`), so results arrive in
+   * the order they were requested.
    */
-  private refreshNegotiated(gen: number, sessionId: string | undefined, seq: number, capabilities: unknown): void {
+  private refreshNegotiated(gen: number, sessionId: string | undefined, capabilities: unknown): void {
     if (typeof capabilities !== "object" || capabilities === null || Array.isArray(capabilities)) return;
     const n = this.negotiated;
     if (!n || this.lifecycle !== gen) return;
     if (sessionId !== undefined && n.sessionId !== undefined && sessionId !== n.sessionId) return;
-    // Concurrent operations of one session: the snapshot of the operation issued
-    // last wins; an older one that arrives later must not undo a newer update.
-    if (seq < n.appliedSeq) return;
-    n.appliedSeq = seq;
-    n.capabilities = capabilities as Capabilities;
+    n.capabilities = { ...(capabilities as Capabilities) };
   }
 
   /** Whether `capability` was negotiated for the session the request names (fail closed). */
@@ -308,6 +337,15 @@ export class Peer implements PeerContext {
   }
 
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
+    // Capability operations go one at a time: the grant is whatever the last one
+    // said, never an older snapshot that happened to arrive later.
+    if (method === Method.CapabilityUpdate || method === Method.CapabilityList) {
+      return this.serialized("out", () => this.callNow<T>(method, params));
+    }
+    return this.callNow<T>(method, params);
+  }
+
+  private callNow<T>(method: string, params: unknown): Promise<T> {
     const req = createRequest(method, params);
     const id = req.id!;
     // Every outgoing flow.start goes through here (the convenience method and
@@ -315,12 +353,10 @@ export class Peer implements PeerContext {
     const rollback = method === Method.FlowStart ? this.beginFlow(flowIdOf(params), flowTypeOf(params), (params as { params?: unknown }).params) : noop;
 
     // What a capability result is checked against when it comes back: the
-    // lifecycle, the session the REQUEST names (else the current one) and the
-    // order the operation was issued in.
+    // lifecycle and the session the REQUEST names (else the current one).
     const capturedGen = this.lifecycle;
     const named = (params as { wmp?: { session_id?: unknown } } | undefined)?.wmp?.session_id;
     const capturedSession = typeof named === "string" ? named : this.negotiated?.sessionId;
-    const capturedSeq = ++this.capSeq;
 
     return new Promise<T>((resolve, reject) => {
       const fail = (err: unknown): void => {
@@ -336,7 +372,7 @@ export class Peer implements PeerContext {
         resolve: ((v: unknown) => {
           if (method === Method.CapabilityUpdate || method === Method.CapabilityList) {
             // Only the session (and lifecycle) that existed when the request went out may be refreshed.
-            this.refreshNegotiated(capturedGen, capturedSession, capturedSeq, (v as { capabilities?: unknown } | undefined)?.capabilities);
+            this.refreshNegotiated(capturedGen, capturedSession, (v as { capabilities?: unknown } | undefined)?.capabilities);
           }
           // A cancelled flow has ended: release its context (shared by the convenience method and profiles).
           if (method === Method.FlowCancel) this.releaseFlow(flowIdOf(params));
@@ -450,6 +486,8 @@ export class Peer implements PeerContext {
       );
     }
     if (result.wmp?.session_id) {
+      // Resuming the same session keeps its flow state; another session does not.
+      if (result.wmp.session_id !== this.sessionId) this.resetFlows();
       this.sessionId = result.wmp.session_id;
       this.bindSessionToTransport(result.wmp.session_id);
     }
@@ -671,9 +709,8 @@ export class Peer implements PeerContext {
     method: string,
     params: unknown,
   ): Promise<unknown> {
-    // A repeat of a terminal notification already processed (a resume re-sends
-    // them with fresh event IDs). Only checked here: a flow is marked terminal
-    // once its notification passed validation (below), not before.
+    // A repeat of a terminal message already processed (or refused): ignored.
+    // Only checked here; a flow is marked once its message passed validation.
     if ((method === Method.FlowComplete || method === Method.FlowError) && isFlowIdEnvelope(params) && this.terminalSeen.has(params.flow_id)) {
       return undefined;
     }
@@ -682,10 +719,16 @@ export class Peer implements PeerContext {
     // validator runs: a notification the validator rejected would be dropped
     // silently and the receiving handler would never learn that the flow failed.
     // Authorization (handleRequest) and the envelope shape are still checked.
-    if (method === Method.FlowComplete && this.validateCompletions && isFlowCompleteEnvelope(params)) {
-      const refusal = this.completionRefusal(params);
-      if (refusal) {
-        this.refuseCompletion(params, refusal);
+    if (method === Method.FlowComplete && this.validateCompletions) {
+      if (isFlowCompleteEnvelope(params)) {
+        const refusal = this.completionRefusal(params);
+        if (refusal) {
+          this.refuseCompletion(params, refusal);
+          return undefined;
+        }
+      } else if (!this.validator) {
+        // Not even the basic envelope, and no schema validator to judge it: it
+        // is not delivered (a result nobody checked must not reach the handler).
         return undefined;
       }
     }
@@ -712,17 +755,26 @@ export class Peer implements PeerContext {
           // -32602 (malformed) / -31013 with supported_versions.
           const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
           if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
-          const result = await this.handler.onSessionCreate(p);
-          if (result) {
-            // The negotiated version is the one that goes on the wire, whatever the handler wrote.
-            result.wmp = { ...result.wmp, version: selected };
-            this.negotiatedVersion = selected;
-            // The session this peer now serves: its identity, and what it granted
-            // (nothing if the result omits capabilities).
-            if (typeof result.wmp.session_id === "string") this.sessionId = result.wmp.session_id;
-            this.beginSession(result.wmp.session_id, result.capabilities);
-          }
-          return result;
+          // Session establishment is serialized: a slow handler cannot finish
+          // after a later create/resume and overwrite what that one installed.
+          return this.serialized("session", async () => {
+            const result = await this.handler.onSessionCreate!(p);
+            if (result) {
+              // The negotiated version is the one that goes on the wire, whatever the handler wrote.
+              result.wmp = { ...result.wmp, version: selected };
+              this.negotiatedVersion = selected;
+              // The session this peer now serves: its identity, routing and what it
+              // granted (nothing if the result omits capabilities). A new session
+              // has no resumption token of ours: the old session's must not linger.
+              if (typeof result.wmp.session_id === "string") {
+                this.sessionId = result.wmp.session_id;
+                this.bindSessionToTransport(result.wmp.session_id);
+              }
+              this.resumptionToken = undefined;
+              this.beginSession(result.wmp.session_id, result.capabilities);
+            }
+            return result;
+          });
         }
         break;
 
@@ -730,19 +782,25 @@ export class Peer implements PeerContext {
         if (this.handler.onSessionResume) {
           const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
           if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
-          const gen = this.lifecycle;
-          const result = await this.handler.onSessionResume(p);
-          if (result) {
-            result.wmp = { ...result.wmp, version: selected };
-            // Only a successful resume that is still current installs session state.
-            if (result.resumed === true && this.lifecycle === gen) {
-              this.negotiatedVersion = selected;
-              const resumedId = typeof result.wmp.session_id === "string" ? result.wmp.session_id : typeof p?.session_id === "string" ? p.session_id : undefined;
-              if (resumedId !== undefined) this.sessionId = resumedId;
-              this.resumeNegotiated(resumedId, result.capabilities);
+          return this.serialized("session", async () => {
+            const gen = this.lifecycle;
+            const result = await this.handler.onSessionResume!(p);
+            if (result) {
+              result.wmp = { ...result.wmp, version: selected };
+              // Only a successful resume that is still current installs session state.
+              if (result.resumed === true && this.lifecycle === gen) {
+                this.negotiatedVersion = selected;
+                const resumedId = typeof result.wmp.session_id === "string" ? result.wmp.session_id : typeof p?.session_id === "string" ? p.session_id : undefined;
+                if (resumedId !== undefined) {
+                  if (resumedId !== this.sessionId) this.resumptionToken = undefined; // another session: not its token
+                  this.sessionId = resumedId;
+                  this.bindSessionToTransport(resumedId);
+                }
+                this.resumeNegotiated(resumedId, result.capabilities);
+              }
             }
-          }
-          return result;
+            return result;
+          });
         }
         break;
 
@@ -794,22 +852,25 @@ export class Peer implements PeerContext {
       // Capabilities
       case Method.CapabilityUpdate:
         if (this.handler.onCapabilityUpdate) {
-          const gen = this.lifecycle;
-          const seq = ++this.capSeq;
-          const result = await this.handler.onCapabilityUpdate(p);
-          // The update changed what the session grants: later flow starts are gated by it.
-          this.refreshNegotiated(gen, p?.wmp?.session_id, seq, result?.capabilities);
-          return result;
+          // One at a time: the grant is what the last handler said.
+          return this.serialized("in", async () => {
+            const gen = this.lifecycle;
+            const result = await this.handler.onCapabilityUpdate!(p);
+            // The update changed what the session grants: later flow starts are gated by it.
+            this.refreshNegotiated(gen, p?.wmp?.session_id, result?.capabilities);
+            return result;
+          });
         }
         break;
 
       case Method.CapabilityList:
         if (this.handler.onCapabilityList) {
-          const gen = this.lifecycle;
-          const seq = ++this.capSeq;
-          const result = await this.handler.onCapabilityList(p);
-          this.refreshNegotiated(gen, p?.wmp?.session_id, seq, result?.capabilities);
-          return result;
+          return this.serialized("in", async () => {
+            const gen = this.lifecycle;
+            const result = await this.handler.onCapabilityList!(p);
+            this.refreshNegotiated(gen, p?.wmp?.session_id, result?.capabilities);
+            return result;
+          });
         }
         break;
 
@@ -894,21 +955,30 @@ export class Peer implements PeerContext {
             if (this.terminalSeen.get(flowId) === "cancelled") {
               return { wmp: p.wmp, flow_id: flowId, status: "cancelled" };
             }
-            // A repeat that arrives while the first is still being processed
-            // shares its outcome instead of repeating its side effects.
+            // The flow generation this cancellation is for (its record, if any).
+            const rec = this.recordedFlows.get(flowId);
+            // A repeat for the same generation that arrives while the first is
+            // still being processed shares its outcome. A replacement flow under
+            // the same id is a different generation and gets its own run.
             const pending = this.cancelling.get(flowId);
-            if (pending) return pending;
-            const run = (async () => {
+            if (pending && pending.rec === rec) return pending.run;
+            const entry: { rec: object | undefined; run: Promise<unknown> } = { rec, run: undefined as unknown as Promise<unknown> };
+            entry.run = (async () => {
+              // Yield first: the entry is installed before the handler can throw
+              // (even synchronously), so its cleanup always sees it.
+              await Promise.resolve();
               try {
                 const result = await this.handler.onFlowCancel!(p);
-                this.endFlow(flowId, "cancelled");
+                // Finalize only the generation that was cancelled: if that flow
+                // ended and another started under the id meanwhile, leave it alone.
+                if (this.recordedFlows.get(flowId) === rec) this.endFlow(flowId, "cancelled");
                 return result;
               } finally {
-                this.cancelling.delete(flowId); // a failure leaves a retry possible
+                if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
               }
             })();
-            this.cancelling.set(flowId, run);
-            return run;
+            this.cancelling.set(flowId, entry);
+            return entry.run;
           }
           return this.handler.onFlowCancel(p);
         }
@@ -942,6 +1012,32 @@ export class Peer implements PeerContext {
   private recordedFlows = new Map<string, { type: string; queryIds?: string[] }>();
 
   /**
+   * Flows that ended (complete, error, a refused completion or a cancel), by
+   * flow_id. A finished or refused flow is not an unknown one: a further terminal
+   * message for it is ignored instead of being judged by the general rules, and
+   * it holds no active-flow slot. Never evicted (it lives as long as the session)
+   * and cleared when the session ends or changes.
+   */
+  private terminalSeen = new Map<string, "ended" | "cancelled">();
+
+  private markTerminal(flowId: string, kind: "ended" | "cancelled" = "ended"): void {
+    this.terminalSeen.set(flowId, kind);
+  }
+
+  /** A flow ended: drop its validation context and remember how it ended. */
+  private endFlow(flowId: unknown, kind: "ended" | "cancelled" = "ended"): void {
+    if (typeof flowId !== "string") return;
+    this.recordedFlows.delete(flowId);
+    this.markTerminal(flowId, kind);
+  }
+
+  /** A new or ended session: the old session's flow state does not carry over. */
+  private resetFlows(): void {
+    this.recordedFlows.clear();
+    this.terminalSeen.clear();
+  }
+
+  /**
    * Records a starting flow and returns the function that undoes it. Refuses
    * (-32602) a flow_id that is already active, so a second start cannot replace
    * the context of the first, and (-31007) a start at capacity.
@@ -955,8 +1051,7 @@ export class Peer implements PeerContext {
       throw new WMPError(ErrorCode.RateLimited, "Too many active flows");
     }
     // A new flow under a reused ID is not a repeat of the old one's terminal
-    // notification. If the start fails the marker comes back: the old flow's
-    // terminal must not be delivered twice because a reuse attempt was refused.
+    // message. If the start fails the marker comes back (below).
     const hadTerminal = this.terminalSeen.get(flowId);
     this.terminalSeen.delete(flowId);
     const q = flowType === "match" && typeof params === "object" && params !== null ? (params as { dcql_query?: unknown }).dcql_query : undefined;
@@ -964,8 +1059,7 @@ export class Peer implements PeerContext {
     this.recordedFlows.set(flowId, rec);
     return () => {
       // Only while this start's own record is still the flow's: if the
-      // replacement already ended (its terminal arrived before the start
-      // response), or another flow took the id, the marker belongs to them.
+      // replacement already ended, or another flow took the id, the marker is theirs.
       if (this.recordedFlows.get(flowId) === rec) {
         this.recordedFlows.delete(flowId);
         if (hadTerminal !== undefined) this.terminalSeen.set(flowId, hadTerminal);
@@ -997,8 +1091,7 @@ export class Peer implements PeerContext {
    * text, goes to whoever would have received the completion or the error.
    */
   private refuseCompletion(p: FlowCompleteParams, err: CompletionResultError): void {
-    this.recordedFlows.delete(p.flow_id);
-    this.markTerminal(p.flow_id); // the synthesized error ends the flow
+    this.endFlow(p.flow_id); // the synthesized error ends the flow
     this.onRefusedCompletion?.(p.flow_id, err);
     const synthesized: FlowErrorParams = {
       wmp: p.wmp,
@@ -1012,30 +1105,11 @@ export class Peer implements PeerContext {
   }
 
   /**
-   * Flows whose terminal notification (complete / error) this peer already
-   * processed. A resume re-sends terminal notifications with fresh event IDs, so
-   * transport-level dedupe cannot recognise them; "a client that already
-   * processed the terminal notification of a flow ignores the repeat"
-   * (Transport 4.3.4). Per session: cleared when the session changes or ends,
-   * and for a flow ID when a new flow starts under it. Never evicted: dropping a
-   * marker would let a later resume deliver that flow's callbacks again; the set
-   * lives as long as the session.
+   * Cancellations being processed, by flow_id, with the flow generation they
+   * belong to: a repeat for the SAME generation arriving meanwhile shares the
+   * outcome; a replacement flow under the same id never does.
    */
-  private terminalSeen = new Map<string, "ended" | "cancelled">();
-
-  /** Cancellations being processed, by flow_id: a repeat arriving meanwhile shares the outcome. */
-  private cancelling = new Map<string, Promise<unknown>>();
-
-  private markTerminal(flowId: string, kind: "ended" | "cancelled" = "ended"): void {
-    this.terminalSeen.set(flowId, kind);
-  }
-
-  /** A flow ended (complete, error or cancel): drop its validation context and remember how it ended. */
-  private endFlow(flowId: unknown, kind: "ended" | "cancelled" = "ended"): void {
-    if (typeof flowId !== "string") return;
-    this.recordedFlows.delete(flowId);
-    this.markTerminal(flowId, kind);
-  }
+  private cancelling = new Map<string, { rec: object | undefined; run: Promise<unknown> }>();
 
   // Track flow_id → flow_type mapping for routing to the right FlowHandler.
   private activeFlows = new Map<string, string>();

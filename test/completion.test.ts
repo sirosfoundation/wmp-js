@@ -89,6 +89,14 @@ describe("validateCompletionResult", () => {
     }
   });
 
+  it("requires redacted_members in alphabetical order", () => {
+    expect(refused({ redacted_members: ["dpop_jwk", "dpop_key_id", "refresh_token"] })).toBe("");
+    expect(refused({ redacted_members: ["dpop_jwk", "refresh_token"] })).toBe("");
+    expect(refused({ redacted_members: ["refresh_token", "dpop_jwk"] })).toContain("alphabetical");
+    expect(refused({ redacted_members: ["dpop_key_id", "dpop_jwk"] })).toContain("alphabetical");
+    expect(refused({ redacted_members: ["refresh_token", "dpop_jwk", "dpop_key_id"] })).not.toBe("");
+  });
+
   it("honours a caller supplied secret member set", () => {
     expect(refused({ credential_metadata: { my_secret: 1 } })).toBe("");
     expect(refused({ credential_metadata: { my_secret: 1 } }, ["my_secret"])).not.toBe("");
@@ -570,6 +578,183 @@ describe("Peer: finished flows release their context", () => {
     t.receive({ jsonrpc: "2.0", id: (t.sent[2] as { id: string }).id, result: { wmp: { version: "0.1" }, flow_id: "f1", status: "cancelled" } });
     await c2;
     peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.start")).toHaveLength(2);
+  });
+});
+
+describe("Peer: finished flows, malformed envelopes and sessions (round 4)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 10));
+  const query = { credentials: [{ id: "pid" }] };
+  const secret = { satisfiable: true, claims: { name: "secret" } };
+  const complete = (flowId: string, result?: unknown, wmp: unknown = { version: "0.1" }) => ({
+    jsonrpc: "2.0" as const,
+    method: "wmp.flow.complete",
+    params: { ...(wmp === null ? {} : { wmp }), flow_id: flowId, ...(result === undefined ? {} : { result }) },
+  });
+  const startMatch = (id: string, flowId: string) => ({
+    jsonrpc: "2.0" as const,
+    id,
+    method: "wmp.flow.start",
+    params: { wmp: { version: "0.1" }, flow_type: "match", flow_id: flowId, params: { dcql_query: query } },
+  });
+  const matchPeer = () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const onFlowError = vi.fn();
+    const peer = new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowComplete, onFlowError } });
+    return { t, peer, onFlowComplete, onFlowError };
+  };
+
+  it("a completion without wmp metadata is not delivered when there is no schema validator", async () => {
+    const { t, onFlowComplete, onFlowError } = matchPeer();
+    t.receive(startMatch("s", "m1"));
+    await settle();
+    t.receive(complete("m1", secret, null));
+    await settle();
+    expect(onFlowComplete).not.toHaveBeenCalled();
+    expect(onFlowError).not.toHaveBeenCalled(); // malformed: dropped, not a flow outcome
+    t.receive(complete("m1", { satisfiable: true })); // a well-formed one still works
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("the same invalid match completion sent twice is refused once and ignored after", async () => {
+    const { t, onFlowComplete, onFlowError } = matchPeer();
+    t.receive(startMatch("s", "m1"));
+    await settle();
+    t.receive(complete("m1", secret));
+    t.receive(complete("m1", secret));
+    await settle();
+    expect(onFlowComplete).not.toHaveBeenCalled();
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+  });
+
+  it("after a match flow ended normally, a claim-bearing repeat is ignored, not judged by the general rules", async () => {
+    const { t, onFlowComplete } = matchPeer();
+    t.receive(startMatch("s", "m1"));
+    await settle();
+    t.receive(complete("m1", { satisfiable: true }));
+    await settle();
+    t.receive(complete("m1", secret));
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("an ended flow holds no active slot, and a restarted id is judged afresh", async () => {
+    const { t, onFlowComplete, onFlowError } = matchPeer();
+    t.receive(startMatch("s1", "m1"));
+    await settle();
+    t.receive(complete("m1", { satisfiable: true }));
+    await settle();
+    t.receive(startMatch("s2", "m1")); // the id is free again
+    await settle();
+    expect((t.sent[1] as Response).error).toBeUndefined();
+    t.receive(complete("m1", secret));
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+  });
+
+  async function clientSession(sid: string, t: MockTransport, peer: Peer) {
+    const p = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1", session_id: sid }, capabilities: {}, security: { mode: "tls" }, resumption_token: "rt" } });
+    await p;
+  }
+
+  it("closing or replacing a session clears the old session's flow contexts and markers", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    await clientSession("ses-1", t, peer);
+    peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    await expect(peer.startFlow("sign", "f1", {})).rejects.toMatchObject({ code: -32602 }); // active in ses-1
+    await peer.closeSession();
+    await clientSession("ses-2", t, peer);
+    peer.startFlow("sign", "f1", {}).catch(() => {}); // the id is usable in the new session
+    await settle();
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.start")).toHaveLength(2);
+
+    // replacement without a close
+    await clientSession("ses-3", t, peer);
+    peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.start")).toHaveLength(3);
+  });
+
+  it("an incoming session.close or a new incoming session clears them too", async () => {
+    const { t, onFlowComplete } = (() => {
+      const t = new MockTransport();
+      const onFlowComplete = vi.fn();
+      new Peer(t, {
+        handler: {
+          onSessionCreate: async () => ({ wmp: { version: "0.1", session_id: "ses-N" }, capabilities: {}, security: { mode: "tls" } }),
+          onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }),
+          onFlowComplete,
+        },
+      });
+      return { t, onFlowComplete };
+    })();
+    const start = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f1", params: {} } });
+    t.receive(start("a"));
+    await settle();
+    t.receive(start("b")); // duplicate while active
+    await settle();
+    expect((t.sent[1] as Response).error?.code).toBe(-32602);
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    t.receive(start("d")); // allowed in the new session
+    await settle();
+    expect((t.sent.at(-1) as Response).error).toBeUndefined();
+    t.receive({ jsonrpc: "2.0", method: "wmp.session.close", params: { wmp: { version: "0.1" }, reason: "complete" } });
+    await settle();
+    t.receive(complete("f1", { credentials: [] })); // old marker/context are gone: a plain completion is delivered
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+  });
+
+  it("closeSession alone frees the closed session's flow ids", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    await clientSession("ses-1", t, peer);
+    peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    await peer.closeSession();
+    peer.startFlow("sign", "f1", {}).catch(() => {}); // no new session yet: the id is free
+    await settle();
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.start")).toHaveLength(2);
+  });
+
+  it("an incoming session.close alone frees the closed session's flow ids", async () => {
+    const t = new MockTransport();
+    new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }) } });
+    const start = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f1", params: {} } });
+    t.receive(start("a"));
+    await settle();
+    t.receive({ jsonrpc: "2.0", method: "wmp.session.close", params: { wmp: { version: "0.1" }, reason: "complete" } });
+    await settle();
+    t.receive(start("b"));
+    await settle();
+    expect((t.sent[1] as Response).error).toBeUndefined();
+  });
+
+  it("resuming the same session keeps its flow state", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    await clientSession("ses-1", t, peer);
+    peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    const resume = peer.resumeSession();
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, resumption_token: "rt2", security: { mode: "tls" } } });
+    await resume;
+    await expect(peer.startFlow("sign", "f1", {})).rejects.toMatchObject({ code: -32602 }); // still active
+    const other = peer.resumeSession();
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-2" }, resumed: true, missed_messages: 0, security: { mode: "tls" } } });
+    await other;
+    peer.startFlow("sign", "f1", {}).catch(() => {}); // a different session: cleared
     await settle();
     expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.start")).toHaveLength(2);
   });
