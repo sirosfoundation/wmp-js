@@ -10,6 +10,7 @@ import {
 } from "../src/completion.js";
 import { Peer } from "../src/peer.js";
 import { ErrorCode } from "../src/types.js";
+import { WMPError, type Response } from "../src/jsonrpc.js";
 import { MockTransport } from "./mock-transport.js";
 
 const JWE = "aaaa.x.bbbb.cccc.dddd"; // five base64url segments
@@ -372,5 +373,142 @@ describe("Peer: match flows and validator ordering", () => {
     await settle();
     expect(refused2).not.toHaveBeenCalled();
     expect(err2).not.toHaveBeenCalled();
+  });
+});
+
+describe("Peer: flow context bookkeeping", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 10));
+  const query = { credentials: [{ id: "pid" }] };
+  const complete = (flowId: string, result?: unknown, wmp: unknown = { version: "0.1" }) => ({
+    jsonrpc: "2.0" as const,
+    method: "wmp.flow.complete",
+    params: { ...(wmp === null ? {} : { wmp }), flow_id: flowId, ...(result === undefined ? {} : { result }) },
+  });
+  const start = (id: string, type: string, flowId: string, params: unknown = {}) => ({
+    jsonrpc: "2.0" as const,
+    id,
+    method: "wmp.flow.start",
+    params: { wmp: { version: "0.1" }, flow_type: type, flow_id: flowId, params },
+  });
+  const secret = { satisfiable: true, claims: { name: "secret" } };
+
+  it("a match flow started through call() (as profiles do) is held to the match set", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const onFlowError = vi.fn();
+    const peer = new Peer(t, { handler: { onFlowComplete, onFlowError } });
+    peer.call("wmp.flow.start", { wmp: { version: "0.1" }, flow_type: "match", flow_id: "m1", params: { parent_flow_id: "p", dcql_query: query } }).catch(() => {});
+    t.receive(complete("m1", secret));
+    await settle();
+    expect(onFlowComplete).not.toHaveBeenCalled();
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+  });
+
+  it("a second start under an active flow_id is refused and the first flow's context survives", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const onFlowError = vi.fn();
+    new Peer(t, {
+      handler: {
+        onFlowStart: async (p) => {
+          if (p.flow_type === "other") throw new WMPError(ErrorCode.MethodNotFound, "x");
+          return { wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type };
+        },
+        onFlowComplete,
+        onFlowError,
+      },
+    });
+    t.receive(start("s1", "match", "m1", { dcql_query: query }));
+    await settle();
+    t.receive(start("s2", "other", "m1")); // same id, another type
+    await settle();
+    expect((t.sent[1] as Response).error).toMatchObject({ code: -32602 });
+    t.receive(complete("m1", secret)); // still a match flow
+    await settle();
+    expect(onFlowComplete).not.toHaveBeenCalled();
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+  });
+
+  it("a start that fails leaves no context: the id is free again", async () => {
+    const t = new MockTransport();
+    let fail = true;
+    new Peer(t, {
+      handler: {
+        onFlowStart: async (p) => {
+          if (fail) throw new WMPError(ErrorCode.InvalidParams, "no");
+          return { wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type };
+        },
+      },
+    });
+    t.receive(start("s1", "match", "m1", { dcql_query: query }));
+    await settle();
+    expect((t.sent[0] as Response).error?.code).toBe(-32602);
+    fail = false;
+    t.receive(start("s2", "match", "m1", { dcql_query: query }));
+    await settle();
+    expect((t.sent[1] as Response).error).toBeUndefined();
+  });
+
+  it("an outgoing start the other side refuses leaves no context either", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowComplete: vi.fn() } });
+    const p = peer.startFlow("match", "m1", { dcql_query: query });
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, error: { code: -31005, message: "x" } });
+    await expect(p).rejects.toBeDefined();
+    const again = peer.startFlow("match", "m1", { dcql_query: query }); // the id is free
+    again.catch(() => {});
+    await settle();
+    expect(t.sent).toHaveLength(2);
+  });
+
+  it("refuses a duplicate active outgoing start and a flow.cancel frees the id", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowCancel: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }) } });
+    peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    await expect(peer.startFlow("sign", "f1", {})).rejects.toMatchObject({ code: -32602 });
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: "f1" } });
+    await settle();
+    peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.start")).toHaveLength(2);
+  });
+
+  it("at capacity a new start is refused instead of evicting an existing flow's context", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const onFlowError = vi.fn();
+    new Peer(t, {
+      handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowComplete, onFlowError },
+    });
+    t.receive(start("m", "match", "match-flow", { dcql_query: query }));
+    for (let i = 0; i < 4095; i++) t.receive(start(`s${i}`, "x", `f${i}`));
+    await settle();
+    t.sent.length = 0;
+    t.receive(start("over", "x", "one-too-many"));
+    await settle();
+    expect((t.sent[0] as Response).error).toMatchObject({ code: -31007 });
+    t.receive(complete("match-flow", secret)); // the oldest flow's context is intact
+    await settle();
+    expect(onFlowComplete).not.toHaveBeenCalled();
+    expect(onFlowError).toHaveBeenCalledTimes(1);
+  });
+
+  it("a completion without wmp metadata is not taken for a protocol-level refusal: the validator decides", async () => {
+    const t = new MockTransport();
+    const onFlowError = vi.fn();
+    const onRefusedCompletion = vi.fn();
+    new Peer(t, {
+      handler: { onFlowError },
+      onRefusedCompletion,
+      validator: { validateMethod: () => [{ path: "wmp", message: "required" }] },
+    });
+    t.receive({ jsonrpc: "2.0", method: "wmp.flow.complete", params: { flow_id: "f1", result: null } } as never);
+    t.receive(complete("f2", { credential_response_encrypted: true, credentials: [{ credential: "x" }] }, null));
+    t.receive(complete("f3", { credential_response_encrypted: true, credentials: [{ credential: "x" }] }, {}));
+    await settle();
+    expect(onRefusedCompletion).not.toHaveBeenCalled();
+    expect(onFlowError).not.toHaveBeenCalled();
   });
 });
