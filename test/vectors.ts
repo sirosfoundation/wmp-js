@@ -7,7 +7,7 @@
  * that silently skips its conformance suite proves nothing, in CI least of all.
  */
 
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 
 export function vectorsDir(): string {
@@ -25,9 +25,26 @@ export function vectorsDir(): string {
   return dir;
 }
 
-/** The spec directory next to the vectors (the one that holds wmp-core.md). */
+/**
+ * The spec directory (the one that holds wmp-core.md). WMP_SPEC_DIR overrides;
+ * otherwise it is the sibling "spec" of the vectors directory, looked up from the
+ * vectors directory's real path first (a symlinked vectors directory sits in
+ * another tree than the checkout it points into) and then as written, then the
+ * sibling checkout. It fails when none holds wmp-core.md.
+ */
 export function specDir(): string {
-  return resolve(vectorsDir(), "..", "spec");
+  const vectors = vectorsDir();
+  const candidates = [
+    process.env.WMP_SPEC_DIR,
+    resolve(realpathSync(vectors), "..", "spec"),
+    resolve(vectors, "..", "spec"),
+    resolve(__dirname, "../../wmp/spec"),
+  ].filter((c): c is string => !!c).map((c) => resolve(c));
+  const dir = candidates.find((c) => existsSync(resolve(c, "wmp-core.md")));
+  if (!dir) {
+    throw new Error(`WMP spec not found (looked for wmp-core.md in ${candidates.join(", ")}); set WMP_SPEC_DIR`);
+  }
+  return dir;
 }
 
 export type VectorKind = "rpc" | "interop" | "transport-http";
