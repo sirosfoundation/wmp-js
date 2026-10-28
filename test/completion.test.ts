@@ -512,3 +512,65 @@ describe("Peer: flow context bookkeeping", () => {
     expect(onFlowError).not.toHaveBeenCalled();
   });
 });
+
+describe("Peer: finished flows release their context", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 10));
+  const startReq = (i: number) => ({
+    jsonrpc: "2.0" as const,
+    id: `s${i}`,
+    method: "wmp.flow.start",
+    params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: `f${i}`, params: {} },
+  });
+
+  async function responder() {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }) } });
+    return { t, peer };
+  }
+
+  it("flowComplete / flowError of an accepted incoming flow free its slot (4100 sequential flows)", async () => {
+    const { t, peer } = await responder();
+    for (let i = 0; i < 4100; i++) {
+      t.receive(startReq(i));
+      await Promise.resolve();
+      await Promise.resolve();
+      if (i % 2) await peer.flowComplete(`f${i}`, {});
+      else await peer.flowError(`f${i}`, -31006, "x");
+    }
+    await settle();
+    const errors = t.sent.filter((m) => (m as Response).error);
+    expect(errors).toHaveLength(0); // never -31007
+  });
+
+  it("a profile's notify of the terminal message frees the slot too", async () => {
+    const { t, peer } = await responder();
+    for (let i = 0; i < 4100; i++) {
+      t.receive(startReq(i));
+      await Promise.resolve();
+      await Promise.resolve();
+      await peer.notify("wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: `f${i}`, result: {} });
+    }
+    await settle();
+    expect(t.sent.filter((m) => (m as Response).error)).toHaveLength(0);
+  });
+
+  it("an outgoing flowCancel that succeeds frees the id (and a failed one does not)", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    const c1 = peer.flowCancel("f1");
+    await settle();
+    // the cancel fails: the flow is still active
+    t.receive({ jsonrpc: "2.0", id: (t.sent[1] as { id: string }).id, error: { code: -31006, message: "no" } });
+    await expect(c1).rejects.toBeDefined();
+    await expect(peer.startFlow("sign", "f1", {})).rejects.toMatchObject({ code: -32602 });
+    const c2 = peer.flowCancel("f1");
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[2] as { id: string }).id, result: { wmp: { version: "0.1" }, flow_id: "f1", status: "cancelled" } });
+    await c2;
+    peer.startFlow("sign", "f1", {}).catch(() => {});
+    await settle();
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.start")).toHaveLength(2);
+  });
+});

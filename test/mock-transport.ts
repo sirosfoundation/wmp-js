@@ -30,6 +30,11 @@ export class MockTransport implements Transport {
     this.listeners.get(event)?.delete(listener as (...args: unknown[]) => void);
   }
 
+  /** Fires a transport event other than "message" (for example "gap"). */
+  emitEvent(event: TransportEventName): void {
+    this.listeners.get(event)?.forEach((fn) => fn());
+  }
+
   receive(msg: Message): void {
     this.listeners.get("message")?.forEach((fn) => fn(msg));
   }
