@@ -644,3 +644,83 @@ describe("cancellation and recovery bookkeeping (round 3)", () => {
     expect(peer.token).toBe("rt3");
   });
 });
+
+describe("cancellation generations (round 4)", () => {
+  const settle4 = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  const cancel = (flow: string, id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: flow } });
+  const complete = (flow: string) => ({ jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: flow, result: { credentials: [] } } });
+  const startF = (id: string, flow: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: flow, params: {} } });
+
+  it("a cancellation that finishes after its flow ended and another started under the id does not touch the new flow", async () => {
+    const t = new MockTransport();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const onFlowComplete = vi.fn();
+    new Peer(t, {
+      handler: {
+        onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }),
+        onFlowCancel: async (p) => {
+          await gate;
+          return { wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" };
+        },
+        onFlowComplete,
+      },
+    });
+    t.receive(startF("s1", "f"));
+    await settle4();
+    t.receive(cancel("f", "c1")); // pending
+    await settle4();
+    t.receive(complete("f")); // the original flow ends
+    await settle4();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    t.receive(startF("s2", "f")); // a replacement under the same id
+    await settle4();
+    release(); // the old cancellation finishes now
+    await settle4();
+    t.receive(complete("f")); // the replacement's completion must be delivered
+    await settle4();
+    expect(onFlowComplete).toHaveBeenCalledTimes(2);
+  });
+
+  it("a replacement flow's cancellation does not share the old generation's pending one", async () => {
+    const t = new MockTransport();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => {
+      await gate;
+      return { wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" };
+    });
+    new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowCancel, onFlowComplete: vi.fn() } });
+    t.receive(startF("s1", "f"));
+    await settle4();
+    t.receive(cancel("f", "c1"));
+    await settle4();
+    t.receive(complete("f"));
+    await settle4();
+    t.receive(startF("s2", "f"));
+    await settle4();
+    t.receive(cancel("f", "c2")); // the replacement's own cancellation
+    await settle4();
+    expect(onFlowCancel).toHaveBeenCalledTimes(2);
+    release();
+    await settle4();
+  });
+
+  it("a handler that throws synchronously leaves a retry possible", async () => {
+    const t = new MockTransport();
+    let fail = true;
+    const onFlowCancel = vi.fn((p: { wmp: never; flow_id: string }) => {
+      if (fail) throw new WMPError(ErrorCode.FlowError, "boom"); // synchronous, before any promise exists
+      return Promise.resolve({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" });
+    });
+    new Peer(t, { handler: { onFlowCancel: onFlowCancel as never } });
+    t.receive(cancel("f1", "c1"));
+    await settle4();
+    expect((t.sent[0] as Response).error?.code).toBe(-31006);
+    fail = false;
+    t.receive(cancel("f1", "c2"));
+    await settle4();
+    expect(onFlowCancel).toHaveBeenCalledTimes(2);
+    expect((t.sent[1] as { result: { status: string } }).result.status).toBe("cancelled");
+  });
+});

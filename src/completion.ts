@@ -67,7 +67,8 @@ function fail(msg: string): never {
  * - credential_response_encrypted is a boolean; when true there is no
  *   credential_metadata and no credentials[].credential value;
  * - redacted_members is a non-empty array of distinct {@link REPLAY_SECRET_MEMBERS}
- *   names, and none of the members it lists is present in the same result;
+ *   names in alphabetical order, and none of the members it lists is present in
+ *   the same result;
  * - a decrypt_credential_response result has credential_count (1 to 256) or
  *   transaction_id, never both, and carries no credentials or
  *   credential_metadata; interval only accompanies transaction_id;
@@ -124,9 +125,13 @@ function validateRedactedMembers(m: Obj): void {
     fail("redacted_members is not a non-empty array of strings");
   }
   const seen = new Set<string>();
+  let previous: string | undefined;
   for (const n of names as string[]) {
     if (!REPLAY_SECRET_MEMBERS.includes(n)) fail("redacted_members lists a member that is not a replay secret member");
     if (seen.has(n)) fail("redacted_members lists a member twice");
+    // Section 3.1.4: the names are listed in alphabetical order.
+    if (previous !== undefined && n < previous) fail("redacted_members is not in alphabetical order");
+    previous = n;
     seen.add(n);
     // A member cannot be both withheld and delivered: a client that read the
     // delivered value would contradict the marker it was told to honour.

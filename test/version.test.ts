@@ -824,16 +824,19 @@ describe("capability and session races (round 3)", () => {
     return { t, peer, lost, ...v };
   };
 
-  it("an older capability.list snapshot that arrives after a newer update does not undo it (outgoing)", async () => {
+  it("outgoing capability operations go one at a time, so the last answer is the latest word", async () => {
     const { t, peer, onVCIStart } = await client({ oid4vci: {} });
     const list = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } });
-    await settle();
     const upd = peer.call("wmp.capability.update", { wmp: { version: "0.1", session_id: "ses-1" }, remove: ["oid4vci"] });
     await settle();
-    const [listId, updId] = [(t.sent[0] as { id: string }).id, (t.sent[1] as { id: string }).id];
-    t.receive({ jsonrpc: "2.0", id: updId, result: { wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } } }); // the newer update revokes
-    t.receive({ jsonrpc: "2.0", id: listId, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } }); // the older snapshot, late
-    await Promise.all([list, upd]);
+    // the update is not even sent while the list is unanswered
+    expect(t.sent.map((m) => (m as { method: string }).method)).toEqual(["wmp.capability.list"]);
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } });
+    await list;
+    await settle();
+    expect(t.sent.map((m) => (m as { method: string }).method)).toEqual(["wmp.capability.list", "wmp.capability.update"]);
+    t.receive({ jsonrpc: "2.0", id: (t.sent[1] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } } });
+    await upd;
     t.sent.length = 0;
     t.receive(startVci("ses-1"));
     await settle();
@@ -841,7 +844,20 @@ describe("capability and session races (round 3)", () => {
     expect(onVCIStart).not.toHaveBeenCalled();
   });
 
-  it("the same for two incoming operations finishing out of order", async () => {
+  it("a failed or timed-out capability call does not block the ones queued behind it", async () => {
+    const { t, peer } = await client({});
+    const first = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } });
+    const second = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } });
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, error: { code: -32601, message: "no" } });
+    await expect(first).rejects.toBeDefined();
+    await settle();
+    expect(t.sent).toHaveLength(2); // the second went out after the first failed
+    t.receive({ jsonrpc: "2.0", id: (t.sent[1] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } } });
+    await second;
+  });
+
+  it("incoming capability handlers run one at a time, so the last one decides", async () => {
     const gates: (() => void)[] = [];
     let call = 0;
     const t = new MockTransport();
@@ -850,7 +866,7 @@ describe("capability and session races (round 3)", () => {
         onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } }),
         onCapabilityList: async () => {
           const mine = ++call;
-          if (mine === 1) await new Promise<void>((r) => gates.push(r)); // the first, slow, answers with the old grant
+          if (mine === 1) await new Promise<void>((r) => gates.push(r)); // the first is slow and answers with the old grant; the second waits for it
           return { wmp: { version: "0.1" }, capabilities: mine === 1 ? { oid4vci: {} } : {}, security: { mode: "tls" } };
         },
       },
@@ -1006,5 +1022,198 @@ describe("capability and session races (round 3)", () => {
     await settle();
     expect((t.sent[0] as Response).error).toBeUndefined();
     expect(onVCIStart).toHaveBeenCalled();
+  });
+});
+
+describe("session identity details (round 4)", () => {
+  const vci = () => {
+    const onVCIStart = vi.fn(async (p: { wmp: unknown; flow_id: string; flow_type: string }) => ({ wmp: p.wmp as never, flow_id: p.flow_id, flow_type: p.flow_type }));
+    return { profile: new OpenID4xProfile({ oid4vci: { supported_grants: [], supported_formats: [] }, onVCIStart }), onVCIStart };
+  };
+  const startVci = (sid?: string) => ({
+    jsonrpc: "2.0" as const,
+    id: "f",
+    method: "wmp.flow.start",
+    params: { wmp: { version: "0.1", ...(sid ? { session_id: sid } : {}) }, flow_type: "oid4vci", flow_id: "flow-1", params: {} },
+  });
+  const mkCreate = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+
+  it("the cached grant is a copy: mutating the object the handler returned changes nothing", async () => {
+    const granted: Record<string, unknown> = { oid4vci: {} };
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: granted, security: { mode: "tls" } }) } });
+    const v = vci();
+    peer.use(v.profile);
+    t.receive(mkCreate("c"));
+    await settle();
+    delete granted.oid4vci; // later mutation of the caller's object
+    granted.other = {};
+    t.sent.length = 0;
+    t.receive(startVci("ses-1"));
+    await settle();
+    expect((t.sent[0] as Response).error).toBeUndefined(); // still granted
+    expect(v.onVCIStart).toHaveBeenCalled();
+
+    // and the other way: adding to the object does not grant
+    const t2 = new MockTransport();
+    const g2: Record<string, unknown> = {};
+    const peer2 = new Peer(t2, { handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: g2, security: { mode: "tls" } }) } });
+    const v2 = vci();
+    peer2.use(v2.profile);
+    t2.receive(mkCreate("c"));
+    await settle();
+    g2.oid4vci = {};
+    t2.sent.length = 0;
+    t2.receive(startVci("ses-1"));
+    await settle();
+    expect((t2.sent[0] as Response).error?.code).toBe(-31005);
+  });
+
+  it("resuming the same session while closeSession is sending does not defeat the close", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    const v = vci();
+    peer.use(v.profile);
+    const created = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" }, resumption_token: "rt" } });
+    await created;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const realSend = t.send.bind(t);
+    t.send = async (m) => {
+      if ((m as { method?: string }).method === "wmp.session.close") await gate;
+      await realSend(m);
+    };
+    const closing = peer.closeSession();
+    await settle();
+    const resumed = peer.resumeSession(); // the same session, while the close is in flight
+    await settle();
+    const resumeReq = t.sent.find((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string };
+    t.receive({ jsonrpc: "2.0", id: resumeReq.id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, capabilities: { oid4vci: {} }, resumption_token: "rt2", security: { mode: "tls" } } });
+    await resumed;
+    release();
+    await closing;
+    expect(peer.session).toBeUndefined();
+    t.sent.length = 0;
+    t.receive(startVci("ses-1"));
+    await settle();
+    expect((t.sent[0] as Response).error?.code).toBe(-31005); // the grant is gone
+  });
+
+  it("incoming session establishment is serialized: a slow create cannot overwrite a later one", async () => {
+    const gates: (() => void)[] = [];
+    let n = 0;
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => {
+          const mine = ++n;
+          if (mine === 1) await new Promise<void>((r) => gates.push(r));
+          return { wmp: { version: "", session_id: `ses-${mine}` }, capabilities: mine === 1 ? { oid4vci: {} } : {}, security: { mode: "tls" } };
+        },
+      },
+    });
+    t.receive(mkCreate("c1"));
+    await settle();
+    t.receive(mkCreate("c2"));
+    await settle();
+    gates[0]();
+    await settle(30);
+    expect(peer.session).toBe("ses-2"); // the later create is the one installed
+  });
+
+  it("the responder binds the transport to the session it installs (create and resume)", async () => {
+    const t = new MockTransport() as MockTransport & { setSessionId?: (id: string) => void };
+    const bound: string[] = [];
+    t.setSessionId = (id) => void bound.push(id);
+    new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }),
+        onSessionResume: async () => ({ wmp: { version: "", session_id: "ses-2" }, resumed: true, missed_messages: 0, security: { mode: "tls" } }),
+      },
+    });
+    t.receive(mkCreate("c"));
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: "r", method: "wmp.session.resume", params: { wmp: { version: "0.1" }, session_id: "ses-2", resumption_token: "x" } });
+    await settle();
+    expect(bound).toEqual(["ses-1", "ses-2"]);
+  });
+
+  it("a replaced session's resumption token is not used for the new one", async () => {
+    const t = new MockTransport();
+    const lost: Error[] = [];
+    const peer = new Peer(t, { onSessionLost: (e) => lost.push(e), handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-N" }, capabilities: {}, security: { mode: "tls" } }) } });
+    const created = peer.createSession({}); // our own session, with a token
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" }, resumption_token: "OLD" } });
+    await created;
+    expect(peer.token).toBe("OLD");
+    t.receive(mkCreate("c")); // an incoming create replaces it
+    await settle();
+    expect(peer.token).toBeUndefined();
+    t.sent.length = 0;
+    t.emitEvent("gap");
+    await settle(30);
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.session.resume")).toHaveLength(0); // never presents OLD for ses-N
+    expect(lost).toHaveLength(1);
+  });
+
+  it("a responder's resume of another session drops the old session's markers, of the same one keeps them", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    let target = "ses-1";
+    new Peer(t, {
+      handler: {
+        onFlowComplete,
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }),
+        onSessionResume: async () => ({ wmp: { version: "", session_id: target }, resumed: true, missed_messages: 0, security: { mode: "tls" } }),
+      },
+    });
+    t.receive(mkCreate("c"));
+    await settle();
+    const done = { jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "f", result: { credentials: [] } } };
+    t.receive(done);
+    await settle();
+    const resume = async (id: string) => {
+      t.receive({ jsonrpc: "2.0", id, method: "wmp.session.resume", params: { wmp: { version: "0.1" }, session_id: target, resumption_token: "x" } });
+      await settle();
+    };
+    await resume("r1"); // the same session
+    t.receive(done);
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    target = "ses-2";
+    await resume("r2"); // another session
+    t.receive(done);
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(2);
+  });
+
+  it("terminal markers are dropped when the resumed session differs and kept when it is the same", async () => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const peer = new Peer(t, { handler: { onFlowComplete } });
+    const created = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" }, resumption_token: "rt" } });
+    await created;
+    const done = { jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "f", result: { credentials: [] } } };
+    t.receive(done);
+    await settle();
+    const resumeTo = async (sid: string) => {
+      const p = peer.resumeSession();
+      await settle();
+      t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1", session_id: sid }, resumed: true, missed_messages: 0, security: { mode: "tls" } } });
+      await p;
+    };
+    await resumeTo("ses-1"); // the same session: a re-sent terminal is still a repeat
+    t.receive(done);
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    await resumeTo("ses-2"); // another session: the old session's markers are gone
+    t.receive(done);
+    await settle();
+    expect(onFlowComplete).toHaveBeenCalledTimes(2);
   });
 });
