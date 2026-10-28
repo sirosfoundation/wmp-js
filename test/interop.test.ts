@@ -7,12 +7,11 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { Peer, type Handler } from "../src/peer.js";
 import { WMPError, type Request, type Response, type RPCError } from "../src/jsonrpc.js";
 import { Method } from "../src/types.js";
 import { MockTransport } from "./mock-transport.js";
+import { loadVectors } from "./vectors.js";
 
 // ---------------------------------------------------------------------------
 // Test vector types
@@ -42,18 +41,7 @@ interface InteropVector {
 }
 
 function loadInteropVectors(): InteropVector[] {
-  const candidates = [
-    resolve(__dirname, "../../wmp/vectors/interop.json"),
-    resolve(process.cwd(), "../wmp/vectors/interop.json"),
-  ];
-  const path = candidates.find((p) => existsSync(p));
-  if (!path) {
-    throw new Error(
-      `interop.json not found; searched ${candidates.join(", ")}`
-    );
-  }
-  const data = readFileSync(path, "utf8");
-  return JSON.parse(data) as InteropVector[];
+  return loadVectors<InteropVector>("interop.json");
 }
 
 // ---------------------------------------------------------------------------

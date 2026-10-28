@@ -137,6 +137,7 @@ export const ErrorCode = {
   ConsignmentModeUnsupported: -31016,
   AssuranceLevelUnsupported: -31017,
   PolicyUnsupported: -31018,
+  PlaintextHashMismatch: -31019,
 } as const;
 
 // ---------------------------------------------------------------------------

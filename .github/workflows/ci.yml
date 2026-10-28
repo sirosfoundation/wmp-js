@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Clone WMP spec (test vectors and schemas)
-        run: git clone https://github.com/leifj/wmp.git ../wmp
+        run: git clone --depth 1 https://github.com/sirosfoundation/wmp.git ../wmp
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
