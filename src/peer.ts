@@ -28,6 +28,7 @@ import {
   Registry,
 } from "./profile.js";
 import { type ValidationError } from "./schema.js";
+import { CompletionResultError, validateCompletionResult } from "./completion.js";
 import {
   type Metadata,
   type SessionCreateParams,
@@ -129,6 +130,16 @@ export interface PeerOptions {
     method: string,
     params: unknown,
   ) => boolean | Promise<boolean>;
+  /**
+   * Refuse an incoming wmp.flow.complete whose result breaks the OpenID4x
+   * completion rules (see validateCompletionResult). The completion is not
+   * delivered; the flow is ended with a synthesized wmp.flow.error
+   * (-32602, no member of the result echoed) to the profile or handler that
+   * owns it. Default: true.
+   */
+  validateCompletions?: boolean;
+  /** Called for every refused completion, with the violation (never a member value). */
+  onRefusedCompletion?: (flowId: string, error: CompletionResultError) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +158,8 @@ export class Peer implements PeerContext {
   private closed = false;
   private validator?: PeerOptions["validator"];
   private authorize?: PeerOptions["authorize"];
+  private validateCompletions: boolean;
+  private onRefusedCompletion?: PeerOptions["onRefusedCompletion"];
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -154,6 +167,8 @@ export class Peer implements PeerContext {
     this.callTimeout = opts?.callTimeout ?? 30_000;
     this.validator = opts?.validator;
     this.authorize = opts?.authorize;
+    this.validateCompletions = opts?.validateCompletions ?? true;
+    this.onRefusedCompletion = opts?.onRefusedCompletion;
 
     // Wire up transport events.
     this.transport.on("message", (msg: Message) => this.dispatch(msg));
@@ -593,6 +608,15 @@ export class Peer implements PeerContext {
       }
 
       case Method.FlowComplete: {
+        if (this.validateCompletions && p.result !== undefined) {
+          try {
+            validateCompletionResult(p.result);
+          } catch (err) {
+            if (!(err instanceof CompletionResultError)) throw err;
+            this.refuseCompletion(p, err);
+            return undefined;
+          }
+        }
         const fh = this.flowHandlerForId(p.flow_id);
         if (fh) { fh.handleComplete(p); return undefined; }
         if (this.handler.onFlowComplete) {
@@ -635,6 +659,24 @@ export class Peer implements PeerContext {
     }
 
     throw new WMPError(ErrorCode.MethodNotFound, `Method not found: ${method}`);
+  }
+
+  /**
+   * A non-conforming completion is not delivered. The flow ends as failed: a
+   * synthesized wmp.flow.error, carrying neither the result nor the violation
+   * text, goes to whoever would have received the completion or the error.
+   */
+  private refuseCompletion(p: FlowCompleteParams, err: CompletionResultError): void {
+    this.onRefusedCompletion?.(p.flow_id, err);
+    const synthesized: FlowErrorParams = {
+      wmp: p.wmp,
+      flow_id: p.flow_id,
+      code: ErrorCode.InvalidParams,
+      message: "Non-conforming flow result",
+    };
+    const fh = this.flowHandlerForId(p.flow_id);
+    if (fh) fh.handleError(synthesized);
+    else this.handler.onFlowError?.(synthesized);
   }
 
   // Track flow_id → flow_type mapping for routing to the right FlowHandler.

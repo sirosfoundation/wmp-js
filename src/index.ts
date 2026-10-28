@@ -132,6 +132,20 @@ export type {
   MLSProvider,
 } from "./mls.js";
 
+// Completion-result rules (OpenID4x profile 3.1.4, 3.3)
+export {
+  validateCompletionResult,
+  validateMatchResult,
+  splitReplaySecrets,
+  redactedMembers,
+  CompletionResultError,
+  DEFAULT_SECRET_MEMBERS,
+  REPLAY_SECRET_MEMBERS,
+  MAX_ENCRYPTED_CREDENTIAL_COUNT,
+  MAX_RESPONSE_JWE_LEN,
+} from "./completion.js";
+export type { ReplaySplit } from "./completion.js";
+
 // OpenID4x
 export {
   CredentialFormat,
