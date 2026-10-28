@@ -753,7 +753,7 @@ export class OpenID4xProfile
           throw transactionDataUnsupportedError();
         }
         const flow = new SignFlow(this.peer!, params.wmp, params.flow_id, sp);
-        this.defer(params.flow_id, async () => {
+        this.defer(async () => {
           try {
             await this.config.onSign!(flow);
           } catch (err) {
@@ -766,7 +766,7 @@ export class OpenID4xProfile
       }
       case "match": {
         const mp = parseMatchStartParams(params.params);
-        this.defer(params.flow_id, () => this.runMatch(params, mp));
+        this.defer(() => this.runMatch(params, mp));
         return { wmp: params.wmp, flow_id: params.flow_id, flow_type: params.flow_type };
       }
       default:
@@ -780,13 +780,13 @@ export class OpenID4xProfile
    * response send resolved (for HTTP: when its POST completed); a PeerContext
    * without that falls back to a zero-delay timer.
    */
-  private defer(flowId: string, fn: () => Promise<void>): void {
+  private defer(fn: () => Promise<void>): void {
     const run = (): void => {
       fn().catch(() => {
         /* the answer could not be sent: the orchestrator's flow timeout applies */
       });
     };
-    if (this.peer?.afterResponse) this.peer.afterResponse(flowId, run);
+    if (this.peer?.afterResponse) this.peer.afterResponse(run);
     else setTimeout(run, 0);
   }
 

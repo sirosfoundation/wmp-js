@@ -534,3 +534,55 @@ describe("flow.start in notification form", () => {
     expect(onSign).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("continuations belong to their own request", () => {
+  it("a duplicate start rejected while the original's response is still being sent does not discard the original's continuation", async () => {
+    const onSign = vi.fn(async (flow: { complete(r: unknown): Promise<void> }) => {
+      await flow.complete({ proof_jwt: "eyJ" });
+    });
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }) },
+    });
+    peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign: onSign as never }));
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    t.sent.length = 0;
+
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const realSend = t.send.bind(t);
+    t.send = async (msg) => {
+      const m = msg as { id?: string; method?: string };
+      if (m.id === "s-dup-1") await gate; // only the ORIGINAL's response is slow
+      await realSend(msg);
+    };
+    t.receive({ ...start("sign", "dup", sign()), id: "s-dup-1" });
+    await settle(30);
+    t.receive({ ...start("sign", "dup", sign()), id: "s-dup-2" }); // a duplicate while the first response is in flight
+    await settle(30);
+    expect(t.sent.find((m) => (m as { id?: string }).id === "s-dup-2")).toMatchObject({ error: { code: -32602 } });
+    release();
+    await settle(60);
+    expect(onSign).toHaveBeenCalledTimes(1);
+    expect(t.sent.some((m) => (m as { method?: string }).method === "wmp.flow.complete")).toBe(true);
+  });
+});
+
+describe("finished sub-flows free their slot", () => {
+  it("4100 sequential sign sub-flows, completed or failed through the profile, never hit the active-flow limit", async () => {
+    let n = 0;
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: (flow) => (n++ % 2 ? flow.reject() : flow.complete({ proof_jwt: "eyJ" })),
+    });
+    for (let i = 0; i < 4100; i++) {
+      t.receive({ ...start("sign", `sf-${i}`, sign({ action: "generate_proof" })), id: `r${i}` });
+      await new Promise((r) => setImmediate(r));
+    }
+    await settle(50);
+    const errors = t.sent.filter((m) => (m as Response).error);
+    expect(errors).toHaveLength(0);
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.flow.complete" || (m as { method?: string }).method === "wmp.flow.error")).toHaveLength(4100);
+  }, 60_000);
+});

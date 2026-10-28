@@ -30,11 +30,12 @@ export interface PeerContext {
 
   /**
    * Optional: run `fn` after the response to the wmp.flow.start currently being
-   * handled for `flowId` was sent. Nothing runs if that start is answered with
-   * an error. Lets a profile send a notification for a flow that must not reach
-   * the peer before the start's response.
+   * handled was sent. Call it synchronously from `startFlow`. Nothing runs if
+   * that start is answered with an error, and a start that fails discards only
+   * its own continuations. Lets a profile send a notification for a flow that
+   * must not reach the peer before the start's response.
    */
-  afterResponse?(flowId: string, fn: () => void): void;
+  afterResponse?(fn: () => void): void;
 }
 
 // ---------------------------------------------------------------------------

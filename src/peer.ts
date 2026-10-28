@@ -294,25 +294,22 @@ export class Peer implements PeerContext {
   // PeerContext implementation (for profiles)
   // -------------------------------------------------------------------------
 
-  private afterResponse_ = new Map<string, (() => void)[]>();
+  /**
+   * The queue of the flow.start request whose handler is being invoked, set only
+   * for the synchronous part of that invocation. Continuations registered with
+   * {@link afterResponse} belong to that request alone, so a start that fails
+   * (for example a duplicate) can only discard its own.
+   */
+  private afterTarget?: (() => void)[];
 
-  /** PeerContext: queue `fn` to run once the response to the current flow.start for `flowId` was sent. */
-  afterResponse(flowId: string, fn: () => void): void {
-    const q = this.afterResponse_.get(flowId) ?? [];
-    q.push(fn);
-    this.afterResponse_.set(flowId, q);
-  }
-
-  private runAfterResponse(flowId: string): void {
-    const q = this.afterResponse_.get(flowId);
-    this.afterResponse_.delete(flowId);
-    for (const fn of q ?? []) {
-      try {
-        fn();
-      } catch {
-        /* a queued continuation must not break the dispatcher */
-      }
-    }
+  /**
+   * PeerContext: queue `fn` to run once the response to the flow.start being
+   * handled was sent. Called outside that handler invocation there is no
+   * response to wait for, and `fn` runs on a zero-delay timer instead.
+   */
+  afterResponse(fn: () => void): void {
+    if (this.afterTarget) this.afterTarget.push(fn);
+    else setTimeout(fn, 0);
   }
 
   async notify(method: string, params: unknown): Promise<void> {
@@ -657,6 +654,8 @@ export class Peer implements PeerContext {
   }
 
   private handleRequest(req: Request): void {
+    // Continuations the handler queued for after this request's response.
+    const after: (() => void)[] = [];
     const dispatch = async () => {
       if (this.authorize) {
         const allowed = await this.authorize(req.method, req.params);
@@ -667,7 +666,7 @@ export class Peer implements PeerContext {
           );
         }
       }
-      return this.dispatchMethod(req.method, req.params);
+      return this.dispatchMethod(req.method, req.params, after);
     };
 
     if (isNotification(req)) {
@@ -679,17 +678,21 @@ export class Peer implements PeerContext {
         /* notifications get no error response */
       });
     } else {
-      const startedFlow = req.method === Method.FlowStart ? flowIdOf(req.params) : undefined;
-      const flowKey = typeof startedFlow === "string" ? startedFlow : undefined;
       dispatch()
         .then(async (result) => {
           const resp = createResponse(req.id!, result);
           await this.transport.send(resp);
           // Only now may anything the handler queued for after the response go out.
-          if (flowKey !== undefined) this.runAfterResponse(flowKey);
+          for (const fn of after.splice(0)) {
+            try {
+              fn();
+            } catch {
+              /* a queued continuation must not break the dispatcher */
+            }
+          }
         })
         .catch((err) => {
-          if (flowKey !== undefined) this.afterResponse_.delete(flowKey);
+          after.length = 0; // this request's continuations only: they never run
           const rpcErr = toRPCError(err);
           const resp = createErrorResponse(req.id!, rpcErr);
           return this.transport.send(resp);
@@ -700,6 +703,7 @@ export class Peer implements PeerContext {
   private async dispatchMethod(
     method: string,
     params: unknown,
+    after?: (() => void)[],
   ): Promise<unknown> {
     // A repeat of a terminal notification already processed (a resume re-sends
     // them with fresh event IDs). Only checked here: a flow is marked terminal
@@ -864,8 +868,16 @@ export class Peer implements PeerContext {
         // context) changed.
         const rollback = this.beginFlow(p?.flow_id, p?.flow_type, p?.params);
         try {
-          if (fh) return await fh.startFlow(p);
-          return await this.handler.onFlowStart!(p);
+          // The handler may queue continuations for after the response; they go
+          // to THIS request's queue (the window is the synchronous invocation).
+          this.afterTarget = after;
+          let started: Promise<unknown>;
+          try {
+            started = fh ? fh.startFlow(p) : this.handler.onFlowStart!(p);
+          } finally {
+            this.afterTarget = undefined;
+          }
+          return await started;
         } catch (err) {
           rollback();
           // A handler that does not implement this flow type: unsupported
