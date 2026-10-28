@@ -138,6 +138,13 @@ export interface PeerOptions {
    * owns it. Default: true.
    */
   validateCompletions?: boolean;
+  /**
+   * Called when the session cannot be continued after an event gap (the
+   * transport saw 410 and the automatic wmp.session.resume failed or had no
+   * resumption token). The application creates a new session
+   * (Transport Section 4.3.4).
+   */
+  onSessionLost?: (error: Error) => void;
   /** Called for every refused completion, with the violation (never a member value). */
   onRefusedCompletion?: (flowId: string, error: CompletionResultError) => void;
 }
@@ -160,6 +167,7 @@ export class Peer implements PeerContext {
   private authorize?: PeerOptions["authorize"];
   private validateCompletions: boolean;
   private onRefusedCompletion?: PeerOptions["onRefusedCompletion"];
+  private onSessionLost?: PeerOptions["onSessionLost"];
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -169,11 +177,13 @@ export class Peer implements PeerContext {
     this.authorize = opts?.authorize;
     this.validateCompletions = opts?.validateCompletions ?? true;
     this.onRefusedCompletion = opts?.onRefusedCompletion;
+    this.onSessionLost = opts?.onSessionLost;
 
     // Wire up transport events.
     this.transport.on("message", (msg: Message) => this.dispatch(msg));
     this.transport.on("error", (err: Error) => this.onTransportError(err));
     this.transport.on("close", () => this.onTransportClose());
+    this.transport.on("gap", () => this.onTransportGap());
   }
 
   /** Register a profile. Call before starting to receive messages. */
@@ -280,7 +290,9 @@ export class Peer implements PeerContext {
       wmp: { version: this.negotiatedVersion ?? VERSION } as Metadata,
       session_id: this.sessionId,
       resumption_token: this.resumptionToken,
-      last_received_id: opts?.lastReceivedId,
+      // In the HTTP binding this is the last event ID (Transport Section 4.5).
+      last_received_id:
+        opts?.lastReceivedId ?? (this.transport as { lastEventId?: string }).lastEventId,
     };
     const result = await this.call<SessionResumeResult>(
       Method.SessionResume,
@@ -713,6 +725,22 @@ export class Peer implements PeerContext {
 
   private onTransportError(_err: Error): void {
     // Could emit events here for reconnection logic.
+  }
+
+  /**
+   * The transport lost events (410): resume the session, which re-sends the
+   * latest progress of active flows and the terminal notification of ended
+   * flows on the already open stream. Without a resumption token, or if the
+   * resume fails, the session is lost.
+   */
+  private onTransportGap(): void {
+    if (!this.sessionId || !this.resumptionToken) {
+      this.onSessionLost?.(new Error("event gap and no resumption token to resume with"));
+      return;
+    }
+    this.resumeSession().catch((err: unknown) => {
+      this.onSessionLost?.(err instanceof Error ? err : new Error(String(err)));
+    });
   }
 
   private onTransportClose(): void {

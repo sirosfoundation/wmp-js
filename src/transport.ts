@@ -17,6 +17,12 @@ export interface TransportEvents {
   error: (err: Error) => void;
   close: () => void;
   open: () => void;
+  /**
+   * The server answered a reconnect with 410 (Transport Section 4.3.4): events
+   * were lost. The transport has already discarded its cursor and opened a new
+   * stream with none; the application (Peer) now resumes the session.
+   */
+  gap: () => void;
 }
 
 export type TransportEventName = keyof TransportEvents;
@@ -160,8 +166,13 @@ export class WebSocketTransport extends Emitter implements Transport {
 export interface HttpSseTransportOptions {
   /** Authorization header value (e.g., "Bearer <token>"). */
   authorization?: string;
-  /** Last-Event-ID for SSE replay. */
+  /**
+   * Initial SSE cursor (the ID of the last event already processed). It is
+   * sent on the first connectSSE() and replaces itself as events arrive.
+   */
   lastEventId?: string;
+  /** How many processed event IDs to remember for replay dedupe. Default: 4096. */
+  dedupeWindow?: number;
   /** Custom fetch implementation (default: global fetch). */
   fetch?: typeof globalThis.fetch;
   /** Custom EventSource constructor (for polyfills that support headers). */
@@ -183,6 +194,10 @@ export class HttpSseTransport extends Emitter implements Transport {
   private fetchFn: typeof globalThis.fetch;
   private EventSourceCtor: typeof EventSource;
   private closed = false;
+  private cursor?: string;
+  private seenIds = new Set<string>();
+  private dedupeWindow: number;
+  private pendingGap = false;
 
   constructor(
     rpcUrl: string,
@@ -195,6 +210,17 @@ export class HttpSseTransport extends Emitter implements Transport {
     this.authorization = opts?.authorization;
     this.fetchFn = opts?.fetch ?? globalThis.fetch.bind(globalThis);
     this.EventSourceCtor = opts?.EventSource ?? globalThis.EventSource;
+    this.cursor = opts?.lastEventId || undefined;
+    this.dedupeWindow = opts?.dedupeWindow ?? 4096;
+  }
+
+  /**
+   * The ID of the last event this transport delivered (the SSE cursor), or
+   * undefined when none was received or the cursor was discarded after a gap.
+   * Event IDs are opaque: store and send them back, never parse or compare.
+   */
+  get lastEventId(): string | undefined {
+    return this.cursor;
   }
 
   /**
@@ -217,69 +243,128 @@ export class HttpSseTransport extends Emitter implements Transport {
   /**
    * Connect the SSE stream. Call this after constructing the transport.
    * Separated from the constructor so callers can register listeners first.
+   * Resumes from the transport's own cursor unless `lastEventId` is given.
    */
   connectSSE(lastEventId?: string): void {
-    this.eventSource?.close();
-    this.eventSource = null;
-
-    this.setupEventSource(lastEventId);
+    if (lastEventId !== undefined) this.cursor = lastEventId || undefined;
+    this.openStream(this.cursor);
   }
 
   /**
-   * Reconnect the SSE stream with the current authorization/session state.
-   * Useful after calling setAuthorization.
+   * Reconnect the SSE stream with the current authorization/session state
+   * and the recorded cursor. Useful after calling setAuthorization.
    */
   reconnectSSE(lastEventId?: string): void {
     this.connectSSE(lastEventId);
   }
 
-  private setupEventSource(lastEventId?: string): void {
-    // Build the SSE URL with session_id (required for tenant routing)
-    // and optional lastEventId for event replay.
-    let url = this.eventsUrl;
-    if (this.sessionId) {
-      const sep = url.includes("?") ? "&" : "?";
-      url += `${sep}session_id=${encodeURIComponent(this.sessionId)}`;
-    }
-    if (lastEventId) {
-      const sep = url.includes("?") ? "&" : "?";
-      url += `${sep}lastEventId=${encodeURIComponent(lastEventId)}`;
-    }
+  private streamHeaders(cursor?: string): Record<string, string> {
+    const h: Record<string, string> = {};
+    if (this.authorization) h["Authorization"] = this.authorization;
+    if (cursor) h["Last-Event-ID"] = cursor;
+    return h;
+  }
 
-    this.eventSource = new this.EventSourceCtor(url);
+  private streamUrl(cursor?: string): string {
+    // session_id (required for tenant routing) and the cursor. The cursor goes
+    // as last_event_id (Transport Section 4.3.3) and, for servers that predate
+    // that name, as lastEventId.
+    const u = new URL(this.eventsUrl, "http://placeholder.invalid");
+    const relative = !/^[a-z][a-z0-9+.-]*:/i.test(this.eventsUrl);
+    if (this.sessionId) u.searchParams.set("session_id", this.sessionId);
+    if (cursor) {
+      u.searchParams.set("last_event_id", cursor);
+      u.searchParams.set("lastEventId", cursor);
+    }
+    return relative ? u.pathname + u.search : u.toString();
+  }
 
-    this.eventSource.onopen = () => this.emit("open");
-    this.eventSource.onerror = () => {
-      if (!this.closed) {
-        this.emit("error", new Error("SSE connection error"));
+  private openStream(cursor: string | undefined): void {
+    this.eventSource?.close();
+    this.eventSource = null;
+
+    const headers = this.streamHeaders(cursor);
+    // Polyfills that can set request headers read `headers` from the init
+    // object; a native EventSource ignores it.
+    const init = Object.keys(headers).length > 0 ? ({ headers } as EventSourceInit) : undefined;
+    const es = new this.EventSourceCtor(this.streamUrl(cursor), init);
+    this.eventSource = es;
+
+    es.onopen = () => {
+      this.emit("open");
+      if (this.pendingGap) {
+        this.pendingGap = false;
+        this.emit("gap");
       }
+    };
+    es.onerror = () => {
+      if (this.closed || this.eventSource !== es) return;
+      // A closed stream with a cursor may be the 410 of a gap; the EventSource
+      // API does not expose the status, so ask.
+      if (es.readyState === 2 /* CLOSED */ && this.cursor) {
+        void this.checkGap(es, this.cursor);
+        return;
+      }
+      this.emit("error", new Error("SSE connection error"));
     };
 
     // WMP events use the "wmp" event type per the spec.
-    this.eventSource.addEventListener("wmp", (ev) => {
-      try {
-        const msg = decodeMessage((ev as MessageEvent).data, { maxSize: 4 * 1024 * 1024 });
-        this.emit("message", msg);
-      } catch (err) {
-        this.emit(
-          "error",
-          err instanceof Error ? err : new Error(String(err)),
-        );
-      }
-    });
-
+    es.addEventListener("wmp", (ev) => this.onSseEvent(ev as MessageEvent));
     // Also handle default "message" events for compatibility.
-    this.eventSource.onmessage = (ev) => {
-      try {
-        const msg = decodeMessage(ev.data, { maxSize: 4 * 1024 * 1024 });
-        this.emit("message", msg);
-      } catch (err) {
-        this.emit(
-          "error",
-          err instanceof Error ? err : new Error(String(err)),
-        );
-      }
-    };
+    es.onmessage = (ev) => this.onSseEvent(ev);
+  }
+
+  /**
+   * Handles one SSE event: an event whose ID was already processed (a replay
+   * after a reconnect) is dropped; otherwise it is delivered and then its ID
+   * becomes the cursor (Transport Section 4.3.2).
+   */
+  private onSseEvent(ev: MessageEvent): void {
+    const id = typeof ev.lastEventId === "string" && ev.lastEventId !== "" ? ev.lastEventId : undefined;
+    if (id !== undefined && this.seenIds.has(id)) return;
+    try {
+      this.emit("message", decodeMessage(ev.data, { maxSize: 4 * 1024 * 1024 }));
+    } catch (err) {
+      this.emit("error", err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      if (id !== undefined) this.recordEventId(id);
+    }
+  }
+
+  private recordEventId(id: string): void {
+    this.cursor = id;
+    this.seenIds.add(id);
+    if (this.seenIds.size > this.dedupeWindow) {
+      // Sets iterate in insertion order: drop the oldest.
+      this.seenIds.delete(this.seenIds.values().next().value as string);
+    }
+  }
+
+  /** Probes the stream URL for a 410 after the EventSource gave up with `cursor`. */
+  private async checkGap(failed: EventSource, cursor: string): Promise<void> {
+    let status: number | undefined;
+    try {
+      const abort = new AbortController();
+      const resp = await this.fetchFn(this.streamUrl(cursor), {
+        headers: { ...this.streamHeaders(cursor), Accept: "text/event-stream" },
+        signal: abort.signal,
+      });
+      status = resp.status;
+      abort.abort(); // only the status matters; do not hold the stream open
+    } catch {
+      status = undefined;
+    }
+    if (this.closed || this.eventSource !== failed) return;
+    if (status === 410) {
+      // Discard the cursor (never reconnect with it again) and open a stream
+      // with none; "gap" is emitted once it is open, so the resume's re-sent
+      // notifications have a connection to arrive on.
+      this.cursor = undefined;
+      this.pendingGap = true;
+      this.openStream(undefined);
+      return;
+    }
+    this.emit("error", new Error("SSE connection error"));
   }
 
   async send(msg: Message): Promise<void> {
