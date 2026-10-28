@@ -16,7 +16,7 @@ import {
   unsupportedTransactionData,
 } from "../src/signflow.js";
 import { OpenID4xProfile, SubFlowRejectedError } from "../src/openid4x.js";
-import { SignFlow } from "../src/signflow.js";
+import { SignFlow, boundNotifier } from "../src/signflow.js";
 import { CompletionResultError } from "../src/completion.js";
 import { validateSignResult } from "../src/signflow.js";
 import { Peer } from "../src/peer.js";
@@ -863,6 +863,36 @@ describe("work is bound to its flow generation (round 5)", () => {
     expect(peer.flowGeneration("f")).toBe(gen2);
     await peer.notifyFlow(gen2, "wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: "f", result: {} });
     expect(peer.flowGeneration("f")).toBeUndefined();
+  });
+});
+
+describe("a missing record authorizes nothing (round 6)", () => {
+  it("notifyFlow without a generation, or for an inactive flow, sends nothing", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }) } });
+    await expect(peer.notifyFlow(undefined, "wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: "never", result: {} })).rejects.toThrow(/no longer active/);
+    await expect(peer.notifyFlow(undefined, "wmp.flow.complete", { wmp: { version: "0.1" }, result: {} })).rejects.toThrow(/no longer active/);
+    await expect(peer.notifyFlow({}, "wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: "never", result: {} })).rejects.toThrow(/no longer active/);
+    expect(t.sent).toHaveLength(0);
+  });
+
+  it("a notifier created after the flow ended cannot send, and reports not current", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }),
+        onFlowCancel: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }),
+      },
+    });
+    t.receive({ jsonrpc: "2.0", id: "a", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f", params: {} } });
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: "f" } });
+    await settle();
+    t.sent.length = 0;
+    const late = boundNotifier(peer, "f"); // made after the flow ended
+    expect(late.current()).toBe(false);
+    await expect(late.notify("wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: "f", result: {} })).rejects.toThrow(/no longer active/);
+    expect(t.sent).toHaveLength(0);
   });
 });
 

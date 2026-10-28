@@ -280,7 +280,7 @@ export function boundNotifier(peer: PeerContext, flowId: string): FlowNotifier &
   return {
     notify: (method, params) => (peer.notifyFlow ? peer.notifyFlow(generation, method, params) : peer.notify(method, params)),
     // Whether the flow this notifier was made for is still the active one.
-    current: () => !peer.flowGeneration || peer.flowGeneration(flowId) === generation,
+    current: () => !peer.flowGeneration || (generation !== undefined && peer.flowGeneration(flowId) === generation),
   };
 }
 

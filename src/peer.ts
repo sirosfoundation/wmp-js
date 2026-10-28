@@ -362,12 +362,14 @@ export class Peer implements PeerContext {
    */
   async notifyFlow(generation: object | undefined, method: string, params: unknown): Promise<void> {
     const id = flowIdOf(params);
-    if (typeof id === "string" && this.recordedFlows.get(id) !== generation) {
+    // No flow id, no generation (the flow is not active) or another generation: nothing is sent.
+    // A missing record must not authorize a send.
+    if (typeof id !== "string" || generation === undefined || this.recordedFlows.get(id) !== generation) {
       throw new Error("flow is no longer active");
     }
     await this.transport.send(createNotification(method, params));
     // Retire the flow only if it is still the generation that sent this.
-    if (typeof id === "string" && this.recordedFlows.get(id) === generation) this.recordedFlows.delete(id);
+    if (this.recordedFlows.get(id) === generation) this.recordedFlows.delete(id);
   }
 
   /** Drops the validation context of a flow that ended; the flow_id is free to start again. */
@@ -494,11 +496,22 @@ export class Peer implements PeerContext {
   async resumeSession(opts?: {
     lastReceivedId?: string;
   }): Promise<SessionResumeResult> {
+    return this.resumeSerialized(opts);
+  }
+
+  /**
+   * `forEpoch`: recovery work that is only valid for the session it was queued
+   * for; if that session was closed or replaced (or the peer closed) while it
+   * waited its turn, it is dropped (StaleSessionError) instead of resuming the
+   * session that replaced it.
+   */
+  private async resumeSerialized(opts?: { lastReceivedId?: string }, forEpoch?: number): Promise<SessionResumeResult> {
     const previous = this.resumeChain;
     let release!: () => void;
     this.resumeChain = new Promise<void>((r) => (release = r));
     await previous;
     try {
+      if (forEpoch !== undefined && (this.closed || this.flowEpoch !== forEpoch)) throw new StaleSessionError();
       return await this.resumeNow(opts);
     } finally {
       release();
@@ -520,13 +533,15 @@ export class Peer implements PeerContext {
         opts?.lastReceivedId ?? (this.transport as { lastEventId?: string }).lastEventId,
     };
     const gen = this.lifecycle;
+    const epoch = this.flowEpoch;
     const result = await this.call<SessionResumeResult>(
       Method.SessionResume,
       params,
     );
     // The session this resume was for may have been closed or replaced while it
-    // was in flight: its result must not bring that session back.
-    if (this.lifecycle !== gen) throw new StaleSessionError();
+    // was in flight: its result must not bring that session back or overwrite the
+    // session that replaced it.
+    if (this.lifecycle !== gen || this.flowEpoch !== epoch) throw new StaleSessionError();
     // An unsuccessful resume changes nothing; the caller creates a new session.
     if (result.resumed !== true) {
       throw new WMPError(ErrorCode.SessionExpired, "Session could not be resumed");
@@ -1040,25 +1055,26 @@ export class Peer implements PeerContext {
             if (this.terminalSeen.get(flowId) === "cancelled") {
               return { wmp: p.wmp, flow_id: flowId, status: "cancelled" };
             }
-            // The flow generation this cancellation is for: the session epoch and the
-            // flow's record (if any).
-            const gen = this.flowEpoch;
-            const rec = this.recordedFlows.get(flowId);
-            // A repeat for the same generation that arrives while the first is
-            // still being processed shares its outcome. A replacement flow under
-            // the same id is a different generation and gets its own run.
+            // The flow this cancellation is for: the session epoch and the flow's
+            // generation (stable across the flow's completion, changed by a new flow
+            // under the same id or by a session reset).
+            const epoch = this.flowEpoch;
+            const gen = this.flowGen.get(flowId) ?? 0;
+            // A repeat for the same flow that arrives while the first is still being
+            // processed shares its outcome, even if the flow completed meanwhile. A
+            // replacement flow under the same id is a different generation.
             const pending = this.cancelling.get(flowId);
-            if (pending && pending.gen === gen && pending.rec === rec) return pending.run;
-            const entry: { gen: number; rec: object | undefined; run: Promise<unknown> } = { gen, rec, run: undefined as unknown as Promise<unknown> };
+            if (pending && pending.epoch === epoch && pending.gen === gen) return pending.run;
+            const entry: { epoch: number; gen: number; run: Promise<unknown> } = { epoch, gen, run: undefined as unknown as Promise<unknown> };
             entry.run = (async () => {
               // Yield first: the entry is installed before the handler can throw
               // (even synchronously), so its cleanup always sees it.
               await Promise.resolve();
               try {
                 const result = await this.handler.onFlowCancel!(p);
-                // Finalize only the generation that was cancelled: if that flow
-                // ended and another started under the id meanwhile, leave it alone.
-                if (this.flowEpoch === gen && this.recordedFlows.get(flowId) === rec) this.endFlow(flowId, "cancelled");
+                // Finalize only the flow that was cancelled: if another started under
+                // the id (or the session was reset) meanwhile, leave it alone.
+                if (this.flowEpoch === epoch && (this.flowGen.get(flowId) ?? 0) === gen) this.endFlow(flowId, "cancelled");
                 return result;
               } finally {
                 if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
@@ -1131,6 +1147,7 @@ export class Peer implements PeerContext {
     this.flowEpoch++;
     this.recordedFlows.clear();
     this.terminalSeen.clear();
+    this.flowGen.clear();
     this.cancelling.clear(); // pending cancellations belong to the old session
   }
 
@@ -1160,6 +1177,7 @@ export class Peer implements PeerContext {
     const q = flowType === "match" && typeof params === "object" && params !== null ? (params as { dcql_query?: unknown }).dcql_query : undefined;
     const rec = { type: flowType, queryIds: q === undefined ? undefined : dcqlQueryIds(q) };
     this.recordedFlows.set(flowId, rec);
+    this.flowGen.set(flowId, (this.flowGen.get(flowId) ?? 0) + 1); // a new flow under this id
     return () => {
       // Only while this start's own record is still the flow's: if the
       // replacement already ended, or another flow took the id, the marker is theirs.
@@ -1212,10 +1230,17 @@ export class Peer implements PeerContext {
    * belong to: a repeat for the SAME generation arriving meanwhile shares the
    * outcome; a replacement flow under the same id never does.
    */
-  private cancelling = new Map<string, { gen: number; rec: object | undefined; run: Promise<unknown> }>();
+  private cancelling = new Map<string, { epoch: number; gen: number; run: Promise<unknown> }>();
 
   /** Incremented whenever the flow state is reset (session closed or replaced). */
   private flowEpoch = 0;
+
+  /**
+   * A per-flow-id generation that survives the flow's completion: it changes only
+   * when a new flow starts under the id (and with every reset), so work tied to
+   * "this flow" can tell a replacement from the same flow having ended.
+   */
+  private flowGen = new Map<string, number>();
 
   // Track flow_id → flow_type mapping for routing to the right FlowHandler.
   private activeFlows = new Map<string, string>();
@@ -1265,17 +1290,21 @@ export class Peer implements PeerContext {
     // that arrives while one is queued adds nothing (the queued one covers it).
     if (this.recoveryQueued) return;
     this.recoveryQueued = true;
+    // The session this gap belongs to: recovery work for a session that was closed
+    // or replaced meanwhile is discarded, never applied to the one that replaced it.
+    const epoch = this.flowEpoch;
     this.recovery = this.recovery.then(async () => {
       this.recoveryQueued = false;
+      if (this.closed || this.flowEpoch !== epoch) return;
       if (!this.sessionId || !this.resumptionToken) {
         this.onSessionLost?.(new Error("event gap and no resumption token to resume with"));
         return;
       }
       try {
-        await this.resumeSession();
+        await this.resumeSerialized(undefined, epoch);
       } catch (err: unknown) {
-        // The session was closed or replaced meanwhile: nothing was lost.
-        if (err instanceof StaleSessionError) return;
+        // The session changed (or the peer closed) while resuming: nothing was lost.
+        if (err instanceof StaleSessionError || this.closed || this.flowEpoch !== epoch) return;
         this.onSessionLost?.(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -1300,6 +1329,14 @@ export class Peer implements PeerContext {
 // Error conversion
 // ---------------------------------------------------------------------------
 
+/** A resume result (or recovery) that belongs to a session that was closed or replaced meanwhile. */
+class StaleSessionError extends Error {
+  constructor() {
+    super("session changed while resuming");
+    this.name = "StaleSessionError";
+  }
+}
+
 function isFlowIdEnvelope(params: unknown): params is { flow_id: string } {
   return typeof params === "object" && params !== null && typeof (params as { flow_id?: unknown }).flow_id === "string";
 }
@@ -1321,14 +1358,6 @@ function flowIdOf(params: unknown): unknown {
 interface AfterResponse {
   fns: (() => void)[];
   undo?: () => void;
-}
-
-/** A resume result that arrived after its session was closed or replaced. */
-class StaleSessionError extends Error {
-  constructor() {
-    super("session changed while resuming");
-    this.name = "StaleSessionError";
-  }
 }
 
 function flowTypeOf(params: unknown): unknown {
