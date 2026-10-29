@@ -1466,7 +1466,7 @@ describe("first binding, create requests, cancellation bookkeeping across resets
     const calls: { headers: Record<string, string>; body: string }[] = [];
     const fetchFn = vi.fn(async (_url: string, init: { headers: Record<string, string>; body: string }) => {
       calls.push({ headers: init.headers, body: init.body });
-      return new Response("", { status: 202 });
+      return { status: 202, ok: true, headers: { get: () => null } } as unknown as Response;
     });
     const t = new HttpSseTransport("http://x/wmp", "http://x/events", { fetch: fetchFn as never });
     t.setSessionId("ses-A");
@@ -1529,7 +1529,7 @@ describe("resume requests are routed by the session they ask for (round 12)", ()
     const calls: Record<string, string>[] = [];
     const fetchFn = vi.fn(async (_url: string, init: { headers: Record<string, string> }) => {
       calls.push(init.headers);
-      return new Response("", { status: 202 });
+      return { status: 202, ok: true, headers: { get: () => null } } as unknown as Response;
     });
     const t = new HttpSseTransport("http://x/wmp", "http://x/events", { fetch: fetchFn as never });
     t.setSessionId("ses-A");
