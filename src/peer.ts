@@ -560,7 +560,7 @@ export class Peer implements PeerContext {
             this.refreshNegotiated(capturedGen, capturedSession, capturedRev, (v as { capabilities?: unknown } | undefined)?.capabilities);
           }
           // A cancelled flow has ended: release its context (shared by the convenience method and profiles).
-          if (method === Method.FlowCancel) this.releaseFlow(flowIdOf(params));
+          if (method === Method.FlowCancel) this.endFlow(flowIdOf(params), "cancelled"); // also remembered as ended: later actions for it are refused
           (resolve as (v: unknown) => void)(v);
         }),
         reject: fail,

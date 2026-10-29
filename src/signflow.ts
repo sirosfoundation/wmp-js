@@ -362,6 +362,21 @@ function present(v: unknown): boolean {
   return typeof v === "object" && v !== null && Object.keys(v).length > 0;
 }
 
+/**
+ * A vp_token the profile allows (table in profile 3.2.5, DCQL form in 7.x): a
+ * non-empty string, a non-empty array of non-empty strings, or an object mapping
+ * query ids to non-empty arrays of non-empty strings. Anything else (booleans,
+ * numbers, null, empty or mixed values) is not a presentation.
+ */
+function validVpToken(v: unknown): boolean {
+  const str = (x: unknown): boolean => typeof x === "string" && x !== "";
+  const strs = (x: unknown): boolean => Array.isArray(x) && x.length > 0 && x.every(str);
+  if (str(v) || strs(v)) return true;
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const vals = Object.values(v as Record<string, unknown>);
+  return vals.length > 0 && vals.every(strs);
+}
+
 /** Response modes in which the wallet encrypts the response (profile 7.7). */
 const ENCRYPTED_RESPONSE_MODES = ["direct_post.jwt", "dc_api.jwt"];
 
@@ -400,7 +415,7 @@ export function validateSignResult(action: string, result: unknown, responseMode
       // A plaintext (or unspecified) mode answers with the VP token (profile
       // 3.2.5); a result without one would end the sub-flow with no presentation.
       if ("response_jwe" in r) throw new CompletionResultError("response_jwe in a response mode that is not encrypted");
-      if (!present(r.vp_token)) throw new CompletionResultError("a successful sign_presentation result carries a vp_token");
+      if (!validVpToken(r.vp_token)) throw new CompletionResultError("a successful sign_presentation result carries a vp_token: a string, an array of strings, or an object of query id to arrays of strings");
     }
     return;
   }

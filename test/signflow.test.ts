@@ -733,6 +733,18 @@ describe("sign_presentation results follow the response mode (profile 7.7)", () 
   });
 });
 
+describe("vp_token type (round 15)", () => {
+  const ok = (vp: unknown) => () => validateSignResult("sign_presentation", { vp_token: vp }, "direct_post");
+  it("accepts a string, an array of strings, and a DCQL object of string arrays", () => {
+    for (const v of ["eyJ", ["a", "b"], { pid: ["a"], other: ["b", "c"] }]) expect(ok(v), JSON.stringify(v)).not.toThrow();
+  });
+  it("refuses booleans, numbers, null, empty and mixed values", () => {
+    for (const v of [true, false, 1, 0, null, undefined, "", [], [1], ["a", ""], ["a", 1], {}, { pid: [] }, { pid: "a" }, { pid: [1] }, { pid: { x: ["a"] } }, [["a"]]]) {
+      expect(ok(v), JSON.stringify(v)).toThrow(CompletionResultError);
+    }
+  });
+});
+
 describe("effective response mode (round 13)", () => {
   const jwe = "aaaa.x.bbbb.cccc.dddd";
   it("a verified_request mode applies when the top-level member is omitted", async () => {
@@ -1177,6 +1189,22 @@ describe("the closed-set refusal does not depend on how the flow started or on a
       expect(onFlowAction, how).not.toHaveBeenCalled();
       expect(JSON.stringify(t.sent)).not.toContain("SECRET");
     }
+  });
+
+  it("after a successful outbound cancel, later actions for that flow are refused (not unchecked)", async () => {
+    const { t, peer, onFlowAction } = await peerWith();
+    peer.startFlow("oid4vp", "out-2", { request_uri: "openid4vp://x" }).catch(() => {});
+    await settle();
+    const cancelling = peer.flowCancel("out-2");
+    await settle();
+    const req = t.sent.find((m) => (m as { method?: string }).method === "wmp.flow.cancel") as { id: string };
+    t.receive({ jsonrpc: "2.0", id: req.id, result: { wmp: { version: "0.1" }, flow_id: "out-2", status: "cancelled" } });
+    await cancelling;
+    t.sent.length = 0;
+    t.receive(action("a9", "out-2", bad));
+    await settle(40);
+    expect((t.sent.find((m) => (m as { id?: string }).id === "a9") as Response).error?.code).toBe(-32602);
+    expect(onFlowAction).not.toHaveBeenCalled();
   });
 
   it("with an optional schema validator that rejects the message first, the refusal and the terminal still happen", async () => {
