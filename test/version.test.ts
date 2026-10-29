@@ -2013,6 +2013,17 @@ describe("stale snapshots, refresh sources (round 11)", () => {
 
 describe("session ordering and resume hygiene (round 12)", () => {
   const ok = (sid: string, extra: Record<string, unknown> = {}) => ({ wmp: { version: "0.1", session_id: sid }, capabilities: {}, security: { mode: "tls" }, ...extra });
+  const mkClient = async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    peer.use(new OpenID4xProfile({ oid4vci: { supported_grants: [], supported_formats: [] }, onVCIStart: async (p: never) => ({ wmp: (p as { wmp: never }).wmp, flow_id: (p as { flow_id: string }).flow_id, flow_type: "oid4vci" }) as never }));
+    const q = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: ok("ses-1", { capabilities: { oid4vci: {} }, resumption_token: "rt1" }) });
+    await q;
+    t.sent.length = 0;
+    return { t, peer };
+  };
   const mk = async () => {
     const t = new MockTransport();
     const peer = new Peer(t, {});
@@ -2072,5 +2083,56 @@ describe("session ordering and resume hygiene (round 12)", () => {
     expect(byId("b").error).toBeUndefined();
     expect(byId("a").error?.code).toBe(-31000);
     expect(peer.session).toBe("ses-1");
+  });
+
+  it("a gap withdraws the grant; a resume without a snapshot leaves it withdrawn and asks for one", async () => {
+    const { t } = await mkClient();
+    t.emitEvent("gap");
+    await settle();
+    const resume = t.sent.find((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string };
+    t.receive({ jsonrpc: "2.0", id: resume.id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 1, security: { mode: "tls" } } });
+    await settle(30);
+    expect(t.sent.some((m) => (m as { method?: string }).method === "wmp.capability.list")).toBe(true);
+    t.sent.length = 0;
+    t.receive({ jsonrpc: "2.0", id: "f", method: "wmp.flow.start", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: "oid4vci", flow_id: "flow-1", params: {} } });
+    await settle();
+    expect((t.sent[0] as Response).error?.code).toBe(-31005);
+  });
+
+  it("an incoming create that arrived first cannot win because its authorization was slow", async () => {
+    const t = new MockTransport();
+    const gates: Array<() => void> = [];
+    const peer = new Peer(t, {
+      authorize: async (method, params) => {
+        if (method === "wmp.session.create" && (params as { tag?: string }).tag === "slow") await new Promise<void>((r) => gates.push(r));
+        return true;
+      },
+      handler: { onSessionCreate: async (p: never) => ok((p as { tag: string }).tag === "slow" ? "ses-slow" : "ses-fast") as never },
+    });
+    const c = (id: string, tag: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" }, tag } });
+    t.receive(c("a", "slow"));
+    t.receive(c("b", "fast"));
+    await settle();
+    gates[0]!();
+    await settle();
+    expect(peer.session).toBe("ses-fast");
+    const a = t.sent.find((m) => (m as { id?: string }).id === "a") as Response;
+    expect(a.error?.code).toBe(-31000);
+  });
+
+  it("the supported_versions in a refusal is a copy", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    void peer;
+    const p = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "9.9", session_id: "x" }, capabilities: {}, security: { mode: "tls" } } });
+    const err = (await p.then(() => undefined, (e) => e)) as WMPError;
+    const data = err.data as { supported_versions: string[] };
+    data.supported_versions.push("0.99");
+    const p2 = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.99", session_id: "x" }, capabilities: {}, security: { mode: "tls" } } });
+    await expect(p2).rejects.toMatchObject({ code: -31013 });
   });
 });
