@@ -240,17 +240,24 @@ export class HttpSseTransport extends Emitter implements Transport {
    */
   setSessionId(sessionId: string): void {
     let reopen = this.reopenOnBind;
-    if (this.sessionId !== undefined && this.sessionId !== sessionId) {
-      // Event IDs are unique only within a session: another session's cursor
-      // would draw a 410 and its seen IDs could swallow this session's events.
-      // The stream belongs to the old session: it is closed (so it can no longer
-      // deliver into the new one) and, if it was open, reopened for the new one.
-      reopen = reopen || this.eventSource !== null;
-      this.eventSource?.close();
-      this.eventSource = null;
-      this.cursor = undefined;
-      this.seenIds.clear();
-      this.pendingGap = false;
+    if (this.sessionId !== sessionId) {
+      const hadSession = this.sessionId !== undefined;
+      // A stream is tied to the session it was opened for (its events are ignored
+      // once that is no longer the bound one), so a stream that is open (also one
+      // opened before the first binding) is closed and reopened for the new session.
+      if (this.eventSource !== null) {
+        reopen = true;
+        this.eventSource.close();
+        this.eventSource = null;
+      }
+      if (hadSession) {
+        // Event IDs are unique only within a session: another session's cursor
+        // would draw a 410 and its seen IDs could swallow this session's events.
+        // (The first binding keeps a cursor the transport was seeded with.)
+        this.cursor = undefined;
+        this.seenIds.clear();
+        this.pendingGap = false;
+      }
     }
     this.sessionId = sessionId;
     if (reopen && !this.closed && this.eventSource === null) {
@@ -436,7 +443,11 @@ export class HttpSseTransport extends Emitter implements Transport {
     if (this.authorization) {
       headers["Authorization"] = this.authorization;
     }
-    if (this.sessionId) {
+    // A session.create must not carry a session id (Transport 4.3.1: the server
+    // assigns it and refuses a request that names one). The binding itself stays,
+    // in case the create fails and the old session is still the one in use.
+    const isCreate = (msg as { method?: unknown }).method === "wmp.session.create";
+    if (this.sessionId && !isCreate) {
       headers["Wmp-Session-Id"] = this.sessionId;
     }
 

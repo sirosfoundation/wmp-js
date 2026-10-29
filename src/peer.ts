@@ -809,10 +809,14 @@ export class Peer implements PeerContext {
                 return result;
               } finally {
                 if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
-                const left = (this.cancelCount.get(flowId) ?? 1) - 1;
-                if (left <= 0) this.cancelCount.delete(flowId);
-                else this.cancelCount.set(flowId, left);
-                this.releaseGen(flowId);
+                // Bookkeeping of a session that was reset meanwhile (counts and entries
+                // were cleared) must not touch the new session's.
+                if (this.flowEpoch === epoch) {
+                  const left = (this.cancelCount.get(flowId) ?? 1) - 1;
+                  if (left <= 0) this.cancelCount.delete(flowId);
+                  else this.cancelCount.set(flowId, left);
+                  this.releaseGen(flowId);
+                }
               }
             })();
             this.cancelling.set(flowId, entry);

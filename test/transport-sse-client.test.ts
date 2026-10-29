@@ -1423,3 +1423,103 @@ describe("overlapping cancellations of one flow id (round 10)", () => {
     expect((t.sent[0] as { result: { status: string } }).result.status).toBe("later");
   });
 });
+
+describe("first binding, create requests, cancellation bookkeeping across resets (round 11)", () => {
+  const settle11 = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  const msg = JSON.stringify({ jsonrpc: "2.0", method: "wmp.flow.progress", params: { wmp: { version: "0.1" }, flow_id: "f", step: "1" } });
+
+  it("a stream opened before the first session binding is reopened for it (keeping a seeded cursor), so its events are delivered", () => {
+    const made: { url: string; closed: boolean; fire(id: string): void }[] = [];
+    class Fake {
+      readyState = 1;
+      closed = false;
+      onopen = null;
+      onerror = null;
+      onmessage = null;
+      private l: ((ev: MessageEvent) => void)[] = [];
+      constructor(public url: string) {
+        made.push(this);
+      }
+      addEventListener(_t: string, fn: (ev: MessageEvent) => void) {
+        this.l.push(fn);
+      }
+      fire(id: string) {
+        this.l.forEach((fn) => fn({ data: msg, lastEventId: id } as MessageEvent));
+      }
+      close() {
+        this.closed = true;
+      }
+    }
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Fake as unknown as typeof EventSource, lastEventId: "seed" });
+    const got: Message[] = [];
+    t.on("message", (m) => got.push(m));
+    t.connectSSE(); // before any session is bound
+    t.setSessionId("ses-1"); // the first binding
+    expect(made).toHaveLength(2);
+    expect(made[0].closed).toBe(true);
+    expect(made[1].url).toBe("http://x/events?session_id=ses-1&last_event_id=seed&lastEventId=seed"); // seeded cursor kept
+    made[1].fire("e1");
+    expect(got).toHaveLength(1); // delivered: the stream knows its session
+  });
+
+  it("a session.create POST carries no Wmp-Session-Id even while a session is bound; other requests do", async () => {
+    const calls: { headers: Record<string, string>; body: string }[] = [];
+    const fetchFn = vi.fn(async (_url: string, init: { headers: Record<string, string>; body: string }) => {
+      calls.push({ headers: init.headers, body: init.body });
+      return new Response("", { status: 202 });
+    });
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { fetch: fetchFn as never });
+    t.setSessionId("ses-A");
+    await t.send({ jsonrpc: "2.0", id: "1", method: "wmp.session.create", params: { wmp: { version: "0.1" } } });
+    await t.send({ jsonrpc: "2.0", id: "2", method: "wmp.flow.start", params: { wmp: { version: "0.1" } } });
+    expect(calls[0].headers["Wmp-Session-Id"]).toBeUndefined();
+    expect(calls[1].headers["Wmp-Session-Id"]).toBe("ses-A");
+    expect(t.lastEventId).toBeUndefined();
+    // the binding survived the create (it may fail), so the next request still carries it
+    await t.send({ jsonrpc: "2.0", id: "3", method: "wmp.message.deliver", params: { wmp: { version: "0.1" } } });
+    expect(calls[2].headers["Wmp-Session-Id"]).toBe("ses-A");
+  });
+
+  it("e2e: a second create through the generic call API on the same peer is accepted by the server", async () => {
+    const { t, peer, sid } = await setup(200);
+    t.connectSSE();
+    const second = await peer.call<{ wmp: { session_id: string } }>("wmp.session.create", { wmp: { version: "0.1" }, security: { mode: "tls" } });
+    expect(second.wmp.session_id).not.toBe(sid);
+    expect(second.wmp.session_id).toMatch(/^ses-/);
+  });
+
+  it("a cancellation of an old session finishing late does not touch the new session's bookkeeping", async () => {
+    const t = new MockTransport();
+    const gates: (() => void)[] = [];
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => {
+      await new Promise<void>((r) => gates.push(r));
+      return { wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" };
+    });
+    const peer = new Peer(t, { handler: { onFlowCancel, onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowComplete: vi.fn() } });
+    const created = async (sid: string) => {
+      const p = peer.createSession({});
+      await settle11();
+      t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1", session_id: sid }, capabilities: {}, security: { mode: "tls" }, resumption_token: "rt" } });
+      await p;
+    };
+    const cancel = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: "x" } });
+    await created("ses-A");
+    t.receive(cancel("c1")); // A's cancellation, pending
+    await settle11();
+    await created("ses-B"); // reset
+    t.receive({ jsonrpc: "2.0", id: "s", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "x", params: {} } }); // x exists in B
+    await settle11();
+    t.receive(cancel("c2")); // B's cancellation of the same id, pending (captures x's generation)
+    await settle11();
+    t.receive({ jsonrpc: "2.0", method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: "x", result: { credentials: [] } } }); // x ends: its generation is kept only for the pending cancellation
+    await settle11();
+    expect(onFlowCancel).toHaveBeenCalledTimes(2);
+    gates[0](); // A's handler finishes: it must not decrement B's count or reclaim B's generation
+    await settle11();
+    t.receive(cancel("c3")); // a replay in B while B's handler is still running: shared
+    await settle11();
+    expect(onFlowCancel).toHaveBeenCalledTimes(2);
+    gates[1]();
+    await settle11();
+  });
+});
