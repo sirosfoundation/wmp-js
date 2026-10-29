@@ -539,7 +539,7 @@ describe("flow.start in notification form", () => {
 describe("continuations belong to their own request", () => {
   it("a duplicate start rejected while the original's response is still being sent does not discard the original's continuation", async () => {
     const onSign = vi.fn(async (flow: { complete(r: unknown): Promise<void> }) => {
-      await flow.complete({ proof_jwt: "eyJ" });
+      await flow.complete({ vp_token: "eyJ" });
     });
     const t = new MockTransport();
     const peer = new Peer(t, {
@@ -649,6 +649,26 @@ describe("sign_presentation results follow the response mode (profile 7.7)", () 
       expect(() => validateSignResult("sign_presentation", { vp_token: "x", response_jwe: jwe }, mode), mode).toThrow(CompletionResultError);
       expect(() => validateSignResult("sign_presentation", {}, mode), mode).toThrow(CompletionResultError);
     }
+  });
+
+  it("a successful result in a plaintext or unspecified mode must carry the vp_token", () => {
+    for (const mode of ["direct_post", "dc_api", undefined]) {
+      expect(() => validateSignResult("sign_presentation", {}, mode as never), String(mode)).toThrow(CompletionResultError);
+      expect(() => validateSignResult("sign_presentation", { proof_jwt: "eyJ" }, mode as never), String(mode)).toThrow(CompletionResultError);
+      expect(() => validateSignResult("sign_presentation", { vp_token: ["a", "b"] }, mode as never), String(mode)).not.toThrow();
+      expect(() => validateSignResult("sign_presentation", { error: { code: "access_denied" } }, mode as never), String(mode)).not.toThrow(); // error-only results stay valid
+    }
+  });
+
+  it("the profile sends no presentation-less success", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: (flow) => flow.complete({ proof_jwt: "eyJ" }),
+    });
+    t.receive(start("sign", "nopres", sign({ response_mode: "direct_post" })));
+    await settle(60);
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.error", params: { code: -31006 } });
+    expect(t.sent.some((m) => (m as { method?: string }).method === "wmp.flow.complete")).toBe(false);
   });
 
   it("a plaintext or unspecified mode takes a vp_token and refuses a JWE", () => {

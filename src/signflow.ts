@@ -366,8 +366,11 @@ export function validateSignResult(action: string, result: unknown, responseMode
     } else if (encrypted) {
       if ("vp_token" in r) throw new CompletionResultError("vp_token in an encrypted response mode; the response must be a response_jwe");
       if (!("response_jwe" in r)) throw new CompletionResultError("an encrypted response mode needs a response_jwe");
-    } else if ("response_jwe" in r) {
-      throw new CompletionResultError("response_jwe in a response mode that is not encrypted");
+    } else {
+      // A plaintext (or unspecified) mode answers with the VP token (profile
+      // 3.2.5); a result without one would end the sub-flow with no presentation.
+      if ("response_jwe" in r) throw new CompletionResultError("response_jwe in a response mode that is not encrypted");
+      if (!("vp_token" in r)) throw new CompletionResultError("a successful sign_presentation result carries a vp_token");
     }
     return;
   }
