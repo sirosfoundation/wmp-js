@@ -831,13 +831,15 @@ export class OpenID4xProfile
    * with a terminal wmp.flow.error -32602 (also without data), and nothing of the
    * refused params is echoed.
    */
-  validateAction(params: FlowActionParams): void {
-    if (params.action !== OID4Action.SelectCredentials || this.flowTypeMap.get(params.flow_id) !== OID4FlowType.OID4VP) return;
+  validateAction(params: FlowActionParams, flowType: string): void {
+    // The type is the one the Peer recorded when the flow started (so flows this
+    // peer started outbound are covered too); the flow stays recorded, so every
+    // further action is judged the same way, until the refusal's terminal is sent.
+    if (params.action !== OID4Action.SelectCredentials || flowType !== OID4FlowType.OID4VP) return;
     try {
       validateSelectCredentialsParams(params.params);
     } catch (err) {
       if (!(err instanceof ActionParamsError)) throw err;
-      this.flowTypeMap.delete(params.flow_id);
       if (this.peer) {
         const flowId = params.flow_id;
         const bound = boundNotifier(this.peer, flowId);

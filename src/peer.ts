@@ -941,6 +941,16 @@ export class Peer implements PeerContext {
       return undefined;
     }
 
+    // A profile may refuse an action for one of its flows before ANY validation or
+    // handler (select_credentials is a closed set, profile 3.2.3.1): the refusal
+    // must not depend on an optional schema validator accepting the message first.
+    // The envelope is checked, and the flow type is the one recorded at start.
+    if (method === Method.FlowAction && isFlowActionEnvelope(params)) {
+      const recorded = this.recordedFlows.get(params.flow_id);
+      const validating = recorded ? this.registry.getFlowHandler(recorded.type) : undefined;
+      validating?.validateAction?.(params, recorded!.type);
+    }
+
     // A completion that breaks the result rules is refused before the generic
     // validator runs: a notification the validator rejected would be dropped
     // silently and the receiving handler would never learn that the flow failed.
@@ -1165,11 +1175,6 @@ export class Peer implements PeerContext {
       }
 
       case Method.FlowAction: {
-        // A profile may refuse an action for one of its flows before any handler
-        // sees it (select_credentials is a closed set, profile 3.2.3.1).
-        const recorded = typeof p?.flow_id === "string" ? this.recordedFlows.get(p.flow_id) : undefined;
-        const validating = recorded ? this.registry.getFlowHandler(recorded.type) : undefined;
-        validating?.validateAction?.(p);
         const fh = this.flowHandlerForId(p.flow_id);
         if (fh) return fh.handleAction(p);
         if (this.handler.onFlowAction) return this.handler.onFlowAction(p);
@@ -1526,6 +1531,15 @@ class StaleSessionError extends Error {
     super("session changed while resuming");
     this.name = "StaleSessionError";
   }
+}
+
+/** flow_id, action and the wmp metadata object with its version: the shape the early action check needs. */
+function isFlowActionEnvelope(params: unknown): params is FlowActionParams {
+  if (typeof params !== "object" || params === null) return false;
+  const p = params as { flow_id?: unknown; action?: unknown; wmp?: unknown };
+  if (typeof p.flow_id !== "string" || typeof p.action !== "string") return false;
+  const w = p.wmp as { version?: unknown } | null | undefined;
+  return typeof w === "object" && w !== null && typeof w.version === "string";
 }
 
 function isFlowIdEnvelope(params: unknown): params is { flow_id: string } {

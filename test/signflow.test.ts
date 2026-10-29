@@ -1080,3 +1080,87 @@ describe("locally ended flows join the history, and a presentation must be a rea
     expect(() => validateSignResult("sign_presentation", { vp_token: { pid: ["x"] } }, "direct_post")).not.toThrow();
   });
 });
+
+describe("the closed-set refusal does not depend on how the flow started or on a schema validator (round 10)", () => {
+  const H = "Zm9yLXRoZS13YWxsZXQtb25seQ";
+  const bad = { consent: true, selections: [{ credential_id: "SECRET-CRED", disclosed_claims: ["family_name"] }] };
+  const action = (id: string, flowId: string, params: unknown) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.action", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_id: flowId, action: "select_credentials", params } });
+
+  async function peerWith(opts: ConstructorParameters<typeof Peer>[1] = {}) {
+    const t = new MockTransport();
+    const onFlowAction = vi.fn(async (p: { wmp: never; flow_id: string; action: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, action: p.action, status: "accepted" }));
+    const peer = new Peer(t, {
+      ...opts,
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: { oid4vp: {} }, security: { mode: "tls" } }),
+        onFlowAction: onFlowAction as never,
+        onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }),
+      },
+    });
+    peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] } }));
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    t.sent.length = 0;
+    return { t, peer, onFlowAction };
+  }
+
+  it("a flow this peer started outbound (Peer.startFlow / call) is covered", async () => {
+    for (const how of ["startFlow", "call"] as const) {
+      const { t, peer, onFlowAction } = await peerWith();
+      const p = how === "startFlow"
+        ? peer.startFlow("oid4vp", "out-1", { request_uri: "openid4vp://x" })
+        : peer.call("wmp.flow.start", { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: "oid4vp", flow_id: "out-1", params: { request_uri: "openid4vp://x" } });
+      p.catch(() => {});
+      await settle();
+      t.sent.length = 0;
+      t.receive(action("a1", "out-1", bad));
+      await settle(40);
+      expect((t.sent.find((m) => (m as { id?: string }).id === "a1") as Response).error).toEqual({ code: -32602, message: "Invalid params" });
+      expect(onFlowAction, how).not.toHaveBeenCalled();
+      expect(JSON.stringify(t.sent)).not.toContain("SECRET");
+    }
+  });
+
+  it("with an optional schema validator that rejects the message first, the refusal and the terminal still happen", async () => {
+    const { t, onFlowAction } = await peerWith({ validator: { validateMethod: () => [{ path: "params", message: "malformed" }] } });
+    t.receive({ jsonrpc: "2.0", id: "s", method: "wmp.flow.start", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: "oid4vp", flow_id: "vp-1", params: {} } });
+    await settle();
+    // (the validator rejects the start too, so record the flow through the outbound path instead)
+    const { t: t2, peer: peer2, onFlowAction: act2 } = await peerWith();
+    void peer2.startFlow("oid4vp", "vp-2", {}).catch(() => {});
+    await settle();
+    t2.sent.length = 0;
+    // now make the validator reject everything that follows
+    (peer2 as unknown as { validator: unknown }).validator = { validateMethod: () => [{ path: "params", message: "malformed" }] };
+    t2.receive(action("a1", "vp-2", bad));
+    await settle(40);
+    const resp = t2.sent.find((m) => (m as { id?: string }).id === "a1") as Response;
+    expect(resp.error).toEqual({ code: -32602, message: "Invalid params" }); // not the validator's detail
+    expect(act2).not.toHaveBeenCalled();
+    const terminal = t2.sent.find((m) => (m as { method?: string }).method === "wmp.flow.error") as { params: { flow_id: string; code: number } };
+    expect(terminal.params).toMatchObject({ flow_id: "vp-2", code: -32602 }); // the parent flow ended
+    void t;
+    void onFlowAction;
+  });
+
+  it("the flow stays judged until its terminal is sent: a failed terminal send does not open a bypass", async () => {
+    const { t, peer, onFlowAction } = await peerWith();
+    void peer.startFlow("oid4vp", "vp-3", {}).catch(() => {});
+    await settle();
+    const realSend = t.send.bind(t);
+    t.send = async (m) => {
+      if ((m as { method?: string }).method === "wmp.flow.error") throw new Error("terminal could not be sent");
+      await realSend(m);
+    };
+    t.sent.length = 0;
+    t.receive(action("a1", "vp-3", bad));
+    await settle(40);
+    t.receive(action("a2", "vp-3", bad)); // the flow is still recorded: judged again
+    await settle(40);
+    for (const id of ["a1", "a2"]) {
+      expect((t.sent.find((m) => (m as { id?: string }).id === id) as Response).error?.code, id).toBe(-32602);
+    }
+    expect(onFlowAction).not.toHaveBeenCalled();
+    void H;
+  });
+});
