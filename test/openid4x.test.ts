@@ -135,7 +135,14 @@ describe("OpenID4xProfile flow dispatch", () => {
 
     await expect(
       p.startFlow({ wmp, flow_type: "unknown", flow_id: "flow-x" }),
-    ).rejects.toMatchObject({ code: ErrorCode.FlowError });
+    ).rejects.toMatchObject({ code: ErrorCode.CapabilityNotSupported, data: { unsupported: "unknown" } });
+  });
+
+  it("declares the capability each flow type needs", () => {
+    const p = new OpenID4xProfile({});
+    expect(p.requiredCapability("oid4vci")).toBe("oid4vci");
+    expect(p.requiredCapability("oid4vp")).toBe("oid4vp");
+    expect(p.requiredCapability("sign")).toBe("");
   });
 });
 

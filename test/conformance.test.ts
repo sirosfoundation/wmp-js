@@ -23,6 +23,12 @@ import {
   splitReplaySecrets,
   CompletionResultError,
 } from "../src/completion.js";
+import { Peer } from "../src/peer.js";
+import { MockTransport } from "./mock-transport.js";
+import { parseSignSubFlowParams, parseMatchStartParams } from "../src/signflow.js";
+import { validateSelectCredentialsParams } from "../src/consent.js";
+import { ActionParamsError } from "../src/consent.js";
+import { WMPError } from "../src/jsonrpc.js";
 import { loadManifest, loadVectors, vectorFilesOnDisk, vectorsDir, specDir, type TestVector } from "./vectors.js";
 
 // Collect all known method names from the Method constant
@@ -325,7 +331,30 @@ describe("Conformance: error codes match Core §3.8", () => {
 
 interface FlowMsg {
   method?: string;
-  params?: { flow_id?: string; flow_type?: string; params?: { dcql_query?: { credentials?: { id: string }[] } }; result?: unknown };
+  params?: {
+    flow_id?: string;
+    flow_type?: string;
+    action?: string;
+    params?: { dcql_query?: { credentials?: { id: string }[] } } & Record<string, unknown>;
+    result?: unknown;
+  };
+}
+
+/** Members of sign params that the engine-blind design adds; none may be lost by parsing. */
+const ENGINE_BLIND_SIGN_MEMBERS = [
+  "credential_response_encryption", "jwe", "deferred", "response_encryption", "state",
+  "auxiliary_data_to_issuer", "credential_type", "credential_issuer",
+];
+
+/** Runs `check`, reporting whether it refused (a protocol-level refusal) or threw something else. */
+function refuses(check: () => void): boolean {
+  try {
+    check();
+    return false;
+  } catch (e) {
+    if (e instanceof CompletionResultError || e instanceof ActionParamsError || e instanceof WMPError) return true;
+    throw e;
+  }
 }
 
 function messagesOf(input: unknown): FlowMsg[] {
@@ -351,6 +380,23 @@ function runFlowChecks(v: TestVector): boolean[] {
       flowTypes.set(id, msg.params?.flow_type ?? "");
       const q = msg.params?.params?.dcql_query?.credentials;
       if (q) queryIds.set(id, q.map((c) => c.id));
+      if (msg.params?.flow_type === "sign") {
+        outcomes.push(
+          refuses(() => {
+            const parsed = parseSignSubFlowParams(msg.params!.params);
+            // Every member the engine-blind design adds survives, unchanged.
+            for (const k of ENGINE_BLIND_SIGN_MEMBERS) {
+              if (msg.params!.params && k in msg.params!.params) expect(parsed[k], `sign params member ${k} dropped`).toEqual(msg.params!.params[k]);
+            }
+          }),
+        );
+      } else if (msg.params?.flow_type === "match") {
+        outcomes.push(refuses(() => parseMatchStartParams(msg.params!.params)));
+      }
+      continue;
+    }
+    if (msg.method === "wmp.flow.action" && msg.params?.action === "select_credentials") {
+      outcomes.push(refuses(() => validateSelectCredentialsParams(msg.params!.params)));
       continue;
     }
     if (msg.method !== "wmp.flow.complete" || msg.params?.result === undefined) continue;
@@ -371,7 +417,7 @@ describe("Conformance: flow-lifecycle vectors are executed", () => {
   const vectors = loadVectors("flow-lifecycle.json");
   // must_refuse vectors whose check is not implemented yet, by method of the
   // refused message. Nothing may be added; an implemented check removes its entry.
-  const pendingMustRefuse = new Set<string>(["wmp.flow.action"]);
+  const pendingMustRefuse = new Set<string>();
 
   for (const v of vectors) {
     it(`${v.id}: ${v.must_refuse ? "is refused" : "passes the flow checks"}`, () => {
@@ -391,7 +437,7 @@ describe("Conformance: flow-lifecycle vectors are executed", () => {
 
   it("executes a substantial number of must_refuse vectors", () => {
     const executed = vectors.filter((v) => v.must_refuse && runFlowChecks(v).length > 0);
-    expect(executed.length).toBeGreaterThanOrEqual(15);
+    expect(executed.length).toBe(vectors.filter((v) => v.must_refuse).length);
   });
 
   for (const v of vectors.filter((x) => x.expected_replay !== undefined)) {
@@ -406,4 +452,58 @@ describe("Conformance: flow-lifecycle vectors are executed", () => {
       else expect(JSON.parse(out.replay)).toEqual(v.input);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Behavioural execution of version negotiation and flow-type error vectors
+// ---------------------------------------------------------------------------
+
+async function respond(input: unknown, supported?: string[]): Promise<Response> {
+  const t = new MockTransport();
+  new Peer(t, {
+    supportedVersions: supported,
+    handler: {
+      // A session.create responder with no version of its own: the Peer's negotiation decides.
+      onSessionCreate: async () => ({
+        wmp: { version: "", session_id: "ses-abcdef0123" },
+        capabilities: {},
+        security: { mode: "tls" },
+      }),
+    },
+  });
+  t.receive(input as never);
+  await new Promise((r) => setTimeout(r, 10));
+  return t.sent[0] as Response;
+}
+
+describe("Conformance: version negotiation vectors run against Peer", () => {
+  const create = loadVectors("session-create.json").filter((v) => v.setup?.supported_versions);
+  const errors = loadVectors("errors.json").filter((v) => v.setup?.supported_versions && v.expected_error);
+
+  it("finds the vectors", () => {
+    expect(create.length).toBeGreaterThanOrEqual(3);
+    expect(errors.length).toBeGreaterThanOrEqual(3);
+  });
+
+  for (const v of create) {
+    it(`${v.id}: selected version`, async () => {
+      const resp = await respond(v.input, v.setup!.supported_versions);
+      const want = (v.expected_response as { result: { wmp: { version: string } } }).result.wmp.version;
+      expect((resp.result as { wmp: { version: string; session_id: string } }).wmp.version).toBe(want);
+      expect((resp.result as { wmp: { session_id: string } }).wmp.session_id).toMatch(/^ses-/);
+    });
+  }
+
+  for (const v of errors) {
+    it(`${v.id}: error response equals the vector`, async () => {
+      const resp = await respond(v.input, v.setup!.supported_versions);
+      expect(resp.error).toEqual((v.expected_error as { error: unknown }).error);
+    });
+  }
+
+  it("error-unknown-flow-type is -31005 with the unsupported flow type", async () => {
+    const v = loadVectors("errors.json").find((x) => x.id === "error-unknown-flow-type")!;
+    const resp = await respond(v.input);
+    expect(resp.error).toEqual((v.expected_error as { error: unknown }).error);
+  });
 });

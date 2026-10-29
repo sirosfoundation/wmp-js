@@ -132,6 +132,10 @@ export type {
   MLSProvider,
 } from "./mls.js";
 
+// Version negotiation and errors
+export { SUPPORTED_VERSIONS, parseVersion, negotiateVersion, versionRejection } from "./version.js";
+export { unsupportedError } from "./errors.js";
+
 // Completion-result rules (OpenID4x profile 3.1.4, 3.3)
 export {
   validateCompletionResult,
@@ -163,6 +167,7 @@ export {
   buildVCIFlowStart,
   withAttestation,
   transactionDataHashesAlgs,
+  SubFlowRejectedError,
 } from "./openid4x.js";
 export type {
   CredentialFormatType,
@@ -182,10 +187,49 @@ export type {
   SelectionAction,
   ConsentAction,
   CredentialSelection,
+  CredentialToInclude,
+  CredentialResponseEncryption,
+  TransactionData,
   FlowStartHandler,
   ActionHandler,
   OpenID4xConfig,
 } from "./openid4x.js";
+
+// Sign sub-flow responder, transaction_data, match (profile 3.1.5, 3.2.5, 3.2.6, 3.3)
+export {
+  CAPABILITY_TRANSACTION_DATA,
+  TRANSACTION_DATA_VERSION_1,
+  TRANSACTION_DATA_HASH_ALGS,
+  SIGN_ACTIONS,
+  MAX_PROOF_COUNT,
+  SignFlow,
+  boundNotifier,
+  offersTransactionData,
+  transactionDataUnsupportedData,
+  transactionDataUnsupportedError,
+  transactionDataHash,
+  decodeTransactionData,
+  checkTransactionDataEntry,
+  parseSignSubFlowParams,
+  parseMatchStartParams,
+  completeSubFlow,
+  failSubFlow,
+  rejectSubFlow,
+  validateSignResult,
+  unsupportedTransactionData,
+} from "./signflow.js";
+export type { TransactionDataCapability, MatchStartParams, MatchResult, FlowNotifier } from "./signflow.js";
+
+// select_credentials consent action (profile 3.2.3.1)
+export {
+  ActionParamsError,
+  validateSelectCredentialsParams,
+  buildSelectCredentials,
+  newSelectionHandle,
+  isSelectionHandle,
+  isQueryId,
+} from "./consent.js";
+export type { SelectCredentialsContext } from "./consent.js";
 
 // Evidence (ERDS)
 export { EvidenceEvent, EventReasonCode } from "./evidence.js";

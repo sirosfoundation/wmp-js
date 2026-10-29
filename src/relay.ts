@@ -8,7 +8,8 @@
  */
 
 import type { Metadata } from "./types.js";
-import { Method, ErrorCode } from "./types.js";
+import { Method, ErrorCode, VERSION } from "./types.js";
+import { parseVersion } from "./version.js";
 import type { MethodHandler } from "./profile.js";
 import { WMPError } from "./jsonrpc.js";
 import type { RelayRegisterParams, RelayRegisterResult } from "./types.js";
@@ -95,7 +96,8 @@ export class Relay implements MethodHandler {
     });
 
     const result: RelayRegisterResult = {
-      wmp: { version: "0.1" },
+      // The version of the session the request came in on (answered in kind), else the default.
+      wmp: { version: parseVersion(p.wmp.version) ? p.wmp.version : VERSION },
       registered: true,
       ttl: Math.floor(this.registrationTTL / 1000),
     };

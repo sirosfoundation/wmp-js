@@ -27,6 +27,30 @@ export interface PeerContext {
 
   /** Send a JSON-RPC request and wait for the response. */
   call<T = unknown>(method: string, params: unknown): Promise<T>;
+
+  /**
+   * Optional: run `fn` after the response to the wmp.flow.start currently being
+   * handled was sent. Call it synchronously from `startFlow`. Nothing runs if
+   * that start is answered with an error, and a start that fails discards only
+   * its own continuations. Lets a profile send a notification for a flow that
+   * must not reach the peer before the start's response.
+   */
+  afterResponse?(fn: () => void): void;
+
+  /**
+   * Optional: an opaque token for the flow `flowId` as it is NOW (undefined if the
+   * peer holds no active flow by that id). It changes when the flow ends and the
+   * id is started again, so work queued for one flow can tell it is stale.
+   */
+  flowGeneration?(flowId: string): object | undefined;
+
+  /**
+   * Optional: like `notify`, for a flow notification (wmp.flow.complete/error)
+   * on behalf of the flow generation `generation` (from {@link flowGeneration}).
+   * Rejects without sending when that generation is no longer the flow's, and
+   * retires the flow after the send only if it still is.
+   */
+  notifyFlow?(generation: object | undefined, method: string, params: unknown): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -57,6 +81,26 @@ export interface FlowHandler {
   handleProgress(params: FlowProgressParams): void;
   handleComplete(params: FlowCompleteParams): void;
   handleError(params: FlowErrorParams): void;
+
+  /**
+   * Optional: refuse a wmp.flow.action for a flow this handler started BEFORE any
+   * handler sees it (the Peer calls it for a recorded flow of one of this
+   * handler's flow types, whatever handler goes on to answer the action, and
+   * before any generic schema validation). `flowType` is the type the Peer
+   * recorded for the flow when it started: authoritative, whoever started it.
+   * Throw a WMPError to refuse; the error is the response, with no member of the
+   * refused params echoed.
+   */
+  validateAction?(params: FlowActionParams, flowType: string): void;
+
+  /**
+   * Optional (go-wmp CapabilityRequirer): the capability that MUST have been
+   * negotiated before a flow of `flowType` may start (Core 6.5, 10.3), or ""
+   * for none. A Peer refuses wmp.flow.start for a flow type whose capability is
+   * not negotiated with -31005 {"unsupported": flowType, "capability": cap}
+   * before startFlow is called. A handler that does not implement it is not gated.
+   */
+  requiredCapability?(flowType: string): string;
 }
 
 // ---------------------------------------------------------------------------
