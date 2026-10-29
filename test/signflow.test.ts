@@ -1164,3 +1164,43 @@ describe("the closed-set refusal does not depend on how the flow started or on a
     void H;
   });
 });
+
+describe("a malformed action envelope is not let through (round 11)", () => {
+  const bad = { consent: true, selections: [{ credential_id: "SECRET-CRED", disclosed_claims: ["x"] }] };
+  it("without wmp, with a non-string wmp.version, or without an action, for a recorded oid4vp flow: -32602 and no handler", async () => {
+    const mk = async () => {
+      const t = new MockTransport();
+      const onFlowAction = vi.fn(async (p: { wmp: never; flow_id: string; action: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, action: p.action, status: "accepted" }));
+      const peer = new Peer(t, { handler: { onFlowAction: onFlowAction as never } });
+      peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] } }));
+      void peer.startFlow("oid4vp", "vp-1", {}).catch(() => {});
+      await settle();
+      t.sent.length = 0;
+      return { t, onFlowAction };
+    };
+    const variants: Record<string, unknown>[] = [
+      { flow_id: "vp-1", action: "select_credentials", params: bad },
+      { wmp: {}, flow_id: "vp-1", action: "select_credentials", params: bad },
+      { wmp: { version: 1 }, flow_id: "vp-1", action: "select_credentials", params: bad },
+      { wmp: { version: "0.1" }, flow_id: "vp-1", params: bad },
+      { wmp: { version: "0.1" }, flow_id: "vp-1", action: 5, params: bad },
+    ];
+    for (const params of variants) {
+      const { t, onFlowAction } = await mk();
+      t.receive({ jsonrpc: "2.0", id: "a", method: "wmp.flow.action", params } as never);
+      await settle(40);
+      expect((t.sent[0] as Response).error?.code, JSON.stringify(params)).toBe(-32602);
+      expect(onFlowAction, JSON.stringify(params)).not.toHaveBeenCalled();
+      expect(JSON.stringify(t.sent)).not.toContain("SECRET");
+    }
+  });
+
+  it("an action for a flow no profile judges keeps its old path (a missing wmp is the handler's business)", async () => {
+    const t = new MockTransport();
+    const onFlowAction = vi.fn(async (p: { wmp: never; flow_id: string; action: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, action: p.action, status: "accepted" }));
+    new Peer(t, { handler: { onFlowAction: onFlowAction as never } });
+    t.receive({ jsonrpc: "2.0", id: "a", method: "wmp.flow.action", params: { flow_id: "other", action: "cancel" } } as never);
+    await settle(40);
+    expect(onFlowAction).toHaveBeenCalledTimes(1);
+  });
+});

@@ -941,10 +941,18 @@ export class Peer implements PeerContext {
     // handler (select_credentials is a closed set, profile 3.2.3.1): the refusal
     // must not depend on an optional schema validator accepting the message first.
     // The envelope is checked, and the flow type is the one recorded at start.
-    if (method === Method.FlowAction && isFlowActionEnvelope(params)) {
-      const recorded = this.recordedFlows.get(params.flow_id);
+    if (method === Method.FlowAction) {
+      const fid = flowIdOf(params);
+      const recorded = typeof fid === "string" ? this.recordedFlows.get(fid) : undefined;
       const validating = recorded ? this.registry.getFlowHandler(recorded.type) : undefined;
-      validating?.validateAction?.(params, recorded!.type);
+      if (validating?.validateAction) {
+        // A malformed envelope for a flow whose profile judges its actions is not
+        // let through to the handlers: it cannot be judged, so it is refused.
+        if (!isFlowActionEnvelope(params)) {
+          throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "malformed flow.action envelope" });
+        }
+        validating.validateAction(params, recorded!.type);
+      }
     }
 
     // A completion that breaks the result rules is refused before the generic
