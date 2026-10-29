@@ -29,6 +29,7 @@ import type {
 import { WMPError } from "./jsonrpc.js";
 import { unsupportedError } from "./errors.js";
 import { dcqlQueryIds, validateMatchResult } from "./completion.js";
+import { ActionParamsError, validateSelectCredentialsParams } from "./consent.js";
 import {
   CAPABILITY_TRANSACTION_DATA,
   SignFlow,
@@ -820,6 +821,34 @@ export class OpenID4xProfile
       result = { satisfiable: false, code: "error" };
     }
     await completeSubFlow(peer, start.wmp, start.flow_id, result, (r) => validateMatchResult(r, dcqlQueryIds(mp.dcql_query)));
+  }
+
+  /**
+   * select_credentials for an oid4vp flow is a closed set (profile 3.2.3.1): a
+   * member outside it (a credential id, claim names or values, ...) would hand
+   * the orchestrator data it must never receive, so the action is refused before
+   * any handler sees it. The response is -32602 with no data, the parent flow ends
+   * with a terminal wmp.flow.error -32602 (also without data), and nothing of the
+   * refused params is echoed.
+   */
+  validateAction(params: FlowActionParams): void {
+    if (params.action !== OID4Action.SelectCredentials || this.flowTypeMap.get(params.flow_id) !== OID4FlowType.OID4VP) return;
+    try {
+      validateSelectCredentialsParams(params.params);
+    } catch (err) {
+      if (!(err instanceof ActionParamsError)) throw err;
+      this.flowTypeMap.delete(params.flow_id);
+      if (this.peer) {
+        const flowId = params.flow_id;
+        const bound = boundNotifier(this.peer, flowId);
+        void bound
+          .notify(Method.FlowError, { wmp: { version: params.wmp?.version ?? VERSION, ...(params.wmp?.session_id ? { session_id: params.wmp.session_id } : {}) }, flow_id: flowId, code: ErrorCode.InvalidParams, message: "Invalid params" })
+          .catch(() => {
+            /* the terminal could not be sent: the refusal response still goes out */
+          });
+      }
+      throw new WMPError(ErrorCode.InvalidParams, "Invalid params");
+    }
   }
 
   async handleAction(params: FlowActionParams): Promise<FlowActionResult> {

@@ -984,3 +984,99 @@ describe("error results in encrypted response modes (round 5)", () => {
     expect(t.sent[1]).toMatchObject({ method: "wmp.flow.complete", params: { result: { error: { code: "access_denied" } } } });
   });
 });
+
+describe("select_credentials is refused before any handler sees it (round 9)", () => {
+  const H = "Zm9yLXRoZS13YWxsZXQtb25seQ";
+  async function orchestrator() {
+    const t = new MockTransport();
+    const onFlowAction = vi.fn(async (p: { wmp: never; flow_id: string; action: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, action: p.action, status: "accepted" }));
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: { oid4vp: {} }, security: { mode: "tls" } }),
+        onFlowAction: onFlowAction as never,
+      },
+    });
+    peer.use(new OpenID4xProfile({ oid4vp: { supported_response_modes: [], supported_formats: [] } }));
+    t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: "s", method: "wmp.flow.start", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: "oid4vp", flow_id: "vp-1", params: { request_uri: "openid4vp://x" } } });
+    await settle();
+    t.sent.length = 0;
+    return { t, peer, onFlowAction };
+  }
+  const action = (id: string, params: unknown) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.action", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_id: "vp-1", action: "select_credentials", params } });
+
+  it("a member outside the closed set is refused: -32602 without data, a terminal -32602, the handler never called", async () => {
+    for (const bad of [
+      { consent: true, selections: [{ credential_id: "SECRET-CRED", disclosed_claims: ["family_name"] }] },
+      { consent: true, selections: [{ query_id: "pid", selection_handle: H, vct: "urn:eudi:pid:1" }] },
+      { consent: true, selections: [{ query_id: "pid", selection_handle: H }], credentials: [] },
+      { consent: false, selections: [{ query_id: "pid", selection_handle: H }] },
+      { consent: "yes" },
+    ]) {
+      const { t, onFlowAction } = await orchestrator();
+      t.receive(action("a1", bad));
+      await settle(40);
+      const resp = t.sent.find((m) => (m as { id?: string }).id === "a1") as Response;
+      expect(resp.error).toEqual({ code: -32602, message: "Invalid params" }); // no data
+      expect(JSON.stringify(t.sent)).not.toContain("SECRET");
+      expect(onFlowAction).not.toHaveBeenCalled();
+      const terminal = t.sent.find((m) => (m as { method?: string }).method === "wmp.flow.error") as { params: { flow_id: string; code: number; message: string; data?: unknown } };
+      expect(terminal.params).toMatchObject({ flow_id: "vp-1", code: -32602, message: "Invalid params" });
+      expect(terminal.params.data).toBeUndefined();
+    }
+  });
+
+  it("a conforming action reaches the handler; the flow stays active", async () => {
+    const { t, onFlowAction } = await orchestrator();
+    t.receive(action("a1", { consent: true, selections: [{ query_id: "pid", selection_handle: H }] }));
+    await settle(40);
+    expect(onFlowAction).toHaveBeenCalledTimes(1);
+    expect((t.sent.find((m) => (m as { id?: string }).id === "a1") as Response).error).toBeUndefined();
+    expect(t.sent.some((m) => (m as { method?: string }).method === "wmp.flow.error")).toBe(false);
+    t.receive(action("a2", { consent: false }));
+    await settle(40);
+    expect(onFlowAction).toHaveBeenCalledTimes(2);
+  });
+
+  it("other actions and other flow types are not judged", async () => {
+    const { t, onFlowAction } = await orchestrator();
+    t.receive({ jsonrpc: "2.0", id: "x", method: "wmp.flow.action", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_id: "vp-1", action: "cancel", params: { reason: "free text is fine here" } } });
+    await settle(40);
+    expect(onFlowAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("after a refusal the flow is gone: its id can start again", async () => {
+    const { t } = await orchestrator();
+    t.receive(action("a1", { consent: true, selections: [{ credential_id: "c" }] }));
+    await settle(40);
+    t.sent.length = 0;
+    t.receive({ jsonrpc: "2.0", id: "s2", method: "wmp.flow.start", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: "oid4vp", flow_id: "vp-1", params: { request_uri: "openid4vp://x" } } });
+    await settle();
+    expect((t.sent[0] as Response).error).toBeUndefined();
+  });
+});
+
+describe("locally ended flows join the history, and a presentation must be a real value (round 9)", () => {
+  it("peer.flowComplete / notifyFlow mark the flow as ended (bounded history, duplicate suppression)", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowComplete: vi.fn() } });
+    const seen = (peer as unknown as { terminalSeen: Map<string, string> }).terminalSeen;
+    t.receive({ jsonrpc: "2.0", id: "a", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f1", params: {} } });
+    await settle();
+    await peer.flowComplete("f1", {});
+    expect(seen.get("f1")).toBe("ended");
+    t.receive({ jsonrpc: "2.0", id: "b", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f2", params: {} } });
+    await settle();
+    await peer.notifyFlow(peer.flowGeneration("f2"), "wmp.flow.complete", { wmp: { version: "0.1" }, flow_id: "f2", result: {} });
+    expect(seen.get("f2")).toBe("ended");
+  });
+
+  it("vp_token and error must be strings, arrays or objects that are not empty (no booleans or numbers)", () => {
+    for (const bad of [false, true, 0, 1, undefined, null, "", [], {}]) {
+      expect(() => validateSignResult("sign_presentation", { vp_token: bad }, "direct_post"), `vp_token ${JSON.stringify(bad)}`).toThrow(CompletionResultError);
+      expect(() => validateSignResult("sign_presentation", { error: bad }, "direct_post"), `error ${JSON.stringify(bad)}`).toThrow(CompletionResultError);
+    }
+    expect(() => validateSignResult("sign_presentation", { vp_token: { pid: ["x"] } }, "direct_post")).not.toThrow();
+  });
+});

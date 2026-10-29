@@ -432,7 +432,7 @@ export class Peer implements PeerContext {
     }
     // This peer ended the flow (complete or error, sent by the convenience
     // methods and by profiles alike): its validation context is no longer needed.
-    if (method === Method.FlowComplete || method === Method.FlowError) this.releaseFlow(flowIdOf(params));
+    if (method === Method.FlowComplete || method === Method.FlowError) this.endFlow(flowIdOf(params));
   }
 
   /** PeerContext: the generation token of an active flow (see {@link PeerContext.flowGeneration}). */
@@ -455,7 +455,7 @@ export class Peer implements PeerContext {
     }
     await this.transport.send(createNotification(method, params));
     // Retire the flow only if it is still the generation that sent this.
-    if (this.recordedFlows.get(id) === generation) this.recordedFlows.delete(id);
+    if (this.recordedFlows.get(id) === generation) this.endFlow(id);
   }
 
   /** Drops the validation context of a flow that ended; the flow_id is free to start again. */
@@ -1143,6 +1143,11 @@ export class Peer implements PeerContext {
       }
 
       case Method.FlowAction: {
+        // A profile may refuse an action for one of its flows before any handler
+        // sees it (select_credentials is a closed set, profile 3.2.3.1).
+        const recorded = typeof p?.flow_id === "string" ? this.recordedFlows.get(p.flow_id) : undefined;
+        const validating = recorded ? this.registry.getFlowHandler(recorded.type) : undefined;
+        validating?.validateAction?.(p);
         const fh = this.flowHandlerForId(p.flow_id);
         if (fh) return fh.handleAction(p);
         if (this.handler.onFlowAction) return this.handler.onFlowAction(p);

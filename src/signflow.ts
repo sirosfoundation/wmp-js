@@ -335,13 +335,13 @@ function meta(wmp: Metadata): Metadata {
   return { version: wmp.version || VERSION, ...(wmp.session_id ? { session_id: wmp.session_id } : {}) };
 }
 
-/** A member that is really there: not undefined/null (which JSON drops or nulls) and not empty. */
+/** A member that is really there: a non-empty string, array or object. */
 function present(v: unknown): boolean {
-  if (v === undefined || v === null) return false;
   if (typeof v === "string") return v !== "";
   if (Array.isArray(v)) return v.length > 0;
-  if (typeof v === "object") return Object.keys(v as object).length > 0;
-  return true;
+  // Only a non-empty object: undefined and null (dropped or nulled by JSON), booleans
+  // and numbers are not a presentation or an error report.
+  return typeof v === "object" && v !== null && Object.keys(v).length > 0;
 }
 
 /** Response modes in which the wallet encrypts the response (profile 7.7). */

@@ -83,6 +83,15 @@ export interface FlowHandler {
   handleError(params: FlowErrorParams): void;
 
   /**
+   * Optional: refuse a wmp.flow.action for a flow this handler started BEFORE any
+   * handler sees it (the Peer calls it for a recorded flow of one of this
+   * handler's flow types, whatever handler goes on to answer the action). Throw a
+   * WMPError to refuse; the error is the response, with no member of the refused
+   * params echoed.
+   */
+  validateAction?(params: FlowActionParams): void;
+
+  /**
    * Optional (go-wmp CapabilityRequirer): the capability that MUST have been
    * negotiated before a flow of `flowType` may start (Core 6.5, 10.3), or ""
    * for none. A Peer refuses wmp.flow.start for a flow type whose capability is
