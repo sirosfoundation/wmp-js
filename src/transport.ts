@@ -198,6 +198,8 @@ export class HttpSseTransport extends Emitter implements Transport {
   private seenIds = new Set<string>();
   private dedupeWindow: number;
   private pendingGap = false;
+  /** The event stream was open when the session ended: reopen it for the next session once bound. */
+  private reopenOnBind = false;
 
   constructor(
     rpcUrl: string,
@@ -237,14 +239,24 @@ export class HttpSseTransport extends Emitter implements Transport {
    * - `session_id` query parameter on SSE connections
    */
   setSessionId(sessionId: string): void {
+    let reopen = this.reopenOnBind;
     if (this.sessionId !== undefined && this.sessionId !== sessionId) {
       // Event IDs are unique only within a session: another session's cursor
       // would draw a 410 and its seen IDs could swallow this session's events.
+      // The stream belongs to the old session: it is closed (so it can no longer
+      // deliver into the new one) and, if it was open, reopened for the new one.
+      reopen = reopen || this.eventSource !== null;
+      this.eventSource?.close();
+      this.eventSource = null;
       this.cursor = undefined;
       this.seenIds.clear();
       this.pendingGap = false;
     }
     this.sessionId = sessionId;
+    if (reopen && !this.closed && this.eventSource === null) {
+      this.reopenOnBind = false;
+      this.openStream(this.cursor);
+    }
   }
 
   /**
@@ -253,6 +265,8 @@ export class HttpSseTransport extends Emitter implements Transport {
    * or seen ids).
    */
   clearSession(): void {
+    // If a stream was open it is reopened when the next session is bound.
+    this.reopenOnBind = this.reopenOnBind || this.eventSource !== null;
     this.sessionId = undefined;
     this.cursor = undefined;
     this.seenIds.clear();
@@ -321,8 +335,13 @@ export class HttpSseTransport extends Emitter implements Transport {
     const init = Object.keys(headers).length > 0 ? ({ headers } as EventSourceInit) : undefined;
     const es = new this.EventSourceCtor(this.streamUrl(cursor), init);
     this.eventSource = es;
+    // The session this stream belongs to: once it is no longer the bound one (or
+    // the stream was replaced or closed) nothing it delivers may touch the
+    // cursor, the seen ids or the application.
+    const session = this.sessionId;
 
     es.onopen = () => {
+      if (this.eventSource !== es) return;
       this.emit("open");
       if (this.pendingGap) {
         this.pendingGap = false;
@@ -341,9 +360,9 @@ export class HttpSseTransport extends Emitter implements Transport {
     };
 
     // WMP events use the "wmp" event type per the spec.
-    es.addEventListener("wmp", (ev) => this.onSseEvent(ev as MessageEvent));
+    es.addEventListener("wmp", (ev) => this.onSseEvent(ev as MessageEvent, es, session));
     // Also handle default "message" events for compatibility.
-    es.onmessage = (ev) => this.onSseEvent(ev);
+    es.onmessage = (ev) => this.onSseEvent(ev, es, session);
   }
 
   /**
@@ -351,7 +370,9 @@ export class HttpSseTransport extends Emitter implements Transport {
    * after a reconnect) is dropped; otherwise it is delivered and then its ID
    * becomes the cursor (Transport Section 4.3.2).
    */
-  private onSseEvent(ev: MessageEvent): void {
+  private onSseEvent(ev: MessageEvent, source: EventSource, session: string | undefined): void {
+    const current = () => this.eventSource === source && this.sessionId === session;
+    if (!current()) return; // a stale stream or session
     const id = typeof ev.lastEventId === "string" && ev.lastEventId !== "" ? ev.lastEventId : undefined;
     if (id !== undefined && this.seenIds.has(id)) return;
     try {
@@ -359,7 +380,9 @@ export class HttpSseTransport extends Emitter implements Transport {
     } catch (err) {
       this.emit("error", err instanceof Error ? err : new Error(String(err)));
     } finally {
-      if (id !== undefined) this.recordEventId(id);
+      // Handling the message may have ended the session (a session.close event):
+      // its id must not become the next session's cursor.
+      if (id !== undefined && current()) this.recordEventId(id);
     }
   }
 

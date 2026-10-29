@@ -385,8 +385,9 @@ describe("switching sessions resets replay state", () => {
     expect(t.lastEventId).toBe("1");
     t.setSessionId("ses-B");
     expect(t.lastEventId).toBeUndefined();
-    t.reconnectSSE();
-    expect(made[1].url).toBe("http://x/events?session_id=ses-B"); // no cursor from A
+    // the open stream moved to the new session on its own, without A's cursor
+    expect(made).toHaveLength(2);
+    expect(made[1].url).toBe("http://x/events?session_id=ses-B");
     made[1].fire("1", msg); // the same id in session B is a new event
     expect(got).toHaveLength(2);
   });
@@ -1275,5 +1276,150 @@ describe("housekeeping (round 9)", () => {
     t.connectSSE();
     made[1].fire("1"); // the same id in a new session is a new event (no stale seen ids)
     expect(t.lastEventId).toBe("1");
+  });
+});
+
+describe("stale streams and session ends (round 10)", () => {
+  const settle10 = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  const msg = JSON.stringify({ jsonrpc: "2.0", method: "wmp.flow.progress", params: { wmp: { version: "0.1" }, flow_id: "f", step: "1" } });
+  function fake() {
+    const made: { url: string; closed: boolean; fire(id: string, data?: string): void }[] = [];
+    class Fake {
+      readyState = 1;
+      closed = false;
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onmessage = null;
+      private l: ((ev: MessageEvent) => void)[] = [];
+      constructor(public url: string) {
+        made.push(this);
+      }
+      addEventListener(_t: string, fn: (ev: MessageEvent) => void) {
+        this.l.push(fn);
+      }
+      fire(id: string, data = msg) {
+        this.l.forEach((fn) => fn({ data, lastEventId: id } as MessageEvent));
+      }
+      close() {
+        this.closed = true;
+      }
+    }
+    return { made, Ctor: Fake as unknown as typeof EventSource };
+  }
+
+  it("events of session A's stream arriving after session B was bound are ignored and do not touch B's replay state", () => {
+    const { made, Ctor } = fake();
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Ctor });
+    const got: Message[] = [];
+    t.on("message", (m) => got.push(m));
+    t.setSessionId("ses-A");
+    t.connectSSE();
+    t.setSessionId("ses-B"); // A's stream is closed and B's opened
+    expect(made[0].closed).toBe(true);
+    made[0].fire("a1"); // a late event from A's stream
+    expect(got).toHaveLength(0);
+    expect(t.lastEventId).toBeUndefined();
+    made[1].fire("b1");
+    expect(got).toHaveLength(1);
+    expect(t.lastEventId).toBe("b1");
+  });
+
+  it("clearSession closes the stream and the next bound session reopens it, clean", () => {
+    const { made, Ctor } = fake();
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Ctor });
+    t.setSessionId("ses-A");
+    t.connectSSE();
+    made[0].fire("1");
+    t.clearSession();
+    expect(made[0].closed).toBe(true);
+    expect(made).toHaveLength(1);
+    t.setSessionId("ses-B"); // the next session: the stream comes back by itself
+    expect(made).toHaveLength(2);
+    expect(made[1].url).toBe("http://x/events?session_id=ses-B");
+    expect(t.lastEventId).toBeUndefined();
+  });
+
+  it("a transport that never streamed does not start streaming when a session is bound", () => {
+    const { made, Ctor } = fake();
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Ctor });
+    t.setSessionId("ses-A");
+    t.setSessionId("ses-B");
+    t.clearSession();
+    t.setSessionId("ses-C");
+    expect(made).toHaveLength(0);
+  });
+
+  it("a session.close handled synchronously while its event is delivered does not leave its id as the next session's cursor", () => {
+    const { made, Ctor } = fake();
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Ctor });
+    t.setSessionId("ses-A");
+    t.on("message", () => t.clearSession()); // the application ends the session in response to the message
+    t.connectSSE();
+    made[0].fire("close-evt");
+    expect(t.lastEventId).toBeUndefined();
+    t.setSessionId("ses-B");
+    expect(made[1].url).toBe("http://x/events?session_id=ses-B"); // no inherited cursor
+  });
+
+  it("the Peer drops the transport's binding before it reports a lost session, so the fallback create works", async () => {
+    for (const mode of ["no-token", "resume-failed"] as const) {
+      const t = new MockTransport() as MockTransport & { clearSession?: () => void; setSessionId?: (id: string) => void };
+      let bound: string | undefined;
+      t.setSessionId = (id) => (bound = id);
+      t.clearSession = () => (bound = undefined);
+      const boundWhenLost: (string | undefined)[] = [];
+      const peer = new Peer(t, { onSessionLost: () => boundWhenLost.push(bound) });
+      const p = peer.createSession({});
+      await settle10();
+      t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" }, ...(mode === "no-token" ? {} : { resumption_token: "rt" }) } });
+      await p;
+      expect(bound).toBe("ses-1");
+      t.emitEvent("gap");
+      await settle10();
+      if (mode === "resume-failed") {
+        t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, error: { code: -31001, message: "expired" } });
+        await settle10(30);
+      }
+      expect(boundWhenLost, mode).toEqual([undefined]); // already cleared when the application hears of it
+    }
+  });
+});
+
+describe("overlapping cancellations of one flow id (round 10)", () => {
+  const settle10 = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  const cancel = (flow: string, id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: flow } });
+  const startF = (id: string, flow: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: flow, params: {} } });
+  const complete = (flow: string) => ({ jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: flow, result: { credentials: [] } } });
+
+  it("an older pending cancellation keeps the generation entry while a replacement's own cancellation comes and goes", async () => {
+    const t = new MockTransport();
+    let releaseOld!: () => void;
+    const gateOld = new Promise<void>((r) => (releaseOld = r));
+    let call = 0;
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => {
+      const mine = ++call;
+      if (mine === 1) {
+        await gateOld; // the old one, still running
+        return { wmp: p.wmp, flow_id: p.flow_id, status: "old" };
+      }
+      if (mine === 2) throw new WMPError(ErrorCode.FlowError, "replacement cancel fails");
+      return { wmp: p.wmp, flow_id: p.flow_id, status: "later" };
+    });
+    new Peer(t, { handler: { onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }), onFlowCancel, onFlowComplete: vi.fn() } });
+    t.receive(cancel("f", "c1")); // no flow yet: gen 0, pending
+    await settle10();
+    t.receive(startF("s", "f")); // a flow starts under the id
+    await settle10();
+    t.receive(cancel("f", "c2")); // the replacement's cancellation overwrites the map entry and fails
+    await settle10();
+    t.receive(complete("f")); // the replacement ends: its generation would be reclaimed
+    await settle10();
+    releaseOld(); // the old cancellation finishes now; it must not mark the replacement cancelled
+    await settle10();
+    t.sent.length = 0;
+    t.receive(cancel("f", "c3")); // a legitimate first cancel of the ended flow
+    await settle10();
+    expect(onFlowCancel).toHaveBeenCalledTimes(3); // reached the handler
+    expect((t.sent[0] as { result: { status: string } }).result.status).toBe("later");
   });
 });

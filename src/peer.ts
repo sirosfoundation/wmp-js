@@ -260,10 +260,8 @@ export class Peer implements PeerContext {
     this.negotiated = undefined;
     this.capRev++;
     this.resetFlows();
-    // The transport is no longer bound to the session that ended (no stale
-    // Wmp-Session-Id, cursor or event stream for the next one).
-    const t = this.transport as { clearSession?: () => void };
-    if (typeof t.clearSession === "function") t.clearSession();
+    // The transport is no longer bound to the session that ended.
+    this.clearTransportBinding();
   }
 
   /**
@@ -431,7 +429,7 @@ export class Peer implements PeerContext {
    * session. A missing entry reads as generation 0.
    */
   private releaseGen(flowId: string): void {
-    if (!this.recordedFlows.has(flowId) && !this.cancelling.has(flowId)) this.flowGen.delete(flowId);
+    if (!this.recordedFlows.has(flowId) && (this.cancelCount.get(flowId) ?? 0) === 0) this.flowGen.delete(flowId);
   }
 
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
@@ -1123,6 +1121,7 @@ export class Peer implements PeerContext {
             const pending = this.cancelling.get(flowId);
             if (pending && pending.epoch === epoch && pending.gen === gen) return pending.run;
             const entry: { epoch: number; gen: number; run: Promise<unknown> } = { epoch, gen, run: undefined as unknown as Promise<unknown> };
+            this.cancelCount.set(flowId, (this.cancelCount.get(flowId) ?? 0) + 1);
             entry.run = (async () => {
               // Yield first: the entry is installed before the handler can throw
               // (even synchronously), so its cleanup always sees it.
@@ -1134,10 +1133,11 @@ export class Peer implements PeerContext {
                 if (this.flowEpoch === epoch && (this.flowGen.get(flowId) ?? 0) === gen) this.endFlow(flowId, "cancelled");
                 return result;
               } finally {
-                if (this.cancelling.get(flowId) === entry) {
-                  this.cancelling.delete(flowId); // a failure leaves a retry possible
-                  this.releaseGen(flowId);
-                }
+                if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
+                const left = (this.cancelCount.get(flowId) ?? 1) - 1;
+                if (left <= 0) this.cancelCount.delete(flowId);
+                else this.cancelCount.set(flowId, left);
+                this.releaseGen(flowId);
               }
             })();
             this.cancelling.set(flowId, entry);
@@ -1210,6 +1210,7 @@ export class Peer implements PeerContext {
     this.terminalSeen.clear();
     this.flowGen.clear();
     this.cancelling.clear(); // pending cancellations belong to the old session
+    this.cancelCount.clear();
   }
 
   /**
@@ -1301,6 +1302,9 @@ export class Peer implements PeerContext {
    */
   private cancelling = new Map<string, { epoch: number; gen: number; run: Promise<unknown> }>();
 
+  /** Cancellations still running per flow id, of ANY generation: a generation entry is kept while one is. */
+  private cancelCount = new Map<string, number>();
+
   /** Incremented whenever the flow state is reset (session closed or replaced). */
   private flowEpoch = 0;
 
@@ -1370,7 +1374,7 @@ export class Peer implements PeerContext {
       if (this.recoveryQueuedEpoch === epoch) this.recoveryQueuedEpoch = undefined;
       if (this.closed || this.flowEpoch !== epoch || this.lifecycle !== gen) return;
       if (!this.sessionId || !this.resumptionToken) {
-        this.onSessionLost?.(new Error("event gap and no resumption token to resume with"));
+        this.sessionLost(new Error("event gap and no resumption token to resume with"));
         return;
       }
       try {
@@ -1378,9 +1382,25 @@ export class Peer implements PeerContext {
       } catch (err: unknown) {
         // The session changed (or the peer closed) while resuming: nothing was lost.
         if (err instanceof StaleSessionError || this.closed || this.flowEpoch !== epoch || this.lifecycle !== gen) return;
-        this.onSessionLost?.(err instanceof Error ? err : new Error(String(err)));
+        this.sessionLost(err instanceof Error ? err : new Error(String(err)));
       }
     });
+  }
+
+  /**
+   * The session cannot be continued: the transport's binding to it is dropped
+   * BEFORE the application is told, so the "create a new session" fallback the
+   * callback is for does not send the dead session's id.
+   */
+  private sessionLost(err: Error): void {
+    this.clearTransportBinding();
+    this.onSessionLost?.(err);
+  }
+
+  /** The transport is no longer bound to a session (no stale Wmp-Session-Id, cursor or event stream). */
+  private clearTransportBinding(): void {
+    const t = this.transport as { clearSession?: () => void };
+    if (typeof t.clearSession === "function") t.clearSession();
   }
 
   private recovery: Promise<void> = Promise.resolve();
