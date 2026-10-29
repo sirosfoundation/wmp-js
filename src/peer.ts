@@ -1534,6 +1534,15 @@ export class Peer implements PeerContext {
     // or replaced meanwhile is discarded, never applied to the one that replaced it.
     const epoch = this.flowEpoch;
     const gen = this.lifecycle;
+    // Events were lost, and one of them may have been a capability revocation: the
+    // CURRENT session's grant is withdrawn right now (gated flows fail closed), not
+    // when its recovery gets its turn behind another session's pending resume. It
+    // stays withdrawn until the resume answer or a fresh capability.list restores it.
+    let mark: number | undefined;
+    if (this.negotiated) {
+      this.negotiated.capabilities = {};
+      mark = ++this.capRev;
+    }
     if (this.recoveryQueuedEpoch === epoch) return; // coalesce only with a queued recovery of THIS session
     this.recoveryQueuedEpoch = epoch;
     this.recovery = this.recovery.then(async () => {
@@ -1543,14 +1552,6 @@ export class Peer implements PeerContext {
       if (!this.sessionId || !this.resumptionToken) {
         this.sessionLost(new Error("event gap and no resumption token to resume with"));
         return;
-      }
-      // Events were lost, and one of them may have been a capability revocation:
-      // the grant is withdrawn (gated flows fail closed) until the resume answer
-      // or a fresh capability.list restores it.
-      let mark: number | undefined;
-      if (this.negotiated) {
-        this.negotiated.capabilities = {};
-        mark = ++this.capRev;
       }
       try {
         await this.resumeSerialized(undefined, epoch, gen);

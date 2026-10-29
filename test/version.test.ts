@@ -2099,6 +2099,18 @@ describe("session ordering and resume hygiene (round 12)", () => {
     expect((t.sent[0] as Response).error?.code).toBe(-31005);
   });
 
+  it("a gap withdraws the grant at once, even while another resume holds the recovery chain", async () => {
+    const { t, peer } = await mkClient();
+    const pending = peer.resumeSession(); // unanswered: the recovery of the gap queues behind it
+    await settle();
+    t.emitEvent("gap");
+    t.sent.length = 0;
+    t.receive({ jsonrpc: "2.0", id: "f", method: "wmp.flow.start", params: { wmp: { version: "0.1", session_id: "ses-1" }, flow_type: "oid4vci", flow_id: "flow-1", params: {} } });
+    await settle();
+    expect((t.sent[0] as Response).error?.code).toBe(-31005);
+    void pending.catch(() => undefined);
+  });
+
   it("an incoming create that arrived first cannot win because its authorization was slow", async () => {
     const t = new MockTransport();
     const gates: Array<() => void> = [];
