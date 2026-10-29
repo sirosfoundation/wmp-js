@@ -194,9 +194,21 @@ export class Peer implements PeerContext {
    */
   private capRev = 0;
 
-  /** Orders overlapping createSession() calls: the newest request wins whatever order the answers arrive in. */
-  private createSeq = 0;
-  private installedCreateSeq = 0;
+  /**
+   * Orders session establishment. Every outgoing create takes a number when it is
+   * issued; every installation (an outgoing create's answer, an incoming create or
+   * resume, a resume's answer) raises `installedSeq` to at least the numbers issued
+   * so far. An outgoing create's answer is installed only if its number is above
+   * `installedSeq`: the newest request wins whatever order answers arrive in, and
+   * an answer issued before another session was installed is stale.
+   */
+  private sessionSeq = 0;
+  private installedSeq = 0;
+
+  /** Sequence of incoming capability handlers (by start): the latest-started one is authoritative. */
+  private incCapSeq = 0;
+  private appliedIncCapSeq = 0;
+  private grantRefreshing = false;
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -248,6 +260,10 @@ export class Peer implements PeerContext {
     this.negotiated = undefined;
     this.capRev++;
     this.resetFlows();
+    // The transport is no longer bound to the session that ended (no stale
+    // Wmp-Session-Id, cursor or event stream for the next one).
+    const t = this.transport as { clearSession?: () => void };
+    if (typeof t.clearSession === "function") t.clearSession();
   }
 
   /**
@@ -279,13 +295,52 @@ export class Peer implements PeerContext {
   private applySnapshot(n: { capabilities: Capabilities }, rev: number, snapshot: Capabilities): void {
     if (this.capRev === rev) {
       n.capabilities = { ...snapshot };
-    } else {
-      const kept: Capabilities = {};
-      for (const k of Object.keys(n.capabilities)) {
-        if (Object.prototype.hasOwnProperty.call(snapshot, k)) kept[k] = n.capabilities[k];
-      }
-      n.capabilities = kept;
+      this.capRev++;
+      return;
     }
+    const kept: Capabilities = {};
+    for (const k of Object.keys(n.capabilities)) {
+      if (Object.prototype.hasOwnProperty.call(snapshot, k)) kept[k] = n.capabilities[k];
+    }
+    n.capabilities = kept;
+    this.capRev++;
+    // The answer may have been older than what is cached, so it was only allowed to
+    // narrow: ask for a fresh snapshot, which restores any capability that is
+    // really granted. (If the peer cannot answer, the grant stays narrowed.)
+    this.scheduleGrantRefresh();
+  }
+
+  /** One fresh capability.list at a time; its answer is applied like any other (at the revision it was requested at). */
+  private scheduleGrantRefresh(): void {
+    const id = this.negotiated?.sessionId;
+    if (this.grantRefreshing || this.closed || id === undefined) return;
+    this.grantRefreshing = true;
+    void (async () => {
+      try {
+        await this.callNow(Method.CapabilityList, { wmp: { version: this.negotiatedVersion ?? VERSION, session_id: id } });
+      } catch {
+        /* no fresh snapshot: the narrowed grant stands (fail closed) */
+      } finally {
+        this.grantRefreshing = false;
+      }
+    })();
+  }
+
+  /**
+   * A result of an incoming capability handler. The handler is this peer's own
+   * authority over the grant, so the latest-STARTED one wins; an older one that
+   * finishes later is ignored.
+   */
+  private applyHandlerResult(gen: number, sessionId: string | undefined, seq: number, capabilities: unknown): void {
+    if (typeof capabilities !== "object" || capabilities === null || Array.isArray(capabilities)) return;
+    const n = this.negotiated;
+    if (!n || this.lifecycle !== gen) return;
+    if (sessionId !== undefined && n.sessionId !== undefined && sessionId !== n.sessionId) return;
+    // A handler that started before one that already decided has been overtaken:
+    // its result is ignored (not merged: the later decision may have granted more).
+    if (seq < this.appliedIncCapSeq) return;
+    this.appliedIncCapSeq = seq;
+    n.capabilities = { ...(capabilities as Capabilities) };
     this.capRev++;
   }
 
@@ -365,7 +420,16 @@ export class Peer implements PeerContext {
 
   async notify(method: string, params: unknown): Promise<void> {
     const msg = createNotification(method, params);
+    // A session close sent through the generic API ends the session exactly as
+    // closeSession() does; only the session that was closed has its state cleared.
+    const closing = method === Method.SessionClose;
+    const gen = this.lifecycle;
+    const closedId = closing ? (params as { wmp?: { session_id?: unknown } } | undefined)?.wmp?.session_id : undefined;
     await this.transport.send(msg);
+    if (closing && this.lifecycle === gen && (closedId === undefined || closedId === this.sessionId)) {
+      this.sessionId = undefined;
+      this.endSession();
+    }
     // This peer ended the flow (complete or error, sent by the convenience
     // methods and by profiles alike): its validation context is no longer needed.
     if (method === Method.FlowComplete || method === Method.FlowError) this.releaseFlow(flowIdOf(params));
@@ -396,10 +460,28 @@ export class Peer implements PeerContext {
 
   /** Drops the validation context of a flow that ended; the flow_id is free to start again. */
   private releaseFlow(flowId: unknown): void {
-    if (typeof flowId === "string") this.recordedFlows.delete(flowId);
+    if (typeof flowId !== "string") return;
+    this.recordedFlows.delete(flowId);
+    this.releaseGen(flowId);
+  }
+
+  /**
+   * Reclaims a flow id's generation once nothing needs it: the flow is not active
+   * and no cancellation for it is pending (a pending one compares against it).
+   * Without this every finished flow would leave an entry behind for the whole
+   * session. A missing entry reads as generation 0.
+   */
+  private releaseGen(flowId: string): void {
+    if (!this.recordedFlows.has(flowId) && !this.cancelling.has(flowId)) this.flowGen.delete(flowId);
   }
 
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
+    // Session create/resume through the generic API get the same validation and
+    // state installation as the convenience methods.
+    if (method === Method.SessionCreate) return this.createVia(params as SessionCreateParams) as Promise<T>;
+    if (method === Method.SessionResume) {
+      return this.resumeSerialized({ params: params as SessionResumeParams }, this.flowEpoch, this.lifecycle) as Promise<T>;
+    }
     return this.callNow<T>(method, params);
   }
 
@@ -464,10 +546,8 @@ export class Peer implements PeerContext {
     invitationNonce?: string;
   }): Promise<SessionCreateResult> {
     const offered = this.offeredVersion();
-    const seq = ++this.createSeq;
-    const wmp: Metadata = { version: offered, sender: opts.sender };
     const params: SessionCreateParams = {
-      wmp,
+      wmp: { version: offered, sender: opts.sender },
       participants: opts.participants,
       capabilities_offered: opts.capabilities,
       security: opts.security ?? { mode: "tls" },
@@ -475,10 +555,16 @@ export class Peer implements PeerContext {
       auth: opts.auth,
       invitation_nonce: opts.invitationNonce,
     };
-    const result = await this.call<SessionCreateResult>(
-      Method.SessionCreate,
-      params,
-    );
+    return this.createVia(params);
+  }
+
+  /** Sends a session.create and installs the answer (validated, ordered against other session changes). */
+  private async createVia(params: SessionCreateParams): Promise<SessionCreateResult> {
+    // The version the request offered (the generic API may send anything; the
+    // answer is then only held to "a version this peer speaks").
+    const offered = params?.wmp?.version;
+    const seq = ++this.sessionSeq;
+    const result = await this.callNow<SessionCreateResult>(Method.SessionCreate, params);
     const newId = Peer.usableId(result.wmp?.session_id);
     if (newId === undefined) {
       throw new WMPError(
@@ -486,21 +572,23 @@ export class Peer implements PeerContext {
         "session.create response missing session_id",
       );
     }
-    // Overlapping creates: the newest request wins whatever order the answers
-    // arrive in; an older answer arriving after a newer one was installed is stale.
-    if (seq < this.installedCreateSeq) throw new StaleSessionError();
+    // The newest request wins whatever order answers arrive in, and an answer
+    // issued before another session was installed (an overlapping create, an
+    // incoming create or resume) is stale: it must not replace that session.
+    if (seq <= this.installedSeq) throw new StaleSessionError();
     // Core 2.2.2: the responder selects the highest version it supports that
     // is not above the offered one. Accept that, never a version this peer does
     // not speak or one above the offer.
     const selected = result.wmp.version;
-    if (!selected || !(this.supportedVersions.includes(selected) && negotiateVersion(offered, [selected]) === selected)) {
+    const withinOffer = typeof offered !== "string" || parseVersion(offered) === undefined || negotiateVersion(offered, [selected ?? ""]) === selected;
+    if (!selected || !(this.supportedVersions.includes(selected) && withinOffer)) {
       throw new WMPError(
         ErrorCode.VersionNotSupported,
         `negotiated version ${selected} is not supported`,
         { supported_versions: this.supportedVersions },
       );
     }
-    this.installedCreateSeq = seq;
+    this.installedSeq = Math.max(this.installedSeq, seq);
     this.sessionId = newId;
     this.bindSessionToTransport(newId);
     this.negotiatedVersion = selected;
@@ -532,7 +620,7 @@ export class Peer implements PeerContext {
    * waited its turn, it is dropped (StaleSessionError) instead of resuming the
    * session that replaced it.
    */
-  private async resumeSerialized(opts: { lastReceivedId?: string } | undefined, forEpoch: number, forGen: number): Promise<SessionResumeResult> {
+  private async resumeSerialized(opts: { lastReceivedId?: string; params?: SessionResumeParams } | undefined, forEpoch: number, forGen: number): Promise<SessionResumeResult> {
     const previous = this.resumeChain;
     let release!: () => void;
     this.resumeChain = new Promise<void>((r) => (release = r));
@@ -547,25 +635,28 @@ export class Peer implements PeerContext {
 
   private resumeChain: Promise<void> = Promise.resolve();
 
-  private async resumeNow(opts?: { lastReceivedId?: string }): Promise<SessionResumeResult> {
-    if (!this.sessionId || !this.resumptionToken) {
-      throw new Error("no session or resumption token to resume");
+  private async resumeNow(opts?: { lastReceivedId?: string; params?: SessionResumeParams }): Promise<SessionResumeResult> {
+    // Explicit parameters (the generic call() API) are used as given; otherwise
+    // they come from the session this peer holds.
+    let params: SessionResumeParams;
+    if (opts?.params) {
+      params = opts.params;
+    } else {
+      if (!this.sessionId || !this.resumptionToken) {
+        throw new Error("no session or resumption token to resume");
+      }
+      params = {
+        wmp: { version: this.negotiatedVersion ?? VERSION } as Metadata,
+        session_id: this.sessionId,
+        resumption_token: this.resumptionToken,
+        // In the HTTP binding this is the last event ID (Transport Section 4.5).
+        last_received_id: opts?.lastReceivedId ?? (this.transport as { lastEventId?: string }).lastEventId,
+      };
     }
-    const params = {
-      wmp: { version: this.negotiatedVersion ?? VERSION } as Metadata,
-      session_id: this.sessionId,
-      resumption_token: this.resumptionToken,
-      // In the HTTP binding this is the last event ID (Transport Section 4.5).
-      last_received_id:
-        opts?.lastReceivedId ?? (this.transport as { lastEventId?: string }).lastEventId,
-    };
     const gen = this.lifecycle;
     const epoch = this.flowEpoch;
     const rev = this.capRev;
-    const result = await this.call<SessionResumeResult>(
-      Method.SessionResume,
-      params,
-    );
+    const result = await this.callNow<SessionResumeResult>(Method.SessionResume, params);
     // The session this resume was for may have been closed or replaced while it
     // was in flight: its result must not bring that session back or overwrite the
     // session that replaced it.
@@ -578,8 +669,9 @@ export class Peer implements PeerContext {
     // version this peer does not speak, or one above what it offered, is a lost
     // session (the caller creates a new one), not a silent switch.
     const selected = result.wmp?.version;
-    const offered = params.wmp.version;
-    if (!selected || !(this.supportedVersions.includes(selected) && negotiateVersion(offered, [selected]) === selected)) {
+    const offered = params.wmp?.version;
+    const withinOffer = typeof offered !== "string" || parseVersion(offered) === undefined || negotiateVersion(offered, [selected ?? ""]) === selected;
+    if (!selected || !(this.supportedVersions.includes(selected) && withinOffer)) {
       throw new WMPError(
         ErrorCode.VersionNotSupported,
         `negotiated version ${selected} is not supported`,
@@ -596,6 +688,7 @@ export class Peer implements PeerContext {
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
+    this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
     this.resumeNegotiated(this.sessionId, result.capabilities, rev);
     return result;
   }
@@ -620,16 +713,12 @@ export class Peer implements PeerContext {
   /** Close the current session. */
   async closeSession(reason = "complete"): Promise<void> {
     if (!this.sessionId) return;
-    const gen = this.lifecycle;
+    // notify() clears this session's state once the close was sent, unless a
+    // replacement session was established meanwhile.
     await this.notify(Method.SessionClose, {
       wmp: { version: this.negotiatedVersion ?? VERSION, session_id: this.sessionId },
       reason,
     });
-    // A replacement session may have been established while the close was being
-    // sent: only the session that was closed has its state cleared.
-    if (this.lifecycle !== gen) return;
-    this.sessionId = undefined;
-    this.endSession();
   }
 
   // -------------------------------------------------------------------------
@@ -894,6 +983,7 @@ export class Peer implements PeerContext {
             this.sessionId = id;
             this.bindSessionToTransport(id);
             this.resumptionToken = undefined;
+            this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
             this.beginSession(id, result.capabilities);
           }
           return result;
@@ -914,6 +1004,7 @@ export class Peer implements PeerContext {
               // "resumed": the requester must not take it for a recovery.
               if (this.lifecycle !== gen) throw new WMPError(ErrorCode.SessionNotFound, "Session superseded");
               this.negotiatedVersion = selected;
+              this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
               const resumedId = Peer.usableId(result.wmp.session_id) ?? Peer.usableId(p?.session_id);
               if (resumedId !== undefined) {
                 if (resumedId !== this.sessionId) this.resumptionToken = undefined; // another session: not its token
@@ -976,10 +1067,10 @@ export class Peer implements PeerContext {
       case Method.CapabilityUpdate:
         if (this.handler.onCapabilityUpdate) {
           const gen = this.lifecycle;
-          const rev = this.capRev;
+          const seq = ++this.incCapSeq;
           const result = await this.handler.onCapabilityUpdate(p);
           // The update changed what the session grants: later flow starts are gated by it.
-          this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities);
+          this.applyHandlerResult(gen, p?.wmp?.session_id, seq, result?.capabilities);
           return result;
         }
         break;
@@ -987,9 +1078,9 @@ export class Peer implements PeerContext {
       case Method.CapabilityList:
         if (this.handler.onCapabilityList) {
           const gen = this.lifecycle;
-          const rev = this.capRev;
+          const seq = ++this.incCapSeq;
           const result = await this.handler.onCapabilityList(p);
-          this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities);
+          this.applyHandlerResult(gen, p?.wmp?.session_id, seq, result?.capabilities);
           return result;
         }
         break;
@@ -1112,7 +1203,10 @@ export class Peer implements PeerContext {
                 if (this.flowEpoch === epoch && (this.flowGen.get(flowId) ?? 0) === gen) this.endFlow(flowId, "cancelled");
                 return result;
               } finally {
-                if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
+                if (this.cancelling.get(flowId) === entry) {
+                  this.cancelling.delete(flowId); // a failure leaves a retry possible
+                  this.releaseGen(flowId);
+                }
               }
             })();
             this.cancelling.set(flowId, entry);
@@ -1172,6 +1266,7 @@ export class Peer implements PeerContext {
   private endFlow(flowId: unknown, kind: "ended" | "cancelled" = "ended"): void {
     if (typeof flowId !== "string") return;
     const known = this.recordedFlows.delete(flowId);
+    this.releaseGen(flowId);
     // A flow already in the history may be re-marked (a cancel of an ended flow
     // upgrades its kind) without growing it.
     if (known || this.terminalSeen.has(flowId)) this.markTerminal(flowId, kind);
