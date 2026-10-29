@@ -162,6 +162,13 @@ export interface PeerOptions {
 // Peer
 // ---------------------------------------------------------------------------
 
+/** What was true when a request ARRIVED (before authorization / handler work). */
+interface RequestTicket {
+  seq: number | undefined;
+  gen: number;
+  rev: number;
+}
+
 export class Peer implements PeerContext {
   private transport: Transport;
   private handler: Handler;
@@ -301,13 +308,9 @@ export class Peer implements PeerContext {
     // revision bump and no refresh (which would otherwise ping-pong between peers
     // whose grants never change).
     if (same) return;
-    // This peer's own handler is the authority for what it returned; if it has no
-    // list handler there is nothing to reconcile against, and its decision stands.
-    if (source === "local" && !this.handler.onCapabilityList) {
-      n.capabilities = { ...snapshot };
-      this.capRev++;
-      return;
-    }
+    // Without a local list handler a stale local snapshot only narrows, and the
+    // remote peer is asked for the authoritative one.
+    if (source === "local" && !this.handler.onCapabilityList) source = "remote";
     const kept: Capabilities = {};
     for (const k of have) {
       if (Object.prototype.hasOwnProperty.call(snapshot, k)) kept[k] = n.capabilities[k];
@@ -575,7 +578,7 @@ export class Peer implements PeerContext {
       throw new WMPError(
         ErrorCode.VersionNotSupported,
         `negotiated version ${selected} is not supported`,
-        { supported_versions: this.supportedVersions },
+        { supported_versions: [...this.supportedVersions] },
       );
     }
     this.installedSeq = Math.max(this.installedSeq, seq);
@@ -664,7 +667,7 @@ export class Peer implements PeerContext {
       throw new WMPError(
         ErrorCode.VersionNotSupported,
         `negotiated version ${selected} is not supported`,
-        { supported_versions: this.supportedVersions },
+        { supported_versions: [...this.supportedVersions] },
       );
     }
     // The resumed session: what the result names, else the one that was asked for
@@ -860,6 +863,14 @@ export class Peer implements PeerContext {
   }
 
   private handleRequest(req: Request): void {
+    // Ordering and lifecycle are fixed on RECEIPT, before authorization (which may
+    // be slow): a request that arrived earlier cannot take a newer number or
+    // capture the lifecycle of a session that replaced the one it targets.
+    const ticket: RequestTicket = {
+      seq: req.method === Method.SessionCreate ? ++this.sessionSeq : undefined,
+      gen: this.lifecycle,
+      rev: this.capRev,
+    };
     const dispatch = async () => {
       if (this.authorize) {
         const allowed = await this.authorize(req.method, req.params);
@@ -870,7 +881,7 @@ export class Peer implements PeerContext {
           );
         }
       }
-      return this.dispatchMethod(req.method, req.params);
+      return this.dispatchMethod(req.method, req.params, ticket);
     };
 
     if (isNotification(req)) {
@@ -894,6 +905,7 @@ export class Peer implements PeerContext {
   private async dispatchMethod(
     method: string,
     params: unknown,
+    ticket: RequestTicket = { seq: undefined, gen: this.lifecycle, rev: this.capRev },
   ): Promise<unknown> {
     // A repeat of a terminal message already processed (or refused): ignored.
     // Only checked here; a flow is marked once its message passed validation.
@@ -944,7 +956,7 @@ export class Peer implements PeerContext {
           // Incoming creates are ordered by REQUEST (the same numbering as outgoing
           // creates): a result older than a session that was already installed is
           // refused, a newer one replaces an older one that finished first.
-          const seq = ++this.sessionSeq;
+          const seq = ticket.seq ?? ++this.sessionSeq;
           const result = await this.handler.onSessionCreate(p);
           if (result) {
             // A session without a usable identity cannot be addressed, closed or
@@ -972,8 +984,8 @@ export class Peer implements PeerContext {
         if (this.handler.onSessionResume) {
           const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
           if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
-          const gen = this.lifecycle;
-          const rev = this.capRev;
+          const gen = ticket.gen;
+          const rev = ticket.rev;
           const result = await this.handler.onSessionResume(p);
           if (result) {
             result.wmp = { ...result.wmp, version: selected };
@@ -1422,8 +1434,18 @@ export class Peer implements PeerContext {
         this.sessionLost(new Error("event gap and no resumption token to resume with"));
         return;
       }
+      // Events were lost, and one of them may have been a capability revocation:
+      // the grant is withdrawn (gated flows fail closed) until the resume answer
+      // or a fresh capability.list restores it.
+      let mark: number | undefined;
+      if (this.negotiated) {
+        this.negotiated.capabilities = {};
+        mark = ++this.capRev;
+      }
       try {
         await this.resumeSerialized(undefined, epoch, gen);
+        // A resume that carried no snapshot leaves the grant withdrawn: ask for one.
+        if (mark !== undefined && this.capRev === mark && this.lifecycle === gen && !this.closed) this.scheduleGrantRefresh("remote");
       } catch (err: unknown) {
         // The session changed (or the peer closed) while resuming: nothing was lost.
         if (err instanceof StaleSessionError || this.closed || this.flowEpoch !== epoch || this.lifecycle !== gen) return;
