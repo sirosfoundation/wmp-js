@@ -6,7 +6,7 @@ import { WMPError, type Response } from "../src/jsonrpc.js";
 import { ErrorCode } from "../src/types.js";
 import { MockTransport } from "./mock-transport.js";
 
-const settle = () => new Promise((r) => setTimeout(r, 10));
+const settle = (ms = 10) => new Promise((r) => setTimeout(r, ms));
 
 describe("parseVersion", () => {
   it("accepts MAJOR.MINOR decimal", () => {
@@ -824,19 +824,16 @@ describe("capability and session races (round 3)", () => {
     return { t, peer, lost, ...v };
   };
 
-  it("outgoing capability operations go one at a time, so the last answer is the latest word", async () => {
+  it("an older capability.list snapshot that arrives after a newer update cannot widen the grant back (outgoing)", async () => {
     const { t, peer, onVCIStart } = await client({ oid4vci: {} });
     const list = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } });
     const upd = peer.call("wmp.capability.update", { wmp: { version: "0.1", session_id: "ses-1" }, remove: ["oid4vci"] });
     await settle();
-    // the update is not even sent while the list is unanswered
-    expect(t.sent.map((m) => (m as { method: string }).method)).toEqual(["wmp.capability.list"]);
-    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } });
-    await list;
-    await settle();
-    expect(t.sent.map((m) => (m as { method: string }).method)).toEqual(["wmp.capability.list", "wmp.capability.update"]);
-    t.receive({ jsonrpc: "2.0", id: (t.sent[1] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } } });
-    await upd;
+    expect(t.sent.map((m) => (m as { method: string }).method)).toEqual(["wmp.capability.list", "wmp.capability.update"]); // no lock: both go out
+    const [listId, updId] = [(t.sent[0] as { id: string }).id, (t.sent[1] as { id: string }).id];
+    t.receive({ jsonrpc: "2.0", id: updId, result: { wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } } }); // the revocation answers first
+    t.receive({ jsonrpc: "2.0", id: listId, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } }); // the older snapshot, late
+    await Promise.all([list, upd]);
     t.sent.length = 0;
     t.receive(startVci("ses-1"));
     await settle();
@@ -844,20 +841,73 @@ describe("capability and session races (round 3)", () => {
     expect(onVCIStart).not.toHaveBeenCalled();
   });
 
-  it("a failed or timed-out capability call does not block the ones queued behind it", async () => {
-    const { t, peer } = await client({});
-    const first = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } });
-    const second = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } });
+  it("a snapshot requested at the current revision is the latest word and can widen", async () => {
+    const { t, peer, onVCIStart } = await client({});
+    const upd = peer.call("wmp.capability.update", { wmp: { version: "0.1", session_id: "ses-1" }, add: { oid4vci: {} } });
     await settle();
-    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, error: { code: -32601, message: "no" } });
-    await expect(first).rejects.toBeDefined();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } });
+    await upd;
+    t.sent.length = 0;
+    t.receive(startVci("ses-1"));
     await settle();
-    expect(t.sent).toHaveLength(2); // the second went out after the first failed
-    t.receive({ jsonrpc: "2.0", id: (t.sent[1] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } } });
-    await second;
+    expect((t.sent[0] as Response).error).toBeUndefined();
+    expect(onVCIStart).toHaveBeenCalled();
   });
 
-  it("incoming capability handlers run one at a time, so the last one decides", async () => {
+  it("a revocation that arrives as an incoming update is not undone by a late outgoing snapshot (both directions)", async () => {
+    let granted: Record<string, unknown> = { oid4vci: {} };
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } }),
+        onCapabilityUpdate: async () => ({ wmp: { version: "0.1" }, capabilities: granted, security: { mode: "tls" } }),
+      },
+    });
+    const v = vci();
+    peer.use(v.profile);
+    t.receive(mkCreate("c"));
+    await settle();
+    t.sent.length = 0;
+    const list = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } }); // outgoing, pending
+    await settle();
+    granted = {};
+    t.receive({ jsonrpc: "2.0", id: "u", method: "wmp.capability.update", params: { wmp: { version: "0.1", session_id: "ses-1" }, remove: ["oid4vci"] } }); // incoming revocation
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.find((m) => (m as { method?: string }).method === "wmp.capability.list") as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } });
+    await list;
+    t.sent.length = 0;
+    t.receive(startVci("ses-1"));
+    await settle();
+    expect((t.sent[0] as Response).error?.code).toBe(-31005);
+    expect(v.onVCIStart).not.toHaveBeenCalled();
+  });
+
+  it("a same-session resume snapshot requested before a revocation cannot restore the grant", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: { onCapabilityUpdate: async () => ({ wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } }) },
+    });
+    const v = vci();
+    peer.use(v.profile);
+    const c = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" }, resumption_token: "rt" } });
+    await c;
+    t.sent.length = 0;
+    const resume = peer.resumeSession(); // snapshot requested now
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: "u", method: "wmp.capability.update", params: { wmp: { version: "0.1", session_id: "ses-1" }, remove: ["oid4vci"] } }); // revoked meanwhile
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.find((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 0, capabilities: { oid4vci: {} }, resumption_token: "rt2", security: { mode: "tls" } } });
+    await resume;
+    t.sent.length = 0;
+    t.receive(startVci("ses-1"));
+    await settle();
+    expect((t.sent[0] as Response).error?.code).toBe(-31005);
+    expect(v.onVCIStart).not.toHaveBeenCalled();
+  });
+
+  it("two incoming capability handlers finishing out of order cannot widen the grant", async () => {
     const gates: (() => void)[] = [];
     let call = 0;
     const t = new MockTransport();
@@ -1101,7 +1151,7 @@ describe("session identity details (round 4)", () => {
     expect((t.sent[0] as Response).error?.code).toBe(-31005); // the grant is gone
   });
 
-  it("incoming session establishment is serialized: a slow create cannot overwrite a later one", async () => {
+  it("a slow incoming create that outlives a later one is refused and cannot overwrite it", async () => {
     const gates: (() => void)[] = [];
     let n = 0;
     const t = new MockTransport();
@@ -1220,5 +1270,219 @@ describe("session identity details (round 4)", () => {
     t.receive(done);
     await settle();
     expect(onFlowComplete).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("session establishment edge cases (round 8)", () => {
+  const vci = () => {
+    const onVCIStart = vi.fn(async (p: { wmp: unknown; flow_id: string; flow_type: string }) => ({ wmp: p.wmp as never, flow_id: p.flow_id, flow_type: p.flow_type }));
+    return { profile: new OpenID4xProfile({ oid4vci: { supported_grants: [], supported_formats: [] }, onVCIStart }), onVCIStart };
+  };
+  const startVci = (sid?: unknown, extra: Record<string, unknown> = {}) => ({
+    jsonrpc: "2.0" as const,
+    id: "f",
+    method: "wmp.flow.start",
+    params: { wmp: { version: "0.1", ...(sid !== undefined ? { session_id: sid } : {}) }, flow_type: "oid4vci", flow_id: "flow-1", params: {}, ...extra },
+  });
+  const mkCreate = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+  const codeOf = (m: unknown) => (m as Response).error?.code;
+
+  it("a slow incoming create refused as superseded does not overwrite, and answers with an error", async () => {
+    const gates: (() => void)[] = [];
+    let n = 0;
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => {
+          const mine = ++n;
+          if (mine === 1) await new Promise<void>((r) => gates.push(r));
+          return { wmp: { version: "", session_id: `ses-${mine}` }, capabilities: {}, security: { mode: "tls" } };
+        },
+      },
+    });
+    t.receive(mkCreate("c1"));
+    await settle();
+    t.receive(mkCreate("c2"));
+    await settle();
+    gates[0]();
+    await settle(30);
+    expect(peer.session).toBe("ses-2");
+    expect(codeOf(t.sent.find((m) => (m as { id?: string }).id === "c1"))).toBe(-31000); // not "success"
+    expect((t.sent.find((m) => (m as { id?: string }).id === "c2") as Response).error).toBeUndefined();
+  });
+
+  it("a slow incoming create that finishes after a local createSession installed another session is refused", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => {
+          await gate;
+          return { wmp: { version: "", session_id: "ses-incoming" }, capabilities: {}, security: { mode: "tls" } };
+        },
+      },
+    });
+    t.receive(mkCreate("in"));
+    await settle();
+    const local = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.find((m) => (m as { method?: string }).method === "wmp.session.create") as { id: string }).id, result: { wmp: { version: "0.1", session_id: "ses-local" }, capabilities: {}, security: { mode: "tls" }, resumption_token: "rt" } });
+    await local;
+    release();
+    await settle(30);
+    expect(peer.session).toBe("ses-local");
+    expect(peer.token).toBe("rt");
+  });
+
+  it("a create result without a usable session id is refused before any state changes", async () => {
+    for (const bad of [undefined, "", null, 5]) {
+      const t = new MockTransport();
+      let first = true;
+      const peer = new Peer(t, {
+        handler: {
+          onSessionCreate: async () => {
+            if (first) {
+              first = false;
+              return { wmp: { version: "", session_id: "ses-good" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } };
+            }
+            return { wmp: { version: "", ...(bad === undefined ? {} : { session_id: bad }) }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } as never;
+          },
+        },
+      });
+      const v = vci();
+      peer.use(v.profile);
+      t.receive(mkCreate("c1"));
+      await settle();
+      t.receive(mkCreate("c2"));
+      await settle();
+      expect(codeOf(t.sent[1]), String(bad)).toBe(-32603);
+      expect(peer.session, String(bad)).toBe("ses-good"); // untouched
+      t.sent.length = 0;
+      t.receive(startVci("ses-good"));
+      await settle();
+      expect((t.sent[0] as Response).error, String(bad)).toBeUndefined(); // the good session's grant survives
+    }
+  });
+
+  it("a stale successful resume on the responder is an error, not resumed:true", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-new" }, capabilities: {}, security: { mode: "tls" } }),
+        onSessionResume: async () => {
+          await gate;
+          return { wmp: { version: "", session_id: "ses-old" }, resumed: true, missed_messages: 0, security: { mode: "tls" } };
+        },
+      },
+    });
+    t.receive({ jsonrpc: "2.0", id: "r", method: "wmp.session.resume", params: { wmp: { version: "0.1" }, session_id: "ses-old", resumption_token: "x" } });
+    await settle();
+    t.receive(mkCreate("c")); // the session is replaced meanwhile
+    await settle();
+    release();
+    await settle(30);
+    const resumeAnswer = t.sent.find((m) => (m as { id?: string }).id === "r") as Response;
+    expect(resumeAnswer.error?.code).toBe(-31000);
+    expect(resumeAnswer.result).toBeUndefined();
+    expect(peer.session).toBe("ses-new");
+  });
+
+  it("a present session id of the wrong type or value never uses the session's grant", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } }) } });
+    const v = vci();
+    peer.use(v.profile);
+    t.receive(mkCreate("c"));
+    await settle();
+    for (const bad of [null, 5, "", "ses-2", {}, false]) {
+      t.sent.length = 0;
+      t.receive(startVci(bad));
+      await settle();
+      expect(codeOf(t.sent[0]), JSON.stringify(bad)).toBe(-31005);
+    }
+    expect(v.onVCIStart).not.toHaveBeenCalled();
+    t.sent.length = 0;
+    t.receive(startVci("ses-1"));
+    await settle();
+    expect((t.sent[0] as Response).error).toBeUndefined();
+    t.sent.length = 0;
+    t.receive({ ...startVci(), id: "f2", params: { wmp: { version: "0.1" }, flow_type: "oid4vci", flow_id: "flow-2", params: {} } }); // an omitted id is allowed
+    await settle();
+    expect((t.sent[0] as Response).error).toBeUndefined();
+  });
+
+  it("overlapping createSession calls: the newest request wins whatever order the answers arrive in", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    const a = peer.createSession({});
+    const b = peer.createSession({});
+    await settle();
+    const [ra, rb] = t.sent.map((m) => m as { id: string });
+    const answer = (id: string, sid: string, token: string) => t.receive({ jsonrpc: "2.0", id, result: { wmp: { version: "0.1", session_id: sid }, capabilities: {}, security: { mode: "tls" }, resumption_token: token } });
+    answer(rb.id, "ses-B", "rtB"); // the newer answer first
+    await b;
+    answer(ra.id, "ses-A", "rtA"); // the older one later
+    await expect(a).rejects.toBeDefined();
+    expect(peer.session).toBe("ses-B");
+    expect(peer.token).toBe("rtB");
+    // and the natural order still works
+    const c = peer.createSession({});
+    const d = peer.createSession({});
+    await settle();
+    const [, , rc, rd] = t.sent.map((m) => m as { id: string });
+    answer(rc.id, "ses-C", "rtC");
+    await c;
+    answer(rd.id, "ses-D", "rtD");
+    await d;
+    expect(peer.session).toBe("ses-D");
+  });
+
+  it("fails before sending when there is no valid supported version to offer", async () => {
+    for (const supported of [[], ["bogus"], ["0.01", "v1"]]) {
+      const t = new MockTransport();
+      const peer = new Peer(t, { supportedVersions: supported });
+      await expect(peer.createSession({}), JSON.stringify(supported)).rejects.toMatchObject({ code: ErrorCode.VersionNotSupported });
+      expect(t.sent).toHaveLength(0);
+    }
+  });
+
+  it("flow.start without a real flow_type or flow_id is -32602, not an unsupported flow", async () => {
+    const t = new MockTransport();
+    new Peer(t, {});
+    const bad = [
+      { flow_id: "f" },
+      { flow_type: 5, flow_id: "f" },
+      { flow_type: "", flow_id: "f" },
+      { flow_type: "x" },
+      { flow_type: "x", flow_id: 5 },
+      { flow_type: "x", flow_id: "" },
+    ];
+    for (const p of bad) {
+      t.sent.length = 0;
+      t.receive({ jsonrpc: "2.0", id: "s", method: "wmp.flow.start", params: { wmp: { version: "0.1" }, ...p } } as never);
+      await settle();
+      expect((t.sent[0] as Response).error, JSON.stringify(p)).toMatchObject({ code: -32602, message: "Invalid params" });
+    }
+  });
+});
+
+describe("version helpers follow the negotiated version (round 8)", () => {
+  it("buildVCIFlowStart takes the session's version, defaulting to 0.1", async () => {
+    const { buildVCIFlowStart } = await import("../src/openid4x.js");
+    expect(buildVCIFlowStart("s", "f", { offer: "openid-credential-offer://x" }).wmp.version).toBe("0.1");
+    expect(buildVCIFlowStart("s", "f", { offer: "openid-credential-offer://x" }, undefined, "0.3").wmp.version).toBe("0.3");
+  });
+
+  it("the relay answers a registration in the version of the request", async () => {
+    const { Relay } = await import("../src/relay.js");
+    const relay = new Relay({} as never);
+    const reg = async (version: unknown) => (await relay.handleMethod("wmp.relay.register", { wmp: { version, sender: "x509:san:dns:a.example" } })) as { wmp: { version: string } };
+    expect((await reg("0.3")).wmp.version).toBe("0.3");
+    expect((await reg("0.1")).wmp.version).toBe("0.1");
+    expect((await reg("nonsense")).wmp.version).toBe("0.1");
+    expect((await reg(undefined)).wmp.version).toBe("0.1");
   });
 });
