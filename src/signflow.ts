@@ -335,6 +335,15 @@ function meta(wmp: Metadata): Metadata {
   return { version: wmp.version || VERSION, ...(wmp.session_id ? { session_id: wmp.session_id } : {}) };
 }
 
+/** A member that is really there: not undefined/null (which JSON drops or nulls) and not empty. */
+function present(v: unknown): boolean {
+  if (v === undefined || v === null) return false;
+  if (typeof v === "string") return v !== "";
+  if (Array.isArray(v)) return v.length > 0;
+  if (typeof v === "object") return Object.keys(v as object).length > 0;
+  return true;
+}
+
 /** Response modes in which the wallet encrypts the response (profile 7.7). */
 const ENCRYPTED_RESPONSE_MODES = ["direct_post.jwt", "dc_api.jwt"];
 
@@ -361,7 +370,10 @@ export function validateSignResult(action: string, result: unknown, responseMode
     const encrypted = responseMode !== undefined && ENCRYPTED_RESPONSE_MODES.includes(responseMode);
     if ("error" in r) {
       // An error result carries no presentation in any mode, and no response_jwe
-      // (profile 7.7): it reports a refusal, there is nothing to encrypt.
+      // (profile 7.7): it reports a refusal, there is nothing to encrypt. The
+      // error itself must be real: undefined/null/empty would serialize to a
+      // result that says nothing at all.
+      if (!present(r.error)) throw new CompletionResultError("error is empty");
       if ("vp_token" in r || "response_jwe" in r) throw new CompletionResultError("an error result carries neither vp_token nor response_jwe");
     } else if (encrypted) {
       if ("vp_token" in r) throw new CompletionResultError("vp_token in an encrypted response mode; the response must be a response_jwe");
@@ -370,7 +382,7 @@ export function validateSignResult(action: string, result: unknown, responseMode
       // A plaintext (or unspecified) mode answers with the VP token (profile
       // 3.2.5); a result without one would end the sub-flow with no presentation.
       if ("response_jwe" in r) throw new CompletionResultError("response_jwe in a response mode that is not encrypted");
-      if (!("vp_token" in r)) throw new CompletionResultError("a successful sign_presentation result carries a vp_token");
+      if (!present(r.vp_token)) throw new CompletionResultError("a successful sign_presentation result carries a vp_token");
     }
     return;
   }
@@ -381,6 +393,7 @@ export function validateSignResult(action: string, result: unknown, responseMode
   if (!("credential_count" in r) && !("transaction_id" in r) && !("error" in r)) {
     throw new CompletionResultError("decryption result carries no credential_count, transaction_id or error");
   }
+  if ("error" in r && !present(r.error)) throw new CompletionResultError("error is empty");
 }
 
 /** The sub-flow a wallet was asked to answer, with the means to answer it. A sub-flow ends once. */

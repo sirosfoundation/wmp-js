@@ -660,6 +660,25 @@ describe("sign_presentation results follow the response mode (profile 7.7)", () 
     }
   });
 
+  it("an error or vp_token that is undefined, null or empty does not count", () => {
+    const jweOk = "aaaa.x.bbbb.cccc.dddd";
+    for (const mode of ["direct_post.jwt", "direct_post", undefined]) {
+      for (const empty of [undefined, null, "", [], {}]) {
+        expect(() => validateSignResult("sign_presentation", { error: empty }, mode as never), `error ${JSON.stringify(empty)} ${String(mode)}`).toThrow(CompletionResultError);
+      }
+    }
+    for (const empty of [undefined, null, "", [], {}]) {
+      expect(() => validateSignResult("sign_presentation", { vp_token: empty }, "direct_post"), `vp_token ${JSON.stringify(empty)}`).toThrow(CompletionResultError);
+      expect(() => validateSignResult("decrypt_credential_response", { error: empty }), `decrypt error ${JSON.stringify(empty)}`).toThrow(CompletionResultError);
+    }
+    // real values pass: a string, an array, a DCQL-style object
+    for (const real of ["eyJ", ["eyJ"], { pid: ["eyJ"] }]) {
+      expect(() => validateSignResult("sign_presentation", { vp_token: real }, "direct_post")).not.toThrow();
+    }
+    expect(() => validateSignResult("sign_presentation", { error: { code: "access_denied" } }, "direct_post.jwt")).not.toThrow();
+    expect(() => validateSignResult("sign_presentation", { response_jwe: jweOk }, "direct_post.jwt")).not.toThrow();
+  });
+
   it("the profile sends no presentation-less success", async () => {
     const { t } = await walletPeer({
       oid4vp: { supported_response_modes: [], supported_formats: [] },
