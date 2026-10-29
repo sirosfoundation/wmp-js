@@ -248,6 +248,20 @@ export class HttpSseTransport extends Emitter implements Transport {
   }
 
   /**
+   * Forget the bound session and its replay state and close the event stream: the
+   * session ended. A later session starts clean (no stale Wmp-Session-Id, cursor
+   * or seen ids).
+   */
+  clearSession(): void {
+    this.sessionId = undefined;
+    this.cursor = undefined;
+    this.seenIds.clear();
+    this.pendingGap = false;
+    this.eventSource?.close();
+    this.eventSource = null;
+  }
+
+  /**
    * Connect the SSE stream. Call this after constructing the transport.
    * Separated from the constructor so callers can register listeners first.
    * Resumes from the transport's own cursor unless `lastEventId` is given.
@@ -360,6 +374,9 @@ export class HttpSseTransport extends Emitter implements Transport {
 
   /** Probes the stream URL for a 410 after the EventSource gave up with `cursor`. */
   private async checkGap(failed: EventSource, cursor: string): Promise<void> {
+    // The session the stream (and so the probe) belongs to: a 410 for a session
+    // that is no longer the bound one says nothing about the current session.
+    const session = this.sessionId;
     let status: number | undefined;
     try {
       const abort = new AbortController();
@@ -372,7 +389,7 @@ export class HttpSseTransport extends Emitter implements Transport {
     } catch {
       status = undefined;
     }
-    if (this.closed || this.eventSource !== failed) return;
+    if (this.closed || this.eventSource !== failed || this.sessionId !== session) return;
     if (status === 410) {
       // Discard the cursor (never reconnect with it again) and open a stream
       // with none; "gap" is emitted once it is open, so the resume's re-sent

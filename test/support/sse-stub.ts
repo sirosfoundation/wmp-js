@@ -214,6 +214,15 @@ export class SseStub {
       return;
     }
 
+    // A flow started under a reused id is a new flow: the earlier flow's retained
+    // progress and terminal notification must not be re-sent on resume.
+    if (body.method === "wmp.flow.start") {
+      const fid = (body.params as { flow_id?: unknown } | undefined)?.flow_id;
+      if (typeof fid === "string") {
+        s.activeProgress.delete(fid);
+        s.terminal.delete(fid);
+      }
+    }
     this.received.push(body);
     res.writeHead(202).end();
   }
