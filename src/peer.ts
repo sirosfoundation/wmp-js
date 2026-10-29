@@ -648,8 +648,12 @@ export class Peer implements PeerContext {
         break;
 
       case Method.SessionClose:
-        // The close of this session (or one that names none) ends its flow state.
-        if (p?.wmp?.session_id === undefined || p.wmp.session_id === this.sessionId) this.resetFlows();
+        // The close of this session (or one that names none) ends it: its flow
+        // state goes and the peer no longer reports (or addresses) it.
+        if (p?.wmp?.session_id === undefined || p.wmp.session_id === this.sessionId) {
+          this.sessionId = undefined;
+          this.resetFlows();
+        }
         if (this.handler.onSessionClose) {
           this.handler.onSessionClose(p);
         }
