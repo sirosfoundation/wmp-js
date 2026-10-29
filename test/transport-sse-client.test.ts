@@ -988,3 +988,129 @@ describe("stable flow generations and recovery epochs (round 6)", () => {
     expect(lost).toHaveLength(0);
   });
 });
+
+describe("rolled-back generations and per-session recovery queue (round 7)", () => {
+  const settle7 = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  const cancel = (flow: string, id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: flow } });
+  const startF = (id: string, flow: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: flow, params: {} } });
+  const complete = (flow: string) => ({ jsonrpc: "2.0" as const, method: "wmp.flow.complete", params: { wmp: { version: "0.1" }, flow_id: flow, result: { credentials: [] } } });
+
+  it("a rejected reuse of the id leaves the generation a pending cancellation belongs to", async () => {
+    const t = new MockTransport();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let accept = true;
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => {
+      await gate;
+      return { wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" };
+    });
+    new Peer(t, {
+      handler: {
+        onFlowStart: async (p) => {
+          if (!accept) throw new WMPError(ErrorCode.InvalidParams, "no");
+          return { wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type };
+        },
+        onFlowCancel,
+        onFlowComplete: vi.fn(),
+      },
+    });
+    t.receive(startF("s1", "f"));
+    await settle7();
+    t.receive(cancel("f", "c1")); // pending
+    await settle7();
+    t.receive(complete("f")); // the flow ends
+    await settle7();
+    accept = false;
+    t.receive(startF("s2", "f")); // an attempt to reuse the id is rejected
+    await settle7();
+    release(); // the original cancellation finishes
+    await settle7();
+    expect(onFlowCancel).toHaveBeenCalledTimes(1);
+    t.sent.length = 0;
+    t.receive(cancel("f", "c2")); // a replay: the outcome was recorded
+    await settle7();
+    expect(onFlowCancel).toHaveBeenCalledTimes(1);
+    expect((t.sent[0] as { result: { status: string } }).result.status).toBe("cancelled");
+  });
+
+  it("rejected starts with fresh ids leave no generation entries behind", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowStart: async () => { throw new WMPError(ErrorCode.InvalidParams, "no"); } } });
+    for (let i = 0; i < 50; i++) t.receive(startF(`s${i}`, `fresh-${i}`));
+    await settle7(30);
+    expect((peer as unknown as { flowGen: Map<string, number> }).flowGen.size).toBe(0);
+  });
+
+  const created = async (peer: Peer, t: MockTransport, sid: string, token: string) => {
+    const p = peer.createSession({});
+    await settle7();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1", session_id: sid }, capabilities: {}, security: { mode: "tls" }, resumption_token: token } });
+    await p;
+  };
+  const resumeReqs = (t: MockTransport) => t.sent.filter((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string; params: { session_id: string; resumption_token: string } }[];
+
+  it("a start that fails leaves no generation behind for work captured during it", async () => {
+    const t = new MockTransport();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let fail = true;
+    const onFlowCancel = vi.fn(async (p: { wmp: never; flow_id: string }) => {
+      await gate;
+      return { wmp: p.wmp, flow_id: p.flow_id, status: "from-handler" };
+    });
+    new Peer(t, {
+      handler: {
+        onFlowStart: async (p) => {
+          if (fail) {
+            await new Promise((r) => setTimeout(r, 30)); // pending, then fails
+            throw new WMPError(ErrorCode.InvalidParams, "no");
+          }
+          return { wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type };
+        },
+        onFlowCancel,
+        onFlowComplete: vi.fn(),
+      },
+    });
+    t.receive(startF("s1", "f")); // pending (tentative generation allocated)
+    await settle7();
+    t.receive(cancel("f", "c1")); // captures the tentative generation
+    await settle7(60); // the start fails and is rolled back
+    fail = false;
+    t.receive(startF("s2", "f")); // a real flow under the id
+    await settle7();
+    t.receive(complete("f"));
+    await settle7();
+    release(); // the old cancellation finishes now: it must not relabel the new flow
+    await settle7();
+    t.sent.length = 0;
+    t.receive(cancel("f", "c2")); // first cancel of the new, ended flow: reaches the handler
+    await settle7();
+    expect(onFlowCancel).toHaveBeenCalledTimes(2);
+  });
+
+  it("a stale session's queued recovery does not swallow the next session's gap", async () => {
+    const t = new MockTransport();
+    const lost: Error[] = [];
+    const peer = new Peer(t, { onSessionLost: (e) => lost.push(e) });
+    await created(peer, t, "ses-A", "rtA");
+    const explicit = peer.resumeSession(); // A's resume is on the wire
+    await settle7();
+    t.emitEvent("gap"); // A's recovery queued behind it
+    await settle7();
+    t.emitEvent("gap"); // a second A gap: this one waits its turn behind the first recovery task
+    await settle7();
+    await created(peer, t, "ses-B", "rtB"); // B replaces A
+    t.emitEvent("gap"); // B's gap while A's stale recovery is still queued
+    await settle7();
+    t.receive({ jsonrpc: "2.0", id: resumeReqs(t)[0].id, result: { wmp: { version: "0.1", session_id: "ses-A" }, resumed: true, missed_messages: 0, resumption_token: "rtA2", security: { mode: "tls" } } });
+    await explicit.catch(() => {});
+    await settle7(40);
+    const reqs = resumeReqs(t);
+    expect(reqs).toHaveLength(2); // A's explicit one, then B's recovery (A's queued one was discarded)
+    expect(reqs[1].params).toMatchObject({ session_id: "ses-B", resumption_token: "rtB" });
+    t.receive({ jsonrpc: "2.0", id: reqs[1].id, result: { wmp: { version: "0.1", session_id: "ses-B" }, resumed: true, missed_messages: 0, resumption_token: "rtB2", security: { mode: "tls" } } });
+    await settle7(30);
+    expect(lost).toHaveLength(0);
+    expect(peer.token).toBe("rtB2");
+  });
+});
