@@ -141,7 +141,7 @@ describe("Peer security hooks", () => {
       jsonrpc: "2.0",
       id: "req-3",
       method: Method.FlowStart,
-      params: { wmp: {}, flow_type: "x", flow_id: "f1" },
+      params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: "f1" },
     } as Request);
 
     await new Promise((r) => setTimeout(r, 10));

@@ -1149,6 +1149,11 @@ export class Peer implements PeerContext {
         if (typeof p?.flow_type !== "string" || p.flow_type === "" || typeof p.flow_id !== "string" || p.flow_id === "") {
           throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "flow_type and flow_id must be non-empty strings" });
         }
+        // The envelope carries the protocol version (Core 3.2); a start without one
+        // is malformed and never reaches a responder.
+        if (typeof p.wmp !== "object" || p.wmp === null || typeof (p.wmp as { version?: unknown }).version !== "string") {
+          throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "wmp.version is required" });
+        }
         const fh = this.registry.getFlowHandler(p.flow_type);
         if (fh) {
           // Core 10.3: a flow type whose capability was not negotiated is

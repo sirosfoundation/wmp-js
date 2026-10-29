@@ -281,6 +281,20 @@ describe("OpenID4xProfile as sign responder", () => {
     expect(onSign).not.toHaveBeenCalled();
   });
 
+  it("refuses a start without a wmp.version envelope with -32602 before any responder runs", async () => {
+    const onSign = vi.fn();
+    const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign });
+    for (const wmp of [undefined, null, {}, { version: 1 }]) {
+      t.sent.length = 0;
+      const m = start("sign", "f", { action: "generate_proof", nonce: "n", audience: "a", proof_type: "jwt" });
+      (m.params as { wmp?: unknown }).wmp = wmp;
+      t.receive(m);
+      await settle();
+      expect((t.sent[0] as Response).error?.code).toBe(-32602);
+    }
+    expect(onSign).not.toHaveBeenCalled();
+  });
+
   it("lets the callback reject the sub-flow", async () => {
     const { t } = await walletPeer({ oid4vp: { supported_response_modes: [], supported_formats: [] }, onSign: (flow) => flow.reject() });
     t.receive(start("sign", "f", sign()));
