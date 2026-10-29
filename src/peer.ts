@@ -179,11 +179,11 @@ export class Peer implements PeerContext {
   private negotiatedVersion?: string;
   private resumptionToken?: string;
   private closed = false;
-  private validator?: PeerOptions["validator"];
-  private authorize?: PeerOptions["authorize"];
+  private validator: PeerOptions["validator"];
+  private authorize: PeerOptions["authorize"];
   private validateCompletions: boolean;
-  private onRefusedCompletion?: PeerOptions["onRefusedCompletion"];
-  private onSessionLost?: PeerOptions["onSessionLost"];
+  private onRefusedCompletion: PeerOptions["onRefusedCompletion"];
+  private onSessionLost: PeerOptions["onSessionLost"];
   private supportedVersions: string[];
   /**
    * Capabilities negotiated for a session, bound to that session's ID; undefined
@@ -281,7 +281,7 @@ export class Peer implements PeerContext {
   private resumeNegotiated(sessionId: unknown, capabilities: Capabilities | undefined, rev: number, source: "remote" | "local" = "remote"): void {
     const id = Peer.usableId(sessionId);
     const n = this.negotiated;
-    if (n && n.sessionId !== undefined && n.sessionId === id) {
+    if (n?.sessionId !== undefined && n.sessionId === id) {
       if (capabilities !== undefined) this.applySnapshot(n, rev, capabilities, source);
       return;
     }
@@ -303,7 +303,7 @@ export class Peer implements PeerContext {
       return;
     }
     const have = Object.keys(n.capabilities);
-    const same = have.length === Object.keys(snapshot).length && have.every((k) => Object.prototype.hasOwnProperty.call(snapshot, k));
+    const same = have.length === Object.keys(snapshot).length && have.every((k) => Object.hasOwn(snapshot, k));
     // A stale snapshot that names exactly what is cached changes nothing: no
     // revision bump and no refresh (which would otherwise ping-pong between peers
     // whose grants never change).
@@ -313,7 +313,7 @@ export class Peer implements PeerContext {
     if (source === "local" && !this.handler.onCapabilityList) source = "remote";
     const kept: Capabilities = {};
     for (const k of have) {
-      if (Object.prototype.hasOwnProperty.call(snapshot, k)) kept[k] = n.capabilities[k];
+      if (Object.hasOwn(snapshot, k)) kept[k] = n.capabilities[k];
     }
     n.capabilities = kept;
     this.capRev++;
@@ -360,7 +360,9 @@ export class Peer implements PeerContext {
         // Only the refresh that is still the current one clears the marker and drains.
         if (this.grantRefresh === mine) {
           this.grantRefresh = undefined;
-          const next = this.grantRefreshPending.remote ? "remote" : this.grantRefreshPending.local ? "local" : undefined;
+          let next: "remote" | "local" | undefined;
+          if (this.grantRefreshPending.remote) next = "remote";
+          else if (this.grantRefreshPending.local) next = "local";
           if (next) {
             this.grantRefreshPending[next] = false;
             this.scheduleGrantRefresh(next); // respects the session held NOW; the other source drains after it
@@ -393,7 +395,7 @@ export class Peer implements PeerContext {
     // Any session id the request carries must be this session's: a present value
     // of the wrong type or content is not "no id".
     if (requestSession !== undefined && requestSession !== n.sessionId) return false;
-    return Object.prototype.hasOwnProperty.call(n.capabilities, capability);
+    return Object.hasOwn(n.capabilities, capability);
   }
 
   /** The highest supported version (what a client offers). */
@@ -1282,7 +1284,7 @@ export class Peer implements PeerContext {
             // processed shares its outcome, even if the flow completed meanwhile. A
             // replacement flow under the same id is a different generation.
             const pending = this.cancelling.get(flowId);
-            if (pending && pending.epoch === epoch && pending.gen === gen) return pending.run;
+            if (pending?.epoch === epoch && pending.gen === gen) return pending.run;
             const entry: { epoch: number; gen: number; run: Promise<unknown> } = { epoch, gen, run: undefined as unknown as Promise<unknown> };
             this.cancelCount.set(flowId, (this.cancelCount.get(flowId) ?? 0) + 1);
             entry.run = (async () => {
