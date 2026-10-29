@@ -1031,7 +1031,9 @@ describe("capability and session races (round 3)", () => {
     t.sent.length = 0;
     t.receive(startVci("ses-1"));
     await settle();
-    expect(onVCIStart).toHaveBeenCalled(); // the grant of the session we still hold is untouched
+    // The session could not be continued: its grant is invalidated, gated flows fail closed.
+    expect(onVCIStart).not.toHaveBeenCalled();
+    expect((t.sent[0] as Response).error).toBeDefined();
   });
 
   it("a responder's unsuccessful resume installs no session state", async () => {
@@ -2002,5 +2004,73 @@ describe("stale snapshots, refresh sources (round 11)", () => {
     await Promise.all([l1, l2]);
     await settle(30);
     expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.capability.list")).toHaveLength(2); // no refresh requested
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review round 12
+// ---------------------------------------------------------------------------
+
+describe("session ordering and resume hygiene (round 12)", () => {
+  const ok = (sid: string, extra: Record<string, unknown> = {}) => ({ wmp: { version: "0.1", session_id: sid }, capabilities: {}, security: { mode: "tls" }, ...extra });
+  const mk = async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    const p = peer.createSession({});
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: ok("ses-1", { resumption_token: "rt1" }) });
+    await p;
+    t.sent.length = 0;
+    return { t, peer };
+  };
+
+  it("a generic wmp.session.resume without explicit params is rejected and sends nothing", async () => {
+    const { t, peer } = await mk();
+    for (const bad of [undefined, null, [], "x"]) {
+      await expect(peer.call("wmp.session.resume", bad as never)).rejects.toMatchObject({ code: -32602 });
+    }
+    expect(t.sent).toHaveLength(0);
+    expect(peer.token).toBe("rt1");
+  });
+
+  it("a same-session resume does not make a concurrent createSession stale", async () => {
+    const { t, peer } = await mk();
+    const create = peer.createSession({}); // issued first
+    await settle();
+    const createId = (t.sent.at(-1) as { id: string }).id;
+    const resume = peer.resumeSession();
+    await settle();
+    const resumeId = (t.sent.at(-1) as { id: string }).id;
+    t.receive({ jsonrpc: "2.0", id: resumeId, result: ok("ses-1", { resumed: true, missed_messages: 0, resumption_token: "rt2" }) });
+    await resume.catch(() => undefined);
+    t.receive({ jsonrpc: "2.0", id: createId, result: ok("ses-2", { resumption_token: "rtc" }) });
+    await expect(create).resolves.toBeDefined();
+    expect(peer.session).toBe("ses-2");
+  });
+
+  it("overlapping incoming creates: the later request wins even when it finishes first", async () => {
+    const t = new MockTransport();
+    const gates: Array<() => void> = [];
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async (p: never) => {
+          const n = gates.length;
+          await new Promise<void>((r) => gates.push(r));
+          return ok(`ses-${n}`) as never;
+        },
+      },
+    });
+    void peer;
+    t.receive({ jsonrpc: "2.0", id: "a", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    t.receive({ jsonrpc: "2.0", id: "b", method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+    await settle();
+    gates[1]!(); // the later request finishes first
+    await settle();
+    gates[0]!();
+    await settle();
+    const byId = (id: string) => t.sent.find((m) => (m as { id?: string }).id === id) as Response;
+    expect(byId("b").error).toBeUndefined();
+    expect(byId("a").error?.code).toBe(-31000);
+    expect(peer.session).toBe("ses-1");
   });
 });

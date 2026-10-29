@@ -205,8 +205,9 @@ export class Peer implements PeerContext {
   private sessionSeq = 0;
   private installedSeq = 0;
 
-  private grantRefreshing = false;
-  private grantRefreshPending: "remote" | "local" | undefined;
+  /** The grant refresh in flight (one per session lifecycle) and the refreshes requested meanwhile, per authority. */
+  private grantRefresh?: { gen: number };
+  private grantRefreshPending = { remote: false, local: false };
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -270,11 +271,11 @@ export class Peer implements PeerContext {
    * session is a replacement: its grant is what the result lists (nothing if
    * omitted), the lifecycle moves on and the old session's flow state is dropped.
    */
-  private resumeNegotiated(sessionId: unknown, capabilities: Capabilities | undefined, rev: number): void {
+  private resumeNegotiated(sessionId: unknown, capabilities: Capabilities | undefined, rev: number, source: "remote" | "local" = "remote"): void {
     const id = Peer.usableId(sessionId);
     const n = this.negotiated;
     if (n && n.sessionId !== undefined && n.sessionId === id) {
-      if (capabilities !== undefined) this.applySnapshot(n, rev, capabilities);
+      if (capabilities !== undefined) this.applySnapshot(n, rev, capabilities, source);
       return;
     }
     this.lifecycle++;
@@ -300,6 +301,13 @@ export class Peer implements PeerContext {
     // revision bump and no refresh (which would otherwise ping-pong between peers
     // whose grants never change).
     if (same) return;
+    // This peer's own handler is the authority for what it returned; if it has no
+    // list handler there is nothing to reconcile against, and its decision stands.
+    if (source === "local" && !this.handler.onCapabilityList) {
+      n.capabilities = { ...snapshot };
+      this.capRev++;
+      return;
+    }
     const kept: Capabilities = {};
     for (const k of have) {
       if (Object.prototype.hasOwnProperty.call(snapshot, k)) kept[k] = n.capabilities[k];
@@ -322,16 +330,19 @@ export class Peer implements PeerContext {
    */
   private scheduleGrantRefresh(source: "remote" | "local"): void {
     if (this.closed) return;
-    if (this.grantRefreshing) {
-      this.grantRefreshPending = source;
+    // A refresh in flight for THIS session lifecycle absorbs the request (it runs
+    // after it); one left over from an earlier session does not hold this one up.
+    if (this.grantRefresh && this.grantRefresh.gen === this.lifecycle) {
+      this.grantRefreshPending[source] = true;
       return;
     }
     const id = this.negotiated?.sessionId;
     if (id === undefined) return;
     const gen = this.lifecycle;
     const rev = this.capRev;
+    const mine = { gen };
+    this.grantRefresh = mine;
     const params = { wmp: { version: this.negotiatedVersion ?? VERSION, session_id: id } };
-    this.grantRefreshing = true;
     void (async () => {
       try {
         if (source === "remote") {
@@ -343,11 +354,14 @@ export class Peer implements PeerContext {
       } catch {
         /* no fresh snapshot: the narrowed grant stands (fail closed) */
       } finally {
-        this.grantRefreshing = false;
-        const pending = this.grantRefreshPending;
-        if (pending) {
-          this.grantRefreshPending = undefined;
-          this.scheduleGrantRefresh(pending); // respects the session held NOW
+        // Only the refresh that is still the current one clears the marker and drains.
+        if (this.grantRefresh === mine) {
+          this.grantRefresh = undefined;
+          const next = this.grantRefreshPending.remote ? "remote" : this.grantRefreshPending.local ? "local" : undefined;
+          if (next) {
+            this.grantRefreshPending[next] = false;
+            this.scheduleGrantRefresh(next); // respects the session held NOW; the other source drains after it
+          }
         }
       }
     })();
@@ -489,6 +503,12 @@ export class Peer implements PeerContext {
     // state installation as the convenience methods.
     if (method === Method.SessionCreate) return this.createVia(params as SessionCreateParams) as Promise<T>;
     if (method === Method.SessionResume) {
+      // Explicit parameters only: a missing/null/non-object value is not "resume the
+      // current session" (that is resumeSession()), and must not silently send and
+      // rotate this peer's own token.
+      if (typeof params !== "object" || params === null || Array.isArray(params)) {
+        throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "session.resume needs explicit params" });
+      }
       return this.resumeSerialized({ params: params as SessionResumeParams }, this.flowEpoch, this.lifecycle) as Promise<T>;
     }
     return this.callNow<T>(method, params);
@@ -691,6 +711,9 @@ export class Peer implements PeerContext {
     // The resumed session: what the result names, else the one that was asked for
     // (the optional member may be left out, as on the responder path).
     const resumedId = Peer.usableId(result.wmp?.session_id) ?? Peer.usableId(params.session_id);
+    // Only a resume that SWITCHES to another session supersedes creates still in
+    // flight; one that merely refreshes the current session does not.
+    const switching = resumedId !== undefined && resumedId !== this.sessionId;
     if (resumedId !== undefined) {
       // Another session's token is not this one's: dropped before any new one is applied.
       if (resumedId !== this.sessionId) this.resumptionToken = undefined;
@@ -702,7 +725,7 @@ export class Peer implements PeerContext {
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
-    this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
+    if (switching) this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
     this.resumeNegotiated(resumedId ?? this.sessionId, result.capabilities, rev);
     return result;
   }
@@ -995,17 +1018,17 @@ export class Peer implements PeerContext {
           // -32602 (malformed) / -31013 with supported_versions.
           const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
           if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
-          // A slow handler must not finish after something else changed the session
-          // this peer holds (another create/resume, a close) and overwrite it: note
-          // the lifecycle first and refuse a result that outlived it.
-          const gen = this.lifecycle;
+          // Incoming creates are ordered by REQUEST (the same numbering as outgoing
+          // creates): a result older than a session that was already installed is
+          // refused, a newer one replaces an older one that finished first.
+          const seq = ++this.sessionSeq;
           const result = await this.handler.onSessionCreate(p);
           if (result) {
             // A session without a usable identity cannot be addressed, closed or
             // gated: it is a handler bug, refused before any state changes.
             const id = Peer.usableId(result.wmp?.session_id);
             if (id === undefined) throw new Error("session.create handler returned no session id");
-            if (this.lifecycle !== gen) throw new WMPError(ErrorCode.SessionNotFound, "Session superseded");
+            if (seq <= this.installedSeq) throw new WMPError(ErrorCode.SessionNotFound, "Session superseded");
             // The negotiated version is the one that goes on the wire, whatever the handler wrote.
             result.wmp = { ...result.wmp, version: selected };
             this.negotiatedVersion = selected;
@@ -1015,7 +1038,7 @@ export class Peer implements PeerContext {
             this.sessionId = id;
             this.bindSessionToTransport(id);
             this.resumptionToken = undefined;
-            this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
+            this.installedSeq = Math.max(this.installedSeq, seq);
             this.beginSession(id, result.capabilities);
           }
           return result;
@@ -1036,14 +1059,16 @@ export class Peer implements PeerContext {
               // "resumed": the requester must not take it for a recovery.
               if (this.lifecycle !== gen) throw new WMPError(ErrorCode.SessionNotFound, "Session superseded");
               this.negotiatedVersion = selected;
-              this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
               const resumedId = Peer.usableId(result.wmp.session_id) ?? Peer.usableId(p?.session_id);
               if (resumedId !== undefined) {
-                if (resumedId !== this.sessionId) this.resumptionToken = undefined; // another session: not its token
+                if (resumedId !== this.sessionId) {
+                  this.resumptionToken = undefined; // another session: not its token
+                  this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
+                }
                 this.sessionId = resumedId;
                 this.bindSessionToTransport(resumedId);
               }
-              this.resumeNegotiated(resumedId, result.capabilities, rev);
+              this.resumeNegotiated(resumedId, result.capabilities, rev, "local");
             }
           }
           return result;
@@ -1500,6 +1525,13 @@ export class Peer implements PeerContext {
    * callback is for does not send the dead session's id.
    */
   private sessionLost(err: Error): void {
+    // A session that cannot be continued may have missed a revocation: its grant
+    // is invalidated (gated flows fail closed until a new session is established)
+    // before the application is told. The session id and token stay readable.
+    this.lifecycle++;
+    this.negotiated = undefined;
+    this.capRev++;
+    this.resetFlows();
     this.clearTransportBinding();
     this.onSessionLost?.(err);
   }

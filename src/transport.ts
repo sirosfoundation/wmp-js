@@ -446,9 +446,19 @@ export class HttpSseTransport extends Emitter implements Transport {
     // A session.create must not carry a session id (Transport 4.3.1: the server
     // assigns it and refuses a request that names one). The binding itself stays,
     // in case the create fails and the old session is still the one in use.
-    const isCreate = (msg as { method?: unknown }).method === "wmp.session.create";
-    if (this.sessionId && !isCreate) {
-      headers["Wmp-Session-Id"] = this.sessionId;
+    const method = (msg as { method?: unknown }).method;
+    let routeId: string | undefined = this.sessionId;
+    if (method === "wmp.session.create") {
+      routeId = undefined;
+    } else if (method === "wmp.session.resume") {
+      // A resume is addressed to the session it asks for, which may not be the one
+      // currently bound (the binding changes only if the resume succeeds): header
+      // and body must name the same session.
+      const asked = (msg as { params?: { session_id?: unknown } }).params?.session_id;
+      if (typeof asked === "string" && asked !== "") routeId = asked;
+    }
+    if (routeId) {
+      headers["Wmp-Session-Id"] = routeId;
     }
 
     const resp = await this.fetchFn(this.rpcUrl, {
