@@ -72,6 +72,8 @@ function fail(msg: string): never {
  * - a decrypt_credential_response result has credential_count (1 to 256) or
  *   transaction_id, never both, and carries no credentials or
  *   credential_metadata; interval only accompanies transaction_id;
+ * - a vp_token, when present, is a presentation form {@link validVpToken} allows;
+ *   presentation_submission is an object and response_code a string (Section 3.2.4);
  * - a response_jwe is a compact JWE of five base64url segments (only the
  *   encrypted key may be empty), at most {@link MAX_RESPONSE_JWE_LEN} long, and
  *   never accompanies a vp_token.
@@ -87,6 +89,31 @@ export function validateCompletionResult(
   validateRedactedMembers(result);
   validateDecryptResult(result);
   validateResponseJWE(result);
+  validatePresentationMembers(result);
+}
+
+/**
+ * A vp_token the profile allows (table in profile 3.2.5, DCQL form in 7.x): a
+ * non-empty string, a non-empty array of non-empty strings, or an object mapping
+ * query ids to non-empty arrays of non-empty strings. Anything else (booleans,
+ * numbers, null, empty or mixed values) is not a presentation.
+ */
+export function validVpToken(v: unknown): boolean {
+  const str = (x: unknown): boolean => typeof x === "string" && x !== "";
+  const strs = (x: unknown): boolean => Array.isArray(x) && x.length > 0 && x.every(str);
+  if (str(v) || strs(v)) return true;
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const vals = Object.values(v as Record<string, unknown>);
+  return vals.length > 0 && vals.every(strs);
+}
+
+/** The result members of an oid4vp completion (Section 3.2.4): each, when present, has its type. */
+function validatePresentationMembers(m: Obj): void {
+  if (has(m, "vp_token") && !validVpToken(m.vp_token)) {
+    fail("vp_token is not a string, an array of strings, or an object of query id to arrays of strings");
+  }
+  if (has(m, "presentation_submission") && !isObj(m.presentation_submission)) fail("presentation_submission is not an object");
+  if (has(m, "response_code") && typeof m.response_code !== "string") fail("response_code is not a string");
 }
 
 function validateEncryptedFlag(m: Obj): boolean {
