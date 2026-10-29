@@ -259,7 +259,25 @@ export function parseSignSubFlowParams(raw: unknown): SignSubFlowParams {
       throw invalidParams("response_mode is required with transaction_data");
     }
   }
+  if (p.action === "sign_presentation") {
+    const top = p.response_mode;
+    const inner = isObj(p.verified_request) ? p.verified_request.response_mode : undefined;
+    if (top !== undefined && inner !== undefined && top !== inner) {
+      throw invalidParams("response_mode disagrees with verified_request.response_mode");
+    }
+  }
   return { ...(p as unknown as SignSubFlowParams) };
+}
+
+/**
+ * The response mode a sign_presentation is answered in: the top-level member
+ * (profile 3.2.5, optional without transaction_data) or, when it is omitted, the
+ * one of the verified request. Without either the mode is plaintext.
+ */
+export function effectiveResponseMode(p: { response_mode?: unknown; verified_request?: unknown }): string | undefined {
+  if (typeof p.response_mode === "string") return p.response_mode;
+  const inner = isObj(p.verified_request) ? p.verified_request.response_mode : undefined;
+  return typeof inner === "string" ? inner : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,7 +450,7 @@ export class SignFlow {
   /** Completes with the sign result (e.g. `{ proof_jwt }`, `{ response_jwe }`). */
   complete(result: unknown): Promise<void> {
     return this.terminal(() =>
-      completeSubFlow(this.peer, this.wmp, this.flowId, result, (r) => validateSignResult(this.params.action, r, this.params.response_mode)),
+      completeSubFlow(this.peer, this.wmp, this.flowId, result, (r) => validateSignResult(this.params.action, r, effectiveResponseMode(this.params))),
     );
   }
 

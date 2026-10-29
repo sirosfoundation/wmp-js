@@ -733,6 +733,34 @@ describe("sign_presentation results follow the response mode (profile 7.7)", () 
   });
 });
 
+describe("effective response mode (round 13)", () => {
+  const jwe = "aaaa.x.bbbb.cccc.dddd";
+  it("a verified_request mode applies when the top-level member is omitted", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: (flow) => flow.complete({ vp_token: "PLAINTEXT-VP-TOKEN" }),
+    });
+    t.receive(start("sign", "enc2", sign({ verified_request: { response_mode: "direct_post.jwt" } })));
+    await settle(60);
+    expect(JSON.stringify(t.sent)).not.toContain("PLAINTEXT-VP-TOKEN");
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.error", params: { code: -31006 } });
+  });
+
+  it("a response_jwe is accepted under the verified_request mode", async () => {
+    const { t } = await walletPeer({
+      oid4vp: { supported_response_modes: [], supported_formats: [] },
+      onSign: (flow) => flow.complete({ response_jwe: jwe }),
+    });
+    t.receive(start("sign", "enc3", sign({ verified_request: { response_mode: "direct_post.jwt" } })));
+    await settle(60);
+    expect(t.sent[1]).toMatchObject({ method: "wmp.flow.complete", params: { result: { response_jwe: jwe } } });
+  });
+
+  it("conflicting modes are refused as malformed", () => {
+    expect(code(() => parseSignSubFlowParams(sign({ response_mode: "direct_post", verified_request: { response_mode: "direct_post.jwt" } })))).toBe(-32602);
+  });
+});
+
 describe("sparse arrays are not selections (round 4)", () => {
   it("validate and build refuse holes", async () => {
     const { validateSelectCredentialsParams, buildSelectCredentials, ActionParamsError } = await import("../src/consent.js");
@@ -968,13 +996,18 @@ describe("retiring after a slow send (round 5)", () => {
     await settle();
     t.receive({ jsonrpc: "2.0", id: "c", method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: "f" } });
     await settle();
-    t.receive(startReq("b")); // a replacement under the same id
+    t.sent.length = 0;
+    t.receive(startReq("b")); // a replacement under the same id while the old terminal is still on its way
     await settle();
-    const gen2 = peer.flowGeneration("f");
-    expect(gen2).toBeDefined();
+    expect((t.sent[0] as Response).error?.code).toBe(-32602); // refused: the old completion must not land on it
+    expect(peer.flowGeneration("f")).toBeUndefined();
     release();
     await sending;
-    expect(peer.flowGeneration("f")).toBe(gen2); // not retired by the old generation's send
+    t.sent.length = 0;
+    t.receive(startReq("c")); // once the send finished the id is free again
+    await settle();
+    expect((t.sent[0] as Response).error).toBeUndefined();
+    expect(peer.flowGeneration("f")).toBeDefined();
   });
 });
 

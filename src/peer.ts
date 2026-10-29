@@ -479,10 +479,22 @@ export class Peer implements PeerContext {
     if (typeof id !== "string" || generation === undefined || this.recordedFlows.get(id) !== generation) {
       throw new Error("flow is no longer active");
     }
-    await this.transport.send(createNotification(method, params));
+    // The id cannot be started again while this send is in flight: the old
+    // notification would otherwise reach the receiver under the id of a replacement.
+    this.sendingFlow.set(id, (this.sendingFlow.get(id) ?? 0) + 1);
+    try {
+      await this.transport.send(createNotification(method, params));
+    } finally {
+      const left = (this.sendingFlow.get(id) ?? 1) - 1;
+      if (left <= 0) this.sendingFlow.delete(id);
+      else this.sendingFlow.set(id, left);
+    }
     // Retire the flow only if it is still the generation that sent this.
     if (this.recordedFlows.get(id) === generation) this.endFlow(id);
   }
+
+  /** Flow ids with a notification still being sent (their reuse is refused meanwhile). */
+  private sendingFlow = new Map<string, number>();
 
   /** Drops the validation context of a flow that ended; the flow_id is free to start again. */
   private releaseFlow(flowId: unknown): void {
@@ -1369,7 +1381,7 @@ export class Peer implements PeerContext {
    */
   private beginFlow(flowId: unknown, flowType: unknown, params: unknown): () => void {
     if (typeof flowId !== "string" || typeof flowType !== "string") return noop;
-    if (this.recordedFlows.has(flowId)) {
+    if (this.recordedFlows.has(flowId) || this.sendingFlow.has(flowId)) {
       throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "flow_id is already active" });
     }
     if (this.recordedFlows.size >= MAX_ACTIVE_FLOWS) {
