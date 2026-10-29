@@ -28,6 +28,7 @@ import {
   Registry,
 } from "./profile.js";
 import { type ValidationError } from "./schema.js";
+import { CompletionResultError, dcqlQueryIds, validateCompletionResult, validateMatchResult } from "./completion.js";
 import {
   type Metadata,
   type SessionCreateParams,
@@ -129,6 +130,16 @@ export interface PeerOptions {
     method: string,
     params: unknown,
   ) => boolean | Promise<boolean>;
+  /**
+   * Refuse an incoming wmp.flow.complete whose result breaks the OpenID4x
+   * completion rules (see validateCompletionResult). The completion is not
+   * delivered; the flow is ended with a synthesized wmp.flow.error
+   * (-32602, no member of the result echoed) to the profile or handler that
+   * owns it. Default: true.
+   */
+  validateCompletions?: boolean;
+  /** Called for every refused completion, with the violation (never a member value). */
+  onRefusedCompletion?: (flowId: string, error: CompletionResultError) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +158,8 @@ export class Peer implements PeerContext {
   private closed = false;
   private validator?: PeerOptions["validator"];
   private authorize?: PeerOptions["authorize"];
+  private validateCompletions: boolean;
+  private onRefusedCompletion?: PeerOptions["onRefusedCompletion"];
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -154,6 +167,8 @@ export class Peer implements PeerContext {
     this.callTimeout = opts?.callTimeout ?? 30_000;
     this.validator = opts?.validator;
     this.authorize = opts?.authorize;
+    this.validateCompletions = opts?.validateCompletions ?? true;
+    this.onRefusedCompletion = opts?.onRefusedCompletion;
 
     // Wire up transport events.
     this.transport.on("message", (msg: Message) => this.dispatch(msg));
@@ -179,28 +194,47 @@ export class Peer implements PeerContext {
   async notify(method: string, params: unknown): Promise<void> {
     const msg = createNotification(method, params);
     await this.transport.send(msg);
+    // This peer ended the flow (complete or error, sent by the convenience
+    // methods and by profiles alike): its validation context is no longer needed.
+    if (method === Method.FlowComplete || method === Method.FlowError) this.releaseFlow(flowIdOf(params));
+  }
+
+  /** Drops the validation context of a flow that ended; the flow_id is free to start again. */
+  private releaseFlow(flowId: unknown): void {
+    if (typeof flowId === "string") this.recordedFlows.delete(flowId);
   }
 
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
     const req = createRequest(method, params);
     const id = req.id!;
+    // Every outgoing flow.start goes through here (the convenience method and
+    // profiles alike), so the flow's validation context is always recorded.
+    const rollback = method === Method.FlowStart ? this.beginFlow(flowIdOf(params), flowTypeOf(params), (params as { params?: unknown }).params) : noop;
 
     return new Promise<T>((resolve, reject) => {
+      const fail = (err: unknown): void => {
+        rollback(); // the start did not succeed: it must not leave a context behind
+        reject(err);
+      };
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new WMPError(ErrorCode.InternalError, `Call to ${method} timed out`));
+        fail(new WMPError(ErrorCode.InternalError, `Call to ${method} timed out`));
       }, this.callTimeout);
 
       this.pending.set(id, {
-        resolve: resolve as (v: unknown) => void,
-        reject,
+        resolve: ((v: unknown) => {
+          // A cancelled flow has ended: release its context (shared by the convenience method and profiles).
+          if (method === Method.FlowCancel) this.releaseFlow(flowIdOf(params));
+          (resolve as (v: unknown) => void)(v);
+        }),
+        reject: fail,
         timer,
       });
 
       this.transport.send(req).catch((err) => {
         this.pending.delete(id);
         clearTimeout(timer);
-        reject(err);
+        fail(err);
       });
     });
   }
@@ -246,6 +280,7 @@ export class Peer implements PeerContext {
       );
     }
     this.sessionId = result.wmp.session_id;
+    this.resetFlows(); // a new session: the old one's flow state does not carry over
     this.bindSessionToTransport(result.wmp.session_id);
     this.negotiatedVersion = result.wmp.version ?? VERSION;
     if (result.resumption_token) {
@@ -272,6 +307,8 @@ export class Peer implements PeerContext {
       params,
     );
     if (result.wmp?.session_id) {
+      // Resuming the same session keeps its flow state; another session does not.
+      if (result.wmp.session_id !== this.sessionId) this.resetFlows();
       this.sessionId = result.wmp.session_id;
       this.bindSessionToTransport(result.wmp.session_id);
     }
@@ -309,6 +346,7 @@ export class Peer implements PeerContext {
       reason,
     });
     this.sessionId = undefined;
+    this.resetFlows();
   }
 
   // -------------------------------------------------------------------------
@@ -489,6 +527,30 @@ export class Peer implements PeerContext {
     method: string,
     params: unknown,
   ): Promise<unknown> {
+    // A repeat of a terminal message already processed (or refused): ignored.
+    // Only checked here; a flow is marked once its message passed validation.
+    if ((method === Method.FlowComplete || method === Method.FlowError) && isFlowIdEnvelope(params) && this.terminalSeen.has(params.flow_id)) {
+      return undefined;
+    }
+
+    // A completion that breaks the result rules is refused before the generic
+    // validator runs: a notification the validator rejected would be dropped
+    // silently and the receiving handler would never learn that the flow failed.
+    // Authorization (handleRequest) and the envelope shape are still checked.
+    if (method === Method.FlowComplete && this.validateCompletions) {
+      if (isFlowCompleteEnvelope(params)) {
+        const refusal = this.completionRefusal(params);
+        if (refusal) {
+          this.refuseCompletion(params, refusal);
+          return undefined;
+        }
+      } else if (!this.validator) {
+        // Not even the basic envelope, and no schema validator to judge it: it
+        // is not delivered (a result nobody checked must not reach the handler).
+        return undefined;
+      }
+    }
+
     if (this.validator) {
       const errors = this.validator.validateMethod(method, params);
       if (errors) {
@@ -507,17 +569,41 @@ export class Peer implements PeerContext {
       // Session
       case Method.SessionCreate:
         if (this.handler.onSessionCreate) {
-          return this.handler.onSessionCreate(p);
+          const result = await this.handler.onSessionCreate(p);
+          if (result) {
+            // The session this peer now serves: remember its identity (a responder-only
+            // peer has no other way to know it), and drop the previous session's flow state.
+            const id = result.wmp?.session_id;
+            if (typeof id === "string" && id !== "") this.sessionId = id;
+            this.resetFlows();
+          }
+          return result;
         }
         break;
 
       case Method.SessionResume:
         if (this.handler.onSessionResume) {
-          return this.handler.onSessionResume(p);
+          const result = await this.handler.onSessionResume(p);
+          if (result?.resumed === true) {
+            const resumed = typeof result.wmp?.session_id === "string" && result.wmp.session_id !== "" ? result.wmp.session_id : typeof p?.session_id === "string" ? p.session_id : undefined;
+            // Resuming a different session than the one held drops the old flow
+            // state; the same one keeps it. The resumed session is the one held from now on.
+            if (resumed !== undefined) {
+              if (resumed !== this.sessionId) this.resetFlows();
+              this.sessionId = resumed;
+            }
+          }
+          return result;
         }
         break;
 
       case Method.SessionClose:
+        // The close of this session (or one that names none) ends it: its flow
+        // state goes and the peer no longer reports (or addresses) it.
+        if (p?.wmp?.session_id === undefined || p.wmp.session_id === this.sessionId) {
+          this.sessionId = undefined;
+          this.resetFlows();
+        }
         if (this.handler.onSessionClose) {
           this.handler.onSessionClose(p);
         }
@@ -569,9 +655,19 @@ export class Peer implements PeerContext {
 
       // Flows — delegate to profile FlowHandlers first, then handler.
       case Method.FlowStart: {
-        const fh = this.registry.getFlowHandler(p.flow_type);
-        if (fh) return fh.startFlow(p);
-        if (this.handler.onFlowStart) return this.handler.onFlowStart(p);
+        // Rejects a duplicate active flow_id and records the flow's validation
+        // context; a start that fails leaves nothing (and no existing flow's
+        // context) changed.
+        const rollback = this.beginFlow(p?.flow_id, p?.flow_type, p?.params);
+        try {
+          const fh = this.registry.getFlowHandler(p.flow_type);
+          if (fh) return await fh.startFlow(p);
+          if (this.handler.onFlowStart) return await this.handler.onFlowStart(p);
+        } catch (err) {
+          rollback();
+          throw err;
+        }
+        rollback();
         break;
       }
 
@@ -593,6 +689,7 @@ export class Peer implements PeerContext {
       }
 
       case Method.FlowComplete: {
+        this.endFlow(p?.flow_id);
         const fh = this.flowHandlerForId(p.flow_id);
         if (fh) { fh.handleComplete(p); return undefined; }
         if (this.handler.onFlowComplete) {
@@ -603,6 +700,7 @@ export class Peer implements PeerContext {
       }
 
       case Method.FlowError: {
+        this.endFlow(p?.flow_id);
         const fh = this.flowHandlerForId(p.flow_id);
         if (fh) { fh.handleError(p); return undefined; }
         if (this.handler.onFlowError) {
@@ -614,7 +712,9 @@ export class Peer implements PeerContext {
 
       case Method.FlowCancel:
         if (this.handler.onFlowCancel) {
-          return this.handler.onFlowCancel(p);
+          const result = await this.handler.onFlowCancel(p);
+          this.endFlow(p?.flow_id, "cancelled");
+          return result;
         }
         break;
 
@@ -635,6 +735,119 @@ export class Peer implements PeerContext {
     }
 
     throw new WMPError(ErrorCode.MethodNotFound, `Method not found: ${method}`);
+  }
+
+  /**
+   * The validation context of every ACTIVE flow (started, not yet ended), by
+   * flow_id: its type and, for match, the ids of the verifier's query. Never
+   * evicted to make room: a new start is refused at capacity instead of
+   * weakening an existing flow's checks.
+   */
+  private recordedFlows = new Map<string, { type: string; queryIds?: string[] }>();
+
+  /**
+   * Flows that ended (complete, error, a refused completion or a cancel), by
+   * flow_id. A finished or refused flow is not an unknown one: a further terminal
+   * message for it is ignored instead of being judged by the general rules, and
+   * it holds no active-flow slot. Never evicted (it lives as long as the session)
+   * and cleared when the session ends or changes.
+   */
+  private terminalSeen = new Map<string, "ended" | "cancelled">();
+
+  private markTerminal(flowId: string, kind: "ended" | "cancelled" = "ended"): void {
+    this.terminalSeen.set(flowId, kind);
+  }
+
+  /**
+   * A flow ended: drop its validation context and, if this peer knew the flow
+   * (it was started here or by the remote peer and not yet ended), remember how
+   * it ended. A terminal message for a flow this peer never saw start is
+   * delivered as before but not remembered, so a remote peer cannot grow the
+   * history with fresh ids.
+   */
+  private endFlow(flowId: unknown, kind: "ended" | "cancelled" = "ended"): void {
+    if (typeof flowId !== "string") return;
+    const known = this.recordedFlows.delete(flowId);
+    if (known) this.markTerminal(flowId, kind);
+  }
+
+  /** A new or ended session: the old session's flow state does not carry over. */
+  private resetFlows(): void {
+    this.recordedFlows.clear();
+    this.terminalSeen.clear();
+  }
+
+  /**
+   * Records a starting flow and returns the function that undoes it. Refuses
+   * (-32602) a flow_id that is already active, so a second start cannot replace
+   * the context of the first, and (-31007) a start at capacity.
+   */
+  private beginFlow(flowId: unknown, flowType: unknown, params: unknown): () => void {
+    if (typeof flowId !== "string" || typeof flowType !== "string") return noop;
+    if (this.recordedFlows.has(flowId)) {
+      throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "flow_id is already active" });
+    }
+    if (this.recordedFlows.size >= MAX_ACTIVE_FLOWS) {
+      throw new WMPError(ErrorCode.RateLimited, "Too many active flows");
+    }
+    // The history of finished flows is bounded too, and it is never evicted (a
+    // dropped marker would weaken validation): at saturation new flows are
+    // refused until the session is renewed.
+    if (this.terminalSeen.size >= MAX_TERMINAL_HISTORY && !this.terminalSeen.has(flowId)) {
+      throw new WMPError(ErrorCode.RateLimited, "Too many finished flows in this session");
+    }
+    // A new flow under a reused ID is not a repeat of the old one's terminal
+    // message. If the start fails the marker comes back (below).
+    const hadTerminal = this.terminalSeen.get(flowId);
+    this.terminalSeen.delete(flowId);
+    const q = flowType === "match" && typeof params === "object" && params !== null ? (params as { dcql_query?: unknown }).dcql_query : undefined;
+    const rec = { type: flowType, queryIds: q === undefined ? undefined : dcqlQueryIds(q) };
+    this.recordedFlows.set(flowId, rec);
+    return () => {
+      // Only while this start's own record is still the flow's: if the
+      // replacement already ended, or another flow took the id, the marker is theirs.
+      if (this.recordedFlows.get(flowId) === rec) {
+        this.recordedFlows.delete(flowId);
+        if (hadTerminal !== undefined) this.terminalSeen.set(flowId, hadTerminal);
+      }
+    };
+  }
+
+  /**
+   * The violation of a completion's result, if any. The check is selected by the
+   * flow type recorded when the flow started, never by members of the result
+   * (openid4x 3.3.3): a match flow's result is the closed set, and a match
+   * completion without a result is refused too.
+   */
+  private completionRefusal(p: FlowCompleteParams): CompletionResultError | undefined {
+    const rec = this.recordedFlows.get(p.flow_id);
+    try {
+      if (rec?.type === "match") validateMatchResult(p.result, rec.queryIds);
+      else if (p.result !== undefined) validateCompletionResult(p.result);
+    } catch (err) {
+      if (err instanceof CompletionResultError) return err;
+      throw err;
+    }
+    return undefined;
+  }
+
+  /**
+   * A non-conforming completion is not delivered. The flow ends as failed: a
+   * synthesized wmp.flow.error, carrying neither the result nor the violation
+   * text, goes to whoever would have received the completion or the error.
+   */
+  private refuseCompletion(p: FlowCompleteParams, err: CompletionResultError): void {
+    this.endFlow(p.flow_id); // the synthesized error ends the flow
+    this.onRefusedCompletion?.(p.flow_id, err);
+    const synthesized: FlowErrorParams = {
+      wmp: p.wmp,
+      flow_id: p.flow_id,
+      code: ErrorCode.InvalidParams,
+      message: "Non-conforming flow result",
+    };
+    const fh = this.flowHandlerForId(p.flow_id);
+    if (fh) fh.handleError(synthesized);
+    else this.handler.onFlowError?.(synthesized);
   }
 
   // Track flow_id → flow_type mapping for routing to the right FlowHandler.
@@ -688,6 +901,35 @@ export class Peer implements PeerContext {
 // ---------------------------------------------------------------------------
 // Error conversion
 // ---------------------------------------------------------------------------
+
+/** The shape a wmp.flow.complete must have before the early result check applies: flow_id and the wmp metadata object with its version. */
+function isFlowCompleteEnvelope(params: unknown): params is FlowCompleteParams {
+  if (typeof params !== "object" || params === null) return false;
+  const p = params as { flow_id?: unknown; wmp?: unknown };
+  if (typeof p.flow_id !== "string") return false;
+  const w = p.wmp as { version?: unknown } | null | undefined;
+  return typeof w === "object" && w !== null && typeof w.version === "string";
+}
+
+function flowIdOf(params: unknown): unknown {
+  return typeof params === "object" && params !== null ? (params as { flow_id?: unknown }).flow_id : undefined;
+}
+
+function isFlowIdEnvelope(params: unknown): params is { flow_id: string } {
+  return typeof params === "object" && params !== null && typeof (params as { flow_id?: unknown }).flow_id === "string";
+}
+
+function flowTypeOf(params: unknown): unknown {
+  return typeof params === "object" && params !== null ? (params as { flow_type?: unknown }).flow_type : undefined;
+}
+
+const noop = (): void => {};
+
+/** Most flows a peer holds validation context for at once; a new start beyond it is refused. */
+const MAX_ACTIVE_FLOWS = 4096;
+
+/** Most finished flows remembered per session; at that point new starts are refused until the session is renewed. */
+const MAX_TERMINAL_HISTORY = 65536;
 
 function toRPCError(err: unknown): RPCError {
   if (err instanceof WMPError) {

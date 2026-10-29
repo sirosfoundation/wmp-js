@@ -17,7 +17,13 @@ import { isRequest, isResponse } from "../src/jsonrpc.js";
 import type { Request, Response } from "../src/jsonrpc.js";
 import { Method, ErrorCode } from "../src/types.js";
 
-import { loadManifest, loadVectors, vectorFilesOnDisk, vectorsDir, specDir } from "./vectors.js";
+import {
+  validateCompletionResult,
+  validateMatchResult,
+  splitReplaySecrets,
+  CompletionResultError,
+} from "../src/completion.js";
+import { loadManifest, loadVectors, vectorFilesOnDisk, vectorsDir, specDir, type TestVector } from "./vectors.js";
 
 // Collect all known method names from the Method constant
 const knownMethods = new Set(Object.values(Method));
@@ -311,4 +317,93 @@ describe("Conformance: error codes match Core §3.8", () => {
   it("defines -31019 as PlaintextHashMismatch", () => {
     expect(ErrorCode.PlaintextHashMismatch).toBe(-31019);
   });
+});
+
+// ---------------------------------------------------------------------------
+// flow-lifecycle: execute the flow checks, including every must_refuse vector
+// ---------------------------------------------------------------------------
+
+interface FlowMsg {
+  method?: string;
+  params?: { flow_id?: string; flow_type?: string; params?: { dcql_query?: { credentials?: { id: string }[] } }; result?: unknown };
+}
+
+function messagesOf(input: unknown): FlowMsg[] {
+  if (Array.isArray(input)) return input.map((s) => (s as { message: FlowMsg }).message);
+  return [input as FlowMsg];
+}
+
+/**
+ * Applies the flow checks wmp-js implements to one vector. Returns, per message
+ * that a check applied to, whether the check reported a violation. The result
+ * check is selected by the flow type recorded when the flow started (match vs
+ * the rest), never by members of the result (openid4x 3.3.3); a vector that
+ * is a lone flow.complete has no start, so by convention its flow_id names the
+ * type: "*-match" is a match flow.
+ */
+function runFlowChecks(v: TestVector): boolean[] {
+  const flowTypes = new Map<string, string>();
+  const queryIds = new Map<string, string[]>();
+  const outcomes: boolean[] = [];
+  for (const msg of messagesOf(v.input)) {
+    const id = msg.params?.flow_id ?? "";
+    if (msg.method === "wmp.flow.start") {
+      flowTypes.set(id, msg.params?.flow_type ?? "");
+      const q = msg.params?.params?.dcql_query?.credentials;
+      if (q) queryIds.set(id, q.map((c) => c.id));
+      continue;
+    }
+    if (msg.method !== "wmp.flow.complete" || msg.params?.result === undefined) continue;
+    const isMatch = (flowTypes.get(id) ?? (id.endsWith("-match") ? "match" : "")) === "match";
+    try {
+      if (isMatch) validateMatchResult(msg.params.result, queryIds.get(id));
+      else validateCompletionResult(msg.params.result);
+      outcomes.push(false);
+    } catch (e) {
+      if (!(e instanceof CompletionResultError)) throw e;
+      outcomes.push(true);
+    }
+  }
+  return outcomes;
+}
+
+describe("Conformance: flow-lifecycle vectors are executed", () => {
+  const vectors = loadVectors("flow-lifecycle.json");
+  // must_refuse vectors whose check is not implemented yet, by method of the
+  // refused message. Nothing may be added; an implemented check removes its entry.
+  const pendingMustRefuse = new Set<string>(["wmp.flow.action"]);
+
+  for (const v of vectors) {
+    it(`${v.id}: ${v.must_refuse ? "is refused" : "passes the flow checks"}`, () => {
+      const outcomes = runFlowChecks(v);
+      if (v.must_refuse) {
+        if (outcomes.length === 0) {
+          const method = messagesOf(v.input)[0].method ?? "";
+          expect(pendingMustRefuse.has(method), `${v.id}: must_refuse vector (${method}) was not checked`).toBe(true);
+          return;
+        }
+        expect(outcomes.every(Boolean), `${v.id}: must_refuse vector passed the conformance check`).toBe(true);
+      } else {
+        expect(outcomes.every((violated) => !violated), `${v.id}: conforming vector was refused`).toBe(true);
+      }
+    });
+  }
+
+  it("executes a substantial number of must_refuse vectors", () => {
+    const executed = vectors.filter((v) => v.must_refuse && runFlowChecks(v).length > 0);
+    expect(executed.length).toBeGreaterThanOrEqual(15);
+  });
+
+  for (const v of vectors.filter((x) => x.expected_replay !== undefined)) {
+    it(`${v.id}: replay form matches expected_replay`, () => {
+      const out = splitReplaySecrets(JSON.stringify(v.input));
+      expect(out.ok).toBe(true);
+      expect(JSON.parse(out.replay)).toEqual(v.expected_replay);
+      // The retained copy conforms, and the live form is the input unchanged.
+      const replayed = JSON.parse(out.replay) as FlowMsg;
+      validateCompletionResult(replayed.params?.result);
+      if (out.live !== undefined) expect(JSON.parse(out.live)).toEqual(v.input);
+      else expect(JSON.parse(out.replay)).toEqual(v.input);
+    });
+  }
 });
