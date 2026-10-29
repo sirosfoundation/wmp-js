@@ -1444,9 +1444,10 @@ export class Peer implements PeerContext {
         return;
       }
       try {
-        await this.resumeSerialized(undefined, epoch, gen);
-        // A resume that carried no snapshot leaves the grant withdrawn: ask for one.
-        if (mark !== undefined && this.capRev === mark && this.lifecycle === gen && !this.closed) this.scheduleGrantRefresh("remote");
+        const resumed = await this.resumeSerialized(undefined, epoch, gen);
+        // A resume that carried no snapshot leaves the grant withdrawn: ask for one,
+        // whatever other gaps bumped the revision meanwhile.
+        if (mark !== undefined && resumed?.capabilities === undefined && this.lifecycle === gen && !this.closed) this.scheduleGrantRefresh("remote");
       } catch (err: unknown) {
         // The session changed (or the peer closed) while resuming: nothing was lost.
         if (err instanceof StaleSessionError || this.closed || this.flowEpoch !== epoch || this.lifecycle !== gen) return;

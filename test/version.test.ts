@@ -2099,6 +2099,17 @@ describe("session ordering and resume hygiene (round 12)", () => {
     expect((t.sent[0] as Response).error?.code).toBe(-31005);
   });
 
+  it("two coalesced gaps: a resume without a snapshot still triggers the capability refresh", async () => {
+    const { t } = await mkClient();
+    t.emitEvent("gap");
+    t.emitEvent("gap"); // coalesced: bumps the revision again
+    await settle();
+    const resume = t.sent.find((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string };
+    t.receive({ jsonrpc: "2.0", id: resume.id, result: { wmp: { version: "0.1", session_id: "ses-1" }, resumed: true, missed_messages: 1, security: { mode: "tls" } } });
+    await settle(30);
+    expect(t.sent.some((m) => (m as { method?: string }).method === "wmp.capability.list")).toBe(true);
+  });
+
   it("a gap withdraws the grant at once, even while another resume holds the recovery chain", async () => {
     const { t, peer } = await mkClient();
     const pending = peer.resumeSession(); // unanswered: the recovery of the gap queues behind it
