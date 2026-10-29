@@ -1074,6 +1074,17 @@ describe("select_credentials is refused before any handler sees it (round 9)", (
     }
   });
 
+  it("an action for a flow the refusal already ended is refused too, never reaching the handler", async () => {
+    const { t, onFlowAction } = await orchestrator();
+    t.receive(action("a1", { consent: true, selections: [{ query_id: "pid", selection_handle: H, vct: "x" }] }));
+    await settle(40);
+    t.sent.length = 0;
+    t.receive(action("a2", { consent: true, selections: [{ credential_id: "SECRET-CRED" }] }));
+    await settle(40);
+    expect((t.sent.find((m) => (m as { id?: string }).id === "a2") as Response).error?.code).toBe(-32602);
+    expect(onFlowAction).not.toHaveBeenCalled();
+  });
+
   it("a conforming action reaches the handler; the flow stays active", async () => {
     const { t, onFlowAction } = await orchestrator();
     t.receive(action("a1", { consent: true, selections: [{ query_id: "pid", selection_handle: H }] }));

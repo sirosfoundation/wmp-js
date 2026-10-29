@@ -990,6 +990,12 @@ export class Peer implements PeerContext {
     // The envelope is checked, and the flow type is the one recorded at start.
     if (method === Method.FlowAction) {
       const fid = flowIdOf(params);
+      // An action for a flow that already ended (completed, failed or cancelled)
+      // has nothing to act on, and its validation record is gone: it must not fall
+      // through to the handlers unchecked. A genuine replacement start clears the marker.
+      if (typeof fid === "string" && this.terminalSeen.has(fid) && !this.recordedFlows.has(fid)) {
+        throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "flow has ended" });
+      }
       const recorded = typeof fid === "string" ? this.recordedFlows.get(fid) : undefined;
       const validating = recorded ? this.registry.getFlowHandler(recorded.type) : undefined;
       if (validating?.validateAction) {
