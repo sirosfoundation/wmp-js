@@ -355,7 +355,19 @@ export class Peer implements PeerContext {
 
   /** Drops the validation context of a flow that ended; the flow_id is free to start again. */
   private releaseFlow(flowId: unknown): void {
-    if (typeof flowId === "string") this.recordedFlows.delete(flowId);
+    if (typeof flowId !== "string") return;
+    this.recordedFlows.delete(flowId);
+    this.releaseGen(flowId);
+  }
+
+  /**
+   * Reclaims a flow id's generation once nothing needs it: the flow is not active
+   * and no cancellation for it is pending (a pending one compares against it).
+   * Without this every finished flow would leave an entry behind for the whole
+   * session. A missing entry reads as generation 0.
+   */
+  private releaseGen(flowId: string): void {
+    if (!this.recordedFlows.has(flowId) && !this.cancelling.has(flowId)) this.flowGen.delete(flowId);
   }
 
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
@@ -1043,7 +1055,10 @@ export class Peer implements PeerContext {
                 if (this.flowEpoch === epoch && (this.flowGen.get(flowId) ?? 0) === gen) this.endFlow(flowId, "cancelled");
                 return result;
               } finally {
-                if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
+                if (this.cancelling.get(flowId) === entry) {
+                  this.cancelling.delete(flowId); // a failure leaves a retry possible
+                  this.releaseGen(flowId);
+                }
               }
             })();
             this.cancelling.set(flowId, entry);
@@ -1103,6 +1118,7 @@ export class Peer implements PeerContext {
   private endFlow(flowId: unknown, kind: "ended" | "cancelled" = "ended"): void {
     if (typeof flowId !== "string") return;
     const known = this.recordedFlows.delete(flowId);
+    this.releaseGen(flowId);
     // A flow already in the history may be re-marked (a cancel of an ended flow
     // upgrades its kind) without growing it.
     if (known || this.terminalSeen.has(flowId)) this.markTerminal(flowId, kind);

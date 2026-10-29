@@ -1114,3 +1114,166 @@ describe("rolled-back generations and per-session recovery queue (round 7)", () 
     expect(peer.token).toBe("rtB2");
   });
 });
+
+describe("stub: a reused flow id starts clean (round 9)", () => {
+  const settleS = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  it("recovery before the replacement finishes does not re-send the old flow's terminal notification", async () => {
+    const onFlowComplete = vi.fn();
+    const { t, sid, peer } = await setup(3, { onFlowComplete });
+    peer.startFlow("sign", "f", {}).catch(() => {});
+    await settleS(40);
+    stub.emit(sid, { jsonrpc: "2.0", method: "wmp.flow.complete", params: { wmp: { version: "0.1", session_id: sid }, flow_id: "f", result: { credentials: [] } } });
+    await settleS(40);
+    expect(onFlowComplete).toHaveBeenCalledTimes(1);
+    peer.startFlow("sign", "f", {}).catch(() => {}); // a new flow under the same id
+    await settleS(40);
+    stub.dropConnections(sid);
+    for (let i = 0; i < 5; i++) stub.emit(sid, progress(sid, "other", `s${i}`));
+    t.reconnectSSE(); // gap -> resume re-sends retained flow state
+    await settleS(250);
+    expect(onFlowComplete).toHaveBeenCalledTimes(1); // the old terminal was not replayed onto the replacement
+  });
+});
+
+describe("housekeeping (round 9)", () => {
+  const settle9 = (ms = 10) => new Promise((r) => setTimeout(r, ms));
+  const gens = (peer: Peer) => (peer as unknown as { flowGen: Map<string, number> }).flowGen;
+  const startF = (id: string, flow: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: flow, params: {} } });
+  const onStart = async (p: { wmp: never; flow_id: string; flow_type: string }) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type });
+
+  it("flow generations are reclaimed when a flow is finished locally or its cancellation succeeded", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onFlowStart: onStart as never, onFlowCancel: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }) } });
+    for (let i = 0; i < 20; i++) {
+      t.receive(startF(`s${i}`, `f${i}`));
+      await Promise.resolve();
+      await Promise.resolve();
+      await peer.flowComplete(`f${i}`, {});
+    }
+    t.receive(startF("sc", "c1"));
+    await settle9();
+    peer.flowCancel("c1").catch(() => {});
+    await settle9();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1" }, flow_id: "c1", status: "cancelled" } });
+    await settle9();
+    expect(gens(peer).size).toBe(0);
+  });
+
+  it("a pending cancellation keeps its flow's generation until it is done", async () => {
+    const t = new MockTransport();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const peer = new Peer(t, { handler: { onFlowStart: onStart as never, onFlowCancel: async (p) => { await gate; return { wmp: p.wmp, flow_id: p.flow_id, status: "cancelled" }; }, onFlowComplete: vi.fn() } });
+    t.receive(startF("s", "f"));
+    await settle9();
+    t.receive({ jsonrpc: "2.0", id: "c1", method: "wmp.flow.cancel", params: { wmp: { version: "0.1" }, flow_id: "f" } });
+    await settle9();
+    await peer.flowComplete("f", {}); // finished locally while the cancellation is pending
+    expect(gens(peer).size).toBe(1);
+    release();
+    await settle9();
+    expect(gens(peer).size).toBe(0);
+  });
+
+  const created = async (peer: Peer, t: MockTransport, sid: string, token: string) => {
+    const p = peer.createSession({});
+    await settle9();
+    t.receive({ jsonrpc: "2.0", id: (t.sent.at(-1) as { id: string }).id, result: { wmp: { version: "0.1", session_id: sid }, capabilities: {}, security: { mode: "tls" }, resumption_token: token } });
+    await p;
+  };
+
+  it("an explicit resume queued for session A does not run against session B", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    await created(peer, t, "ses-A", "rtA");
+    const first = peer.resumeSession({ lastReceivedId: "evA1" }); // on the wire
+    await settle9();
+    const second = peer.resumeSession({ lastReceivedId: "evA2" }); // queued behind it
+    second.catch(() => {});
+    await settle9();
+    await created(peer, t, "ses-B", "rtB"); // B replaces A
+    const resumes = () => t.sent.filter((m) => (m as { method?: string }).method === "wmp.session.resume") as { id: string; params: { session_id: string; resumption_token: string; last_received_id?: string } }[];
+    t.receive({ jsonrpc: "2.0", id: resumes()[0].id, result: { wmp: { version: "0.1", session_id: "ses-A" }, resumed: true, missed_messages: 0, resumption_token: "rtA2", security: { mode: "tls" } } });
+    await first.catch(() => {});
+    await expect(second).rejects.toBeDefined();
+    await settle9(30);
+    expect(resumes()).toHaveLength(1); // nothing was sent for B with A's lastReceivedId
+    expect(peer.session).toBe("ses-B");
+  });
+
+  it("a 410 probe for session A that finishes after session B was bound does not produce a gap", async () => {
+    const instances: { onerror: (() => void) | null; onopen: (() => void) | null; readyState: number }[] = [];
+    class Closed {
+      readyState = 2;
+      onopen: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onmessage = null;
+      constructor() {
+        instances.push(this);
+        // streams opened after the first one (a recovery) open at once
+        if (instances.length > 1) queueMicrotask(() => this.onopen?.());
+      }
+      addEventListener() {}
+      close() {}
+    }
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const fetchFn = vi.fn(async () => {
+      await gate;
+      return { status: 410 } as Response;
+    });
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Closed as unknown as typeof EventSource, fetch: fetchFn as never, lastEventId: "cursor-A" });
+    const gaps = vi.fn();
+    const errors = vi.fn();
+    t.on("gap", gaps);
+    t.on("error", errors);
+    t.setSessionId("ses-A");
+    t.connectSSE();
+    instances[0].onerror?.(); // the stream for A failed: the probe starts
+    await settle9();
+    t.setSessionId("ses-B"); // B is bound while the probe is pending
+    release();
+    await settle9(30);
+    expect(gaps).not.toHaveBeenCalled();
+    expect(errors).not.toHaveBeenCalled();
+    expect(t.lastEventId).toBeUndefined(); // and B's replay state was reset by the switch, not by A's 410
+  });
+
+  it("clearSession forgets the binding, the cursor and the seen ids and closes the stream", () => {
+    const closed: number[] = [];
+    class Fake {
+      readyState = 1;
+      onopen = null;
+      onerror = null;
+      onmessage = null;
+      private l: ((ev: MessageEvent) => void)[] = [];
+      addEventListener(_t: string, fn: (ev: MessageEvent) => void) {
+        this.l.push(fn);
+      }
+      fire(id: string) {
+        this.l.forEach((fn) => fn({ data: JSON.stringify({ jsonrpc: "2.0", method: "wmp.flow.progress", params: { wmp: { version: "0.1" }, flow_id: "f", step: "1" } }), lastEventId: id } as MessageEvent));
+      }
+      close() {
+        closed.push(1);
+      }
+    }
+    const made: Fake[] = [];
+    const Ctor = class extends Fake {
+      constructor() {
+        super();
+        made.push(this);
+      }
+    };
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { EventSource: Ctor as unknown as typeof EventSource });
+    t.setSessionId("ses-A");
+    t.connectSSE();
+    made[0].fire("1");
+    expect(t.lastEventId).toBe("1");
+    t.clearSession();
+    expect(t.lastEventId).toBeUndefined();
+    expect(closed).toHaveLength(1);
+    t.connectSSE();
+    made[1].fire("1"); // the same id in a new session is a new event (no stale seen ids)
+    expect(t.lastEventId).toBe("1");
+  });
+});

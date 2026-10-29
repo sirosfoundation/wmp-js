@@ -841,6 +841,28 @@ describe("Peer: a responder-only peer tracks the session it serves (round 8)", (
     expect((t.sent.at(-1) as Response).error).toBeUndefined();
   });
 
+  it("a matching close clears the session id the peer reports and addresses", async () => {
+    const { t, peer } = mkPeer(() => "ses-1");
+    t.receive(create("c"));
+    await settle();
+    expect(peer.session).toBe("ses-1");
+    t.receive(close("ses-1"));
+    await settle();
+    expect(peer.session).toBeUndefined();
+    t.sent.length = 0;
+    await peer.flowProgress("f", "step"); // convenience messages no longer carry the closed id
+    expect((t.sent[0] as { params: { wmp: { session_id?: string } } }).params.wmp.session_id).toBeUndefined();
+  });
+
+  it("a close naming another session leaves the session id alone", async () => {
+    const { t, peer } = mkPeer(() => "ses-1");
+    t.receive(create("c"));
+    await settle();
+    t.receive(close("ses-OTHER"));
+    await settle();
+    expect(peer.session).toBe("ses-1");
+  });
+
   it("a close naming another session leaves the state alone", async () => {
     const { t } = mkPeer(() => "ses-1");
     t.receive(create("c"));
