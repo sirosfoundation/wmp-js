@@ -875,13 +875,21 @@ export class Peer implements PeerContext {
     const q = flowType === "match" && typeof params === "object" && params !== null ? (params as { dcql_query?: unknown }).dcql_query : undefined;
     const rec = { type: flowType, queryIds: q === undefined ? undefined : dcqlQueryIds(q) };
     this.recordedFlows.set(flowId, rec);
-    this.flowGen.set(flowId, (this.flowGen.get(flowId) ?? 0) + 1); // a new flow under this id
+    const previousGen = this.flowGen.get(flowId);
+    const myGen = ++this.genCounter;
+    this.flowGen.set(flowId, myGen); // a new flow under this id (tentative until the start succeeds)
     return () => {
       // Only while this start's own record is still the flow's: if the
       // replacement already ended, or another flow took the id, the marker is theirs.
       if (this.recordedFlows.get(flowId) === rec) {
         this.recordedFlows.delete(flowId);
         if (hadTerminal !== undefined) this.terminalSeen.set(flowId, hadTerminal);
+        // The start failed: the flow generation it allocated goes with it, so work
+        // tied to the flow that was there before (a pending cancellation) still matches.
+        if (this.flowGen.get(flowId) === myGen) {
+          if (previousGen === undefined) this.flowGen.delete(flowId);
+          else this.flowGen.set(flowId, previousGen);
+        }
       }
     };
   }
@@ -939,6 +947,8 @@ export class Peer implements PeerContext {
    * "this flow" can tell a replacement from the same flow having ended.
    */
   private flowGen = new Map<string, number>();
+  /** Source of unique generation numbers (a rolled-back start never reuses one). */
+  private genCounter = 0;
 
   // Track flow_id → flow_type mapping for routing to the right FlowHandler.
   private activeFlows = new Map<string, string>();
@@ -986,13 +996,14 @@ export class Peer implements PeerContext {
     // Recoveries run one at a time: a second resume sent before the first one's
     // response arrived would present the token the first already rotated. A gap
     // that arrives while one is queued adds nothing (the queued one covers it).
-    if (this.recoveryQueued) return;
-    this.recoveryQueued = true;
     // The session this gap belongs to: recovery work for a session that was closed
     // or replaced meanwhile is discarded, never applied to the one that replaced it.
     const epoch = this.flowEpoch;
+    if (this.recoveryQueuedEpoch === epoch) return; // coalesce only with a queued recovery of THIS session
+    this.recoveryQueuedEpoch = epoch;
     this.recovery = this.recovery.then(async () => {
-      this.recoveryQueued = false;
+      // A stale task must not clear the marker of a newer session's queued recovery.
+      if (this.recoveryQueuedEpoch === epoch) this.recoveryQueuedEpoch = undefined;
       if (this.closed || this.flowEpoch !== epoch) return;
       if (!this.sessionId || !this.resumptionToken) {
         this.onSessionLost?.(new Error("event gap and no resumption token to resume with"));
@@ -1009,7 +1020,7 @@ export class Peer implements PeerContext {
   }
 
   private recovery: Promise<void> = Promise.resolve();
-  private recoveryQueued = false;
+  private recoveryQueuedEpoch: number | undefined;
 
   private onTransportClose(): void {
     if (!this.closed) {
