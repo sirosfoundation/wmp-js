@@ -1743,7 +1743,7 @@ describe("capability ordering, generic session edge cases, refresh queue (round 
   const createAnswer = (id: string, sid: string, token?: string, caps: Record<string, unknown> = {}, version = "0.1") => ({ jsonrpc: "2.0" as const, id, result: { wmp: { version, session_id: sid }, capabilities: caps, security: { mode: "tls" }, ...(token ? { resumption_token: token } : {}) } });
   const capsList = (t: MockTransport) => t.sent.filter((m) => (m as { method?: string }).method === "wmp.capability.list") as { id: string }[];
 
-  it("a slow incoming revocation and a later list cannot leave the revoked capability admitted (handlers run in order)", async () => {
+  it("a slow incoming revocation and a list that ran before it finished cannot leave the revoked capability admitted", async () => {
     let granted: Record<string, unknown> = { oid4vci: {} };
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -1769,8 +1769,6 @@ describe("capability ordering, generic session edge cases, refresh queue (round 
     await settle();
     release();
     await settle(30);
-    const listAnswer = t.sent.find((m) => (m as { id?: string }).id === "l") as { result: { capabilities: Record<string, unknown> } };
-    expect(listAnswer.result.capabilities).toEqual({}); // it saw the revocation
     t.sent.length = 0;
     t.receive(startVci("ses-1"));
     await settle();
@@ -1779,6 +1777,7 @@ describe("capability ordering, generic session edge cases, refresh queue (round 
   });
 
   it("an incoming handler's result cannot undo a newer change made through the outgoing direction", async () => {
+    let granted: Record<string, unknown> = { oid4vci: {} };
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     const t = new MockTransport();
@@ -1786,7 +1785,7 @@ describe("capability ordering, generic session edge cases, refresh queue (round 
       handler: {
         onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } }),
         onCapabilityList: async () => {
-          const snapshot = { oid4vci: {} }; // captured now...
+          const snapshot = { ...granted }; // captured now...
           await gate; // ...answered later
           return { wmp: { version: "0.1" }, capabilities: snapshot, security: { mode: "tls" } };
         },
@@ -1803,6 +1802,7 @@ describe("capability ordering, generic session edge cases, refresh queue (round 
     await settle();
     t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } } }); // revoked through the outgoing direction
     await upd;
+    granted = {}; // the revocation reached this peer's own authority too
     release(); // the delayed incoming list now returns its old snapshot
     await settle(30);
     t.sent.length = 0;
@@ -1919,13 +1919,88 @@ describe("capability ordering, generic session edge cases, refresh queue (round 
     await settle();
     expect(capsList(t)).toHaveLength(3); // l1, l2 and the first refresh
     // another stale answer arrives while refresh #1 is still unanswered
-    t.receive({ jsonrpc: "2.0", id: l2id, result: { wmp: { version: "0.1" }, capabilities: {}, security: { mode: "tls" } } });
-    await Promise.all([l1, u1, l2]);
+    t.receive({ jsonrpc: "2.0", id: l2id, result: { wmp: { version: "0.1" }, capabilities: { other: {} }, security: { mode: "tls" } } }); // stale and different from the cache
     await settle();
     expect(capsList(t)).toHaveLength(3); // the second refresh waits for the first
     const refresh1 = capsList(t)[2];
     t.receive({ jsonrpc: "2.0", id: refresh1.id, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } });
     await settle(30);
     expect(capsList(t).length).toBeGreaterThanOrEqual(4); // the queued refresh ran after it
+  });
+});
+
+describe("stale snapshots, refresh sources (round 11)", () => {
+  const vci = () => {
+    const onVCIStart = vi.fn(async (p: { wmp: unknown; flow_id: string; flow_type: string }) => ({ wmp: p.wmp as never, flow_id: p.flow_id, flow_type: p.flow_type }));
+    return { profile: new OpenID4xProfile({ oid4vci: { supported_grants: [], supported_formats: [] }, onVCIStart }), onVCIStart };
+  };
+  const startVci = (sid?: string) => ({
+    jsonrpc: "2.0" as const,
+    id: "f",
+    method: "wmp.flow.start",
+    params: { wmp: { version: "0.1", ...(sid ? { session_id: sid } : {}) }, flow_type: "oid4vci", flow_id: "flow-1", params: {} },
+  });
+  const mkCreate = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+  const createAnswer = (id: string, sid: string, caps: Record<string, unknown> = {}) => ({ jsonrpc: "2.0" as const, id, result: { wmp: { version: "0.1", session_id: sid }, capabilities: caps, security: { mode: "tls" }, resumption_token: "rt" } });
+
+  it("a stale incoming snapshot that narrows is reconciled against the peer's own authority, restoring a newly granted capability", async () => {
+    let granted: Record<string, unknown> = {};
+    let slow = true;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let calls = 0;
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }),
+        onCapabilityList: async () => {
+          calls++;
+          const snapshot = { ...granted }; // captured when it starts
+          if (slow && calls === 1) await gate; // the first list is slow
+          return { wmp: { version: "0.1" }, capabilities: snapshot, security: { mode: "tls" } };
+        },
+      },
+    });
+    const v = vci();
+    peer.use(v.profile);
+    t.receive(mkCreate("c"));
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: "l", method: "wmp.capability.list", params: { wmp: { version: "0.1", session_id: "ses-1" } } }); // captures {}
+    await settle();
+    t.sent.length = 0;
+    const upd = peer.call("wmp.capability.update", { wmp: { version: "0.1", session_id: "ses-1" }, add: { oid4vci: {} } });
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: (t.sent[0] as { id: string }).id, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } }); // grants oid4vci
+    await upd;
+    granted = { oid4vci: {} }; // and so does this peer's own authority
+    release(); // the old list finishes with its stale {}
+    await settle(40);
+    t.sent.length = 0;
+    t.receive(startVci("ses-1"));
+    await settle();
+    expect((t.sent[0] as Response).error).toBeUndefined(); // the grant was not left permanently narrowed
+    expect(v.onVCIStart).toHaveBeenCalled();
+    void slow;
+  });
+
+  it("a stale snapshot that names exactly what is cached triggers no refresh (no ping-pong between peers)", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    const v = vci();
+    peer.use(v.profile);
+    const c = peer.createSession({});
+    await settle();
+    t.receive(createAnswer((t.sent[0] as { id: string }).id, "ses-1", { oid4vci: {} }));
+    await c;
+    t.sent.length = 0;
+    const l1 = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } });
+    const l2 = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-1" } });
+    await settle();
+    const [id1, id2] = t.sent.map((m) => (m as { id: string }).id);
+    t.receive({ jsonrpc: "2.0", id: id1, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } }); // fresh: applies
+    t.receive({ jsonrpc: "2.0", id: id2, result: { wmp: { version: "0.1" }, capabilities: { oid4vci: {} }, security: { mode: "tls" } } }); // stale but identical membership
+    await Promise.all([l1, l2]);
+    await settle(30);
+    expect(t.sent.filter((m) => (m as { method?: string }).method === "wmp.capability.list")).toHaveLength(2); // no refresh requested
   });
 });
