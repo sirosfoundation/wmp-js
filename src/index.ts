@@ -147,6 +147,7 @@ export {
   OpenID4xProfile,
   buildVCIFlowStart,
   withAttestation,
+  transactionDataHashesAlgs,
 } from "./openid4x.js";
 export type {
   CredentialFormatType,
@@ -187,8 +188,22 @@ export { Relay } from "./relay.js";
 export type { RelayConfig, QueuedMessage } from "./relay.js";
 
 // Session store (server-side)
-export { MemorySessionStore } from "./session-store.js";
-export type { Session, SessionStore } from "./session-store.js";
+export {
+  MemorySessionStore,
+  SessionStoreError,
+  isSessionExpired,
+  sessionOwnedBy,
+  tokensEqual,
+} from "./session-store.js";
+export type {
+  Session,
+  SessionStore,
+  SessionStoreErrorCode,
+  TokenRotator,
+  SessionCreator,
+  SessionUpdater,
+  ExpiredSessionLister,
+} from "./session-store.js";
 
 // Discovery
 export { extractDomain, discoverEndpoint } from "./discovery.js";

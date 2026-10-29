@@ -11,31 +11,13 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { isRequest, isResponse } from "../src/jsonrpc.js";
 import type { Request, Response } from "../src/jsonrpc.js";
 import { Method, ErrorCode } from "../src/types.js";
 
-// ---------------------------------------------------------------------------
-// Test vector schema
-// ---------------------------------------------------------------------------
-
-interface TestVector {
-  id: string;
-  description: string;
-  conformance_level: string;
-  input: unknown;
-  expected_response?: unknown;
-  expected_error?: unknown;
-  notes?: string;
-}
-
-function loadVectors(filename: string): TestVector[] {
-  const path = resolve(__dirname, "../../wmp/vectors", filename);
-  const data = readFileSync(path, "utf8");
-  return JSON.parse(data) as TestVector[];
-}
+import { loadManifest, loadVectors, vectorFilesOnDisk, vectorsDir, specDir } from "./vectors.js";
 
 // Collect all known method names from the Method constant
 const knownMethods = new Set(Object.values(Method));
@@ -259,5 +241,74 @@ describe("Conformance: method coverage", () => {
         `Vector method '${m}' not in Method constants`,
       ).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manifest: every vector file is listed, every listed file exists
+// ---------------------------------------------------------------------------
+
+describe("Conformance: manifest", () => {
+  const manifest = loadManifest();
+
+  it("lists every vector file in the directory and nothing else", () => {
+    const listed = manifest.map((e) => e.file).sort();
+    expect(listed).toEqual(vectorFilesOnDisk());
+  });
+
+  it("uses only kinds this harness executes", () => {
+    for (const e of manifest) {
+      expect(["rpc", "interop", "transport-http"], `${e.file}: kind ${e.kind}`).toContain(e.kind);
+    }
+  });
+
+  for (const e of manifest) {
+    it(`${e.file} (${e.kind}) parses as a non-empty vector array with unique ids`, () => {
+      const vectors = loadVectors(e.file);
+      expect(vectors.length, `${e.file} has no vectors`).toBeGreaterThan(0);
+      const ids = vectors.map((v) => v.id);
+      expect(new Set(ids).size, `${e.file}: duplicate vector ids`).toBe(ids.length);
+    });
+  }
+});
+
+describe("Conformance: vectors directory", () => {
+  it("resolves to a directory that holds the manifest (whatever it is called)", () => {
+    expect(existsSync(resolve(vectorsDir(), "manifest.json"))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error codes: ErrorCode and Core §3.8 define the same set
+// ---------------------------------------------------------------------------
+
+describe("Conformance: error codes match Core §3.8", () => {
+  const spec = readFileSync(resolve(specDir(), "wmp-core.md"), "utf8");
+  // Table rows of the form "| -31019 | Name | ... |".
+  const specCodes = new Set(
+    [...spec.matchAll(/^\|\s*(-3\d{4})\s*\|/gm)].map((m) => Number(m[1])),
+  );
+
+  it("finds the WMP error codes in the spec", () => {
+    expect(specCodes.size).toBeGreaterThan(15);
+    expect(specCodes.has(-31019)).toBe(true);
+  });
+
+  it("every WMP code in the spec is an ErrorCode member", () => {
+    for (const code of specCodes) {
+      if (code <= -32000) continue; // JSON-RPC standard codes
+      expect(knownErrorCodes.has(code as never), `ErrorCode lacks ${code}`).toBe(true);
+    }
+  });
+
+  it("every WMP ErrorCode member is in the spec", () => {
+    for (const code of knownErrorCodes) {
+      if (code <= -32000) continue;
+      expect(specCodes.has(code), `spec lacks ${code}`).toBe(true);
+    }
+  });
+
+  it("defines -31019 as PlaintextHashMismatch", () => {
+    expect(ErrorCode.PlaintextHashMismatch).toBe(-31019);
   });
 });

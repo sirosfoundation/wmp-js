@@ -7,6 +7,7 @@ import {
   OpenID4xProfile,
   buildVCIFlowStart,
   withAttestation,
+  transactionDataHashesAlgs,
 } from "../src/openid4x.js";
 import type {
   ClientAttestationProvider,
@@ -320,5 +321,20 @@ describe("CredentialNotificationParams type", () => {
     };
     expect(notification.event).toBe("credential_failure");
     expect(notification.event_description).toBe("User revoked consent");
+  });
+});
+
+describe("transactionDataHashesAlgs", () => {
+  it("accepts the array shape", () => {
+    expect(transactionDataHashesAlgs({ transaction_data_hashes_alg: ["sha-256", "sha-384"] })).toEqual(["sha-256", "sha-384"]);
+  });
+  it("accepts a bare string from an older peer", () => {
+    expect(transactionDataHashesAlgs({ transaction_data_hashes_alg: "sha-256" })).toEqual(["sha-256"]);
+  });
+  it("drops empty and non-string values", () => {
+    expect(transactionDataHashesAlgs({})).toEqual([]);
+    expect(transactionDataHashesAlgs({ transaction_data_hashes_alg: "" })).toEqual([]);
+    expect(transactionDataHashesAlgs({ transaction_data_hashes_alg: [1, "", "sha-256"] as never })).toEqual(["sha-256"]);
+    expect(transactionDataHashesAlgs({ transaction_data_hashes_alg: 5 as never })).toEqual([]);
   });
 });

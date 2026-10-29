@@ -57,6 +57,7 @@ export const EventReasonCode = {
   Timeout: "timeout",
   SystemError: "system_error",
   DelegationInvalid: "delegation_invalid",
+  PlaintextHashMismatch: "plaintext_hash_mismatch",
 } as const;
 
 // ---------------------------------------------------------------------------

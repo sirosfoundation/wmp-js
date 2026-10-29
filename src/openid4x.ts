@@ -357,8 +357,25 @@ export interface TransactionData {
   credential_ids?: string[];
   /** Hash algorithm for transaction_data_hashes */
   hash_alg?: string;
-  /** Algorithm identifier for the hashes claim in KB-JWT */
-  transaction_data_hashes_alg?: string;
+  /**
+   * The verifier's acceptable hash algorithms for this entry (OID4VP). An
+   * array on the wire; a bare string is accepted from older peers. Read it
+   * through {@link transactionDataHashesAlgs}.
+   */
+  transaction_data_hashes_alg?: string[] | string;
+}
+
+/**
+ * Normalizes TransactionData.transaction_data_hashes_alg to an array (the
+ * spec shape); a bare string from an older peer becomes a one-element array.
+ * Anything else (including empty strings and non-string array members) is
+ * dropped.
+ */
+export function transactionDataHashesAlgs(td: Pick<TransactionData, "transaction_data_hashes_alg">): string[] {
+  const v: unknown = td.transaction_data_hashes_alg;
+  if (typeof v === "string") return v === "" ? [] : [v];
+  if (Array.isArray(v)) return v.filter((x): x is string => typeof x === "string" && x !== "");
+  return [];
 }
 
 export interface SignSubFlowParams {
