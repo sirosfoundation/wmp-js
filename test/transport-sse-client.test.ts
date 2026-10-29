@@ -1523,3 +1523,21 @@ describe("first binding, create requests, cancellation bookkeeping across resets
     await settle11();
   });
 });
+
+describe("resume requests are routed by the session they ask for (round 12)", () => {
+  it("the Wmp-Session-Id of a session.resume names the requested session, the binding is untouched", async () => {
+    const calls: Record<string, string>[] = [];
+    const fetchFn = vi.fn(async (_url: string, init: { headers: Record<string, string> }) => {
+      calls.push(init.headers);
+      return new Response("", { status: 202 });
+    });
+    const t = new HttpSseTransport("http://x/wmp", "http://x/events", { fetch: fetchFn as never });
+    t.setSessionId("ses-A");
+    await t.send({ jsonrpc: "2.0", id: "1", method: "wmp.session.resume", params: { wmp: { version: "0.1" }, session_id: "ses-B", resumption_token: "x" } });
+    expect(calls[0]["Wmp-Session-Id"]).toBe("ses-B");
+    await t.send({ jsonrpc: "2.0", id: "2", method: "wmp.flow.start", params: { wmp: { version: "0.1" } } });
+    expect(calls[1]["Wmp-Session-Id"]).toBe("ses-A"); // the binding did not move
+    await t.send({ jsonrpc: "2.0", id: "3", method: "wmp.session.resume", params: { wmp: { version: "0.1" }, resumption_token: "x" } }); // names none: the bound one
+    expect(calls[2]["Wmp-Session-Id"]).toBe("ses-A");
+  });
+});
