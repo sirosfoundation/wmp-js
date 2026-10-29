@@ -807,3 +807,81 @@ describe("Peer: bounded terminal history (round 5)", () => {
     expect(onFlowComplete).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("Peer: a responder-only peer tracks the session it serves (round 8)", () => {
+  const settle = () => new Promise((r) => setTimeout(r, 10));
+  const start = (id: string, flowId: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.flow.start", params: { wmp: { version: "0.1" }, flow_type: "x", flow_id: flowId, params: {} } });
+  const mkPeer = (resumeId: () => string) => {
+    const t = new MockTransport();
+    const onFlowComplete = vi.fn();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "0.1", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }),
+        onSessionResume: async () => ({ wmp: { version: "0.1", session_id: resumeId() }, resumed: true, missed_messages: 0, security: { mode: "tls" } }),
+        onFlowStart: async (p) => ({ wmp: p.wmp, flow_id: p.flow_id, flow_type: p.flow_type }),
+        onFlowComplete,
+      },
+    });
+    return { t, peer, onFlowComplete };
+  };
+  const create = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+  const close = (sid: string) => ({ jsonrpc: "2.0" as const, method: "wmp.session.close", params: { wmp: { version: "0.1", session_id: sid }, reason: "complete" } });
+
+  it("records the session id from create, so a close naming it clears the flow state", async () => {
+    const { t, peer } = mkPeer(() => "ses-1");
+    t.receive(create("c"));
+    await settle();
+    expect(peer.session).toBe("ses-1");
+    t.receive(start("a", "f1"));
+    await settle();
+    t.receive(close("ses-1")); // names the session this peer serves
+    await settle();
+    t.receive(start("b", "f1")); // the id is free again
+    await settle();
+    expect((t.sent.at(-1) as Response).error).toBeUndefined();
+  });
+
+  it("a close naming another session leaves the state alone", async () => {
+    const { t } = mkPeer(() => "ses-1");
+    t.receive(create("c"));
+    await settle();
+    t.receive(start("a", "f1"));
+    await settle();
+    t.receive(close("ses-OTHER"));
+    await settle();
+    t.receive(start("b", "f1"));
+    await settle();
+    expect((t.sent.at(-1) as Response).error?.code).toBe(-32602); // still active
+  });
+
+  it("a resume of a different session drops the old flow state, of the same one keeps it", async () => {
+    let target = "ses-1";
+    const { t, peer } = mkPeer(() => target);
+    t.receive(create("c"));
+    await settle();
+    t.receive(start("a", "f1"));
+    await settle();
+    const resume = async (id: string) => {
+      t.receive({ jsonrpc: "2.0", id, method: "wmp.session.resume", params: { wmp: { version: "0.1" }, session_id: target, resumption_token: "x" } });
+      await settle();
+    };
+    await resume("r1"); // the same session
+    t.receive(start("b", "f1"));
+    await settle();
+    expect((t.sent.at(-1) as Response).error?.code).toBe(-32602); // kept: still active
+    target = "ses-2";
+    await resume("r2"); // another session
+    expect(peer.session).toBe("ses-2");
+    t.receive(start("c2", "f1"));
+    await settle();
+    expect((t.sent.at(-1) as Response).error).toBeUndefined(); // cleared
+  });
+
+  it("a resume on a peer that held no session installs the resumed one", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, { handler: { onSessionResume: async () => ({ wmp: { version: "0.1", session_id: "ses-9" }, resumed: true, missed_messages: 0, security: { mode: "tls" } }) } });
+    t.receive({ jsonrpc: "2.0", id: "r", method: "wmp.session.resume", params: { wmp: { version: "0.1" }, session_id: "ses-9", resumption_token: "x" } });
+    await settle();
+    expect(peer.session).toBe("ses-9");
+  });
+});

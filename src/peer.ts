@@ -185,30 +185,18 @@ export class Peer implements PeerContext {
   private negotiated?: { sessionId?: string; capabilities: Capabilities };
 
   /**
-   * Operations that must not overlap, one chain per kind: outgoing capability
-   * operations, incoming capability handlers, incoming session create/resume.
-   * They finish in the order they started, so the last to finish is also the
-   * latest word and an older snapshot can never replace a newer one. (Outgoing
-   * and incoming are separate chains: each side waits on the other's answer, and
-   * one shared chain could deadlock two peers calling each other.)
+   * Revision of the cached grant: bumped whenever it changes. An operation that
+   * obtains a grant snapshot over an RPC (capability list/update, resume) notes
+   * the revision when it starts; if the grant changed meanwhile the snapshot may
+   * be older than what is cached, so it can only NARROW the grant (never widen
+   * it): a revocation is never undone by a late answer, and no lock is held
+   * across the RPC.
    */
-  private chains: Record<"out" | "in" | "session", Promise<void>> = {
-    out: Promise.resolve(),
-    in: Promise.resolve(),
-    session: Promise.resolve(),
-  };
+  private capRev = 0;
 
-  private async serialized<T>(kind: "out" | "in" | "session", fn: () => Promise<T>): Promise<T> {
-    const previous = this.chains[kind];
-    let release!: () => void;
-    this.chains[kind] = new Promise<void>((r) => (release = r));
-    await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
-  }
+  /** Orders overlapping createSession() calls: the newest request wins whatever order the answers arrive in. */
+  private createSeq = 0;
+  private installedCreateSeq = 0;
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -241,66 +229,95 @@ export class Peer implements PeerContext {
    */
   private lifecycle = 0;
 
+  /** A usable session identity: a non-empty string. Anything else is no identity (the grant is then unbound and admits nothing). */
+  private static usableId(id: unknown): string | undefined {
+    return typeof id === "string" && id !== "" ? id : undefined;
+  }
+
   /** A new session: what it granted replaces what the previous one did (nothing if it omits them). */
-  private beginSession(sessionId: string | undefined, capabilities: Capabilities | undefined): void {
+  private beginSession(sessionId: unknown, capabilities: Capabilities | undefined): void {
     this.lifecycle++;
     // A copy: the grant must not change when the caller's (or handler's) object does.
-    this.negotiated = { sessionId, capabilities: { ...capabilities } };
+    this.negotiated = { sessionId: Peer.usableId(sessionId), capabilities: { ...capabilities } };
+    this.capRev++;
     this.resetFlows(); // flow state of the old session does not carry over
   }
 
   private endSession(): void {
     this.lifecycle++;
     this.negotiated = undefined;
+    this.capRev++;
     this.resetFlows();
   }
 
   /**
-   * A resume of `sessionId`. The SAME session keeps its identity: capabilities
-   * the result lists replace its grant, an omitted set leaves it, and neither the
-   * lifecycle nor the flow state changes. Another session is a replacement: its
-   * grant is what the result lists (nothing if omitted), the lifecycle moves on
-   * and the old session's flow state is dropped.
+   * A resume of `sessionId`; `rev` is the grant revision when the resume was
+   * requested. The SAME session keeps its identity: a capability set the result
+   * lists is a snapshot (applied like a capability result), an omitted set leaves
+   * the grant, and neither the lifecycle nor the flow state changes. Another
+   * session is a replacement: its grant is what the result lists (nothing if
+   * omitted), the lifecycle moves on and the old session's flow state is dropped.
    */
-  private resumeNegotiated(sessionId: string | undefined, capabilities: Capabilities | undefined): void {
+  private resumeNegotiated(sessionId: unknown, capabilities: Capabilities | undefined, rev: number): void {
+    const id = Peer.usableId(sessionId);
     const n = this.negotiated;
-    if (n && n.sessionId === sessionId) {
-      if (capabilities !== undefined) n.capabilities = { ...capabilities };
+    if (n && n.sessionId !== undefined && n.sessionId === id) {
+      if (capabilities !== undefined) this.applySnapshot(n, rev, capabilities);
       return;
     }
     this.lifecycle++;
-    this.negotiated = { sessionId, capabilities: { ...capabilities } };
+    this.negotiated = { sessionId: id, capabilities: { ...capabilities } };
+    this.capRev++;
     this.resetFlows();
   }
 
   /**
-   * A capability update/list result replaces the cached set, but only of an
-   * existing session that is still the one it was requested under: `gen` and
-   * `sessionId` are what was current when the operation started, so a late result
-   * cannot recreate a closed session's grant or overwrite a newer session's.
-   * Operations of one kind never overlap (see `chains`), so results arrive in
-   * the order they were requested.
+   * Applies a grant snapshot obtained at revision `rev`: current revision means
+   * it is the latest word and replaces the grant; a changed revision means it may
+   * be stale, so it only removes capabilities that are no longer listed.
    */
-  private refreshNegotiated(gen: number, sessionId: string | undefined, capabilities: unknown): void {
+  private applySnapshot(n: { capabilities: Capabilities }, rev: number, snapshot: Capabilities): void {
+    if (this.capRev === rev) {
+      n.capabilities = { ...snapshot };
+    } else {
+      const kept: Capabilities = {};
+      for (const k of Object.keys(n.capabilities)) {
+        if (Object.prototype.hasOwnProperty.call(snapshot, k)) kept[k] = n.capabilities[k];
+      }
+      n.capabilities = kept;
+    }
+    this.capRev++;
+  }
+
+  /**
+   * A capability update/list result, applied only to an existing session that is
+   * still the one it was requested under: `gen` and `sessionId` are what was
+   * current when the operation started, so a late result cannot recreate a closed
+   * session's grant or overwrite a newer session's; `rev` orders it against other
+   * changes to the grant (see `capRev`).
+   */
+  private refreshNegotiated(gen: number, sessionId: string | undefined, rev: number, capabilities: unknown): void {
     if (typeof capabilities !== "object" || capabilities === null || Array.isArray(capabilities)) return;
     const n = this.negotiated;
     if (!n || this.lifecycle !== gen) return;
     if (sessionId !== undefined && n.sessionId !== undefined && sessionId !== n.sessionId) return;
-    n.capabilities = { ...(capabilities as Capabilities) };
+    this.applySnapshot(n, rev, capabilities as Capabilities);
   }
 
   /** Whether `capability` was negotiated for the session the request names (fail closed). */
   private hasNegotiated(capability: string, requestSession: unknown): boolean {
     const n = this.negotiated;
-    // A grant that is not bound to a session identity admits nothing (fail closed).
-    if (!n || n.sessionId === undefined) return false;
-    if (typeof requestSession === "string" && requestSession !== n.sessionId) return false;
+    // A grant that is not bound to a usable session identity admits nothing (fail closed).
+    if (!n || n.sessionId === undefined || n.sessionId === "") return false;
+    // Any session id the request carries must be this session's: a present value
+    // of the wrong type or content is not "no id".
+    if (requestSession !== undefined && requestSession !== n.sessionId) return false;
     return Object.prototype.hasOwnProperty.call(n.capabilities, capability);
   }
 
   /** The highest supported version (what a client offers). */
   private offeredVersion(): string {
-    let best: string = VERSION;
+    let best: string | undefined;
     let bestKey = -1;
     for (const v of this.supportedVersions) {
       const p = parseVersion(v);
@@ -310,6 +327,11 @@ export class Peer implements PeerContext {
         bestKey = key;
         best = v;
       }
+    }
+    // Nothing valid to offer: fail before anything is sent, instead of offering a
+    // version this peer was not configured to speak.
+    if (best === undefined) {
+      throw new WMPError(ErrorCode.VersionNotSupported, "No valid supported protocol version configured", { supported_versions: [...this.supportedVersions] });
     }
     return best;
   }
@@ -378,11 +400,6 @@ export class Peer implements PeerContext {
   }
 
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
-    // Capability operations go one at a time: the grant is whatever the last one
-    // said, never an older snapshot that happened to arrive later.
-    if (method === Method.CapabilityUpdate || method === Method.CapabilityList) {
-      return this.serialized("out", () => this.callNow<T>(method, params));
-    }
     return this.callNow<T>(method, params);
   }
 
@@ -396,6 +413,7 @@ export class Peer implements PeerContext {
     // What a capability result is checked against when it comes back: the
     // lifecycle and the session the REQUEST names (else the current one).
     const capturedGen = this.lifecycle;
+    const capturedRev = this.capRev;
     const named = (params as { wmp?: { session_id?: unknown } } | undefined)?.wmp?.session_id;
     const capturedSession = typeof named === "string" ? named : this.negotiated?.sessionId;
 
@@ -413,7 +431,7 @@ export class Peer implements PeerContext {
         resolve: ((v: unknown) => {
           if (method === Method.CapabilityUpdate || method === Method.CapabilityList) {
             // Only the session (and lifecycle) that existed when the request went out may be refreshed.
-            this.refreshNegotiated(capturedGen, capturedSession, (v as { capabilities?: unknown } | undefined)?.capabilities);
+            this.refreshNegotiated(capturedGen, capturedSession, capturedRev, (v as { capabilities?: unknown } | undefined)?.capabilities);
           }
           // A cancelled flow has ended: release its context (shared by the convenience method and profiles).
           if (method === Method.FlowCancel) this.releaseFlow(flowIdOf(params));
@@ -446,6 +464,7 @@ export class Peer implements PeerContext {
     invitationNonce?: string;
   }): Promise<SessionCreateResult> {
     const offered = this.offeredVersion();
+    const seq = ++this.createSeq;
     const wmp: Metadata = { version: offered, sender: opts.sender };
     const params: SessionCreateParams = {
       wmp,
@@ -460,12 +479,16 @@ export class Peer implements PeerContext {
       Method.SessionCreate,
       params,
     );
-    if (!result.wmp?.session_id || typeof result.wmp.session_id !== "string") {
+    const newId = Peer.usableId(result.wmp?.session_id);
+    if (newId === undefined) {
       throw new WMPError(
         ErrorCode.SessionNotFound,
         "session.create response missing session_id",
       );
     }
+    // Overlapping creates: the newest request wins whatever order the answers
+    // arrive in; an older answer arriving after a newer one was installed is stale.
+    if (seq < this.installedCreateSeq) throw new StaleSessionError();
     // Core 2.2.2: the responder selects the highest version it supports that
     // is not above the offered one. Accept that, never a version this peer does
     // not speak or one above the offer.
@@ -477,10 +500,11 @@ export class Peer implements PeerContext {
         { supported_versions: this.supportedVersions },
       );
     }
-    this.sessionId = result.wmp.session_id;
-    this.bindSessionToTransport(result.wmp.session_id);
+    this.installedCreateSeq = seq;
+    this.sessionId = newId;
+    this.bindSessionToTransport(newId);
     this.negotiatedVersion = selected;
-    this.beginSession(result.wmp.session_id, result.capabilities);
+    this.beginSession(newId, result.capabilities);
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
@@ -496,7 +520,10 @@ export class Peer implements PeerContext {
   async resumeSession(opts?: {
     lastReceivedId?: string;
   }): Promise<SessionResumeResult> {
-    return this.resumeSerialized(opts);
+    // The session (lifecycle and flow epoch) this resume is requested for is noted
+    // NOW, before it waits its turn: if that session is closed or replaced while
+    // it queues, it is dropped instead of reinstalling the old session.
+    return this.resumeSerialized(opts, this.flowEpoch, this.lifecycle);
   }
 
   /**
@@ -505,13 +532,13 @@ export class Peer implements PeerContext {
    * waited its turn, it is dropped (StaleSessionError) instead of resuming the
    * session that replaced it.
    */
-  private async resumeSerialized(opts?: { lastReceivedId?: string }, forEpoch?: number): Promise<SessionResumeResult> {
+  private async resumeSerialized(opts: { lastReceivedId?: string } | undefined, forEpoch: number, forGen: number): Promise<SessionResumeResult> {
     const previous = this.resumeChain;
     let release!: () => void;
     this.resumeChain = new Promise<void>((r) => (release = r));
     await previous;
     try {
-      if (forEpoch !== undefined && (this.closed || this.flowEpoch !== forEpoch)) throw new StaleSessionError();
+      if (this.closed || this.flowEpoch !== forEpoch || this.lifecycle !== forGen) throw new StaleSessionError();
       return await this.resumeNow(opts);
     } finally {
       release();
@@ -534,6 +561,7 @@ export class Peer implements PeerContext {
     };
     const gen = this.lifecycle;
     const epoch = this.flowEpoch;
+    const rev = this.capRev;
     const result = await this.call<SessionResumeResult>(
       Method.SessionResume,
       params,
@@ -558,16 +586,17 @@ export class Peer implements PeerContext {
         { supported_versions: this.supportedVersions },
       );
     }
-    if (result.wmp?.session_id) {
+    const resumedId = Peer.usableId(result.wmp?.session_id);
+    if (resumedId !== undefined) {
       // (Flow state: resumeNegotiated below keeps it for the same session and drops it for another.)
-      this.sessionId = result.wmp.session_id;
-      this.bindSessionToTransport(result.wmp.session_id);
+      this.sessionId = resumedId;
+      this.bindSessionToTransport(resumedId);
     }
     this.negotiatedVersion = selected;
     if (result.resumption_token) {
       this.resumptionToken = result.resumption_token;
     }
-    this.resumeNegotiated(this.sessionId, result.capabilities);
+    this.resumeNegotiated(this.sessionId, result.capabilities, rev);
     return result;
   }
 
@@ -845,26 +874,29 @@ export class Peer implements PeerContext {
           // -32602 (malformed) / -31013 with supported_versions.
           const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
           if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
-          // Session establishment is serialized: a slow handler cannot finish
-          // after a later create/resume and overwrite what that one installed.
-          return this.serialized("session", async () => {
-            const result = await this.handler.onSessionCreate!(p);
-            if (result) {
-              // The negotiated version is the one that goes on the wire, whatever the handler wrote.
-              result.wmp = { ...result.wmp, version: selected };
-              this.negotiatedVersion = selected;
-              // The session this peer now serves: its identity, routing and what it
-              // granted (nothing if the result omits capabilities). A new session
-              // has no resumption token of ours: the old session's must not linger.
-              if (typeof result.wmp.session_id === "string") {
-                this.sessionId = result.wmp.session_id;
-                this.bindSessionToTransport(result.wmp.session_id);
-              }
-              this.resumptionToken = undefined;
-              this.beginSession(result.wmp.session_id, result.capabilities);
-            }
-            return result;
-          });
+          // A slow handler must not finish after something else changed the session
+          // this peer holds (another create/resume, a close) and overwrite it: note
+          // the lifecycle first and refuse a result that outlived it.
+          const gen = this.lifecycle;
+          const result = await this.handler.onSessionCreate(p);
+          if (result) {
+            // A session without a usable identity cannot be addressed, closed or
+            // gated: it is a handler bug, refused before any state changes.
+            const id = Peer.usableId(result.wmp?.session_id);
+            if (id === undefined) throw new Error("session.create handler returned no session id");
+            if (this.lifecycle !== gen) throw new WMPError(ErrorCode.SessionNotFound, "Session superseded");
+            // The negotiated version is the one that goes on the wire, whatever the handler wrote.
+            result.wmp = { ...result.wmp, version: selected };
+            this.negotiatedVersion = selected;
+            // The session this peer now serves: its identity, routing and what it
+            // granted (nothing if the result omits capabilities). A new session
+            // has no resumption token of ours: the old session's must not linger.
+            this.sessionId = id;
+            this.bindSessionToTransport(id);
+            this.resumptionToken = undefined;
+            this.beginSession(id, result.capabilities);
+          }
+          return result;
         }
         break;
 
@@ -872,25 +904,26 @@ export class Peer implements PeerContext {
         if (this.handler.onSessionResume) {
           const selected = negotiateVersion(p?.wmp?.version, this.supportedVersions);
           if (selected === undefined) throw versionRejection(p?.wmp?.version, this.supportedVersions);
-          return this.serialized("session", async () => {
-            const gen = this.lifecycle;
-            const result = await this.handler.onSessionResume!(p);
-            if (result) {
-              result.wmp = { ...result.wmp, version: selected };
-              // Only a successful resume that is still current installs session state.
-              if (result.resumed === true && this.lifecycle === gen) {
-                this.negotiatedVersion = selected;
-                const resumedId = typeof result.wmp.session_id === "string" ? result.wmp.session_id : typeof p?.session_id === "string" ? p.session_id : undefined;
-                if (resumedId !== undefined) {
-                  if (resumedId !== this.sessionId) this.resumptionToken = undefined; // another session: not its token
-                  this.sessionId = resumedId;
-                  this.bindSessionToTransport(resumedId);
-                }
-                this.resumeNegotiated(resumedId, result.capabilities);
+          const gen = this.lifecycle;
+          const rev = this.capRev;
+          const result = await this.handler.onSessionResume(p);
+          if (result) {
+            result.wmp = { ...result.wmp, version: selected };
+            if (result.resumed === true) {
+              // A successful resume that outlived a close or replacement is not
+              // "resumed": the requester must not take it for a recovery.
+              if (this.lifecycle !== gen) throw new WMPError(ErrorCode.SessionNotFound, "Session superseded");
+              this.negotiatedVersion = selected;
+              const resumedId = Peer.usableId(result.wmp.session_id) ?? Peer.usableId(p?.session_id);
+              if (resumedId !== undefined) {
+                if (resumedId !== this.sessionId) this.resumptionToken = undefined; // another session: not its token
+                this.sessionId = resumedId;
+                this.bindSessionToTransport(resumedId);
               }
+              this.resumeNegotiated(resumedId, result.capabilities, rev);
             }
-            return result;
-          });
+          }
+          return result;
         }
         break;
 
@@ -942,31 +975,33 @@ export class Peer implements PeerContext {
       // Capabilities
       case Method.CapabilityUpdate:
         if (this.handler.onCapabilityUpdate) {
-          // One at a time: the grant is what the last handler said.
-          return this.serialized("in", async () => {
-            const gen = this.lifecycle;
-            const result = await this.handler.onCapabilityUpdate!(p);
-            // The update changed what the session grants: later flow starts are gated by it.
-            this.refreshNegotiated(gen, p?.wmp?.session_id, result?.capabilities);
-            return result;
-          });
+          const gen = this.lifecycle;
+          const rev = this.capRev;
+          const result = await this.handler.onCapabilityUpdate(p);
+          // The update changed what the session grants: later flow starts are gated by it.
+          this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities);
+          return result;
         }
         break;
 
       case Method.CapabilityList:
         if (this.handler.onCapabilityList) {
-          return this.serialized("in", async () => {
-            const gen = this.lifecycle;
-            const result = await this.handler.onCapabilityList!(p);
-            this.refreshNegotiated(gen, p?.wmp?.session_id, result?.capabilities);
-            return result;
-          });
+          const gen = this.lifecycle;
+          const rev = this.capRev;
+          const result = await this.handler.onCapabilityList(p);
+          this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities);
+          return result;
         }
         break;
 
       // Flows — delegate to profile FlowHandlers first, then handler.
       case Method.FlowStart: {
-        const fh = this.registry.getFlowHandler(p?.flow_type);
+        // Both identifiers must be real strings: without them there is nothing to
+        // route or record, and "unsupported flow type" would be the wrong answer.
+        if (typeof p?.flow_type !== "string" || p.flow_type === "" || typeof p.flow_id !== "string" || p.flow_id === "") {
+          throw new WMPError(ErrorCode.InvalidParams, "Invalid params", { reason: "flow_type and flow_id must be non-empty strings" });
+        }
+        const fh = this.registry.getFlowHandler(p.flow_type);
         if (fh) {
           // Core 10.3: a flow type whose capability was not negotiated is
           // refused with -31005 before the profile sees it, and before anything
@@ -1301,21 +1336,22 @@ export class Peer implements PeerContext {
     // The session this gap belongs to: recovery work for a session that was closed
     // or replaced meanwhile is discarded, never applied to the one that replaced it.
     const epoch = this.flowEpoch;
+    const gen = this.lifecycle;
     if (this.recoveryQueuedEpoch === epoch) return; // coalesce only with a queued recovery of THIS session
     this.recoveryQueuedEpoch = epoch;
     this.recovery = this.recovery.then(async () => {
       // A stale task must not clear the marker of a newer session's queued recovery.
       if (this.recoveryQueuedEpoch === epoch) this.recoveryQueuedEpoch = undefined;
-      if (this.closed || this.flowEpoch !== epoch) return;
+      if (this.closed || this.flowEpoch !== epoch || this.lifecycle !== gen) return;
       if (!this.sessionId || !this.resumptionToken) {
         this.onSessionLost?.(new Error("event gap and no resumption token to resume with"));
         return;
       }
       try {
-        await this.resumeSerialized(undefined, epoch);
+        await this.resumeSerialized(undefined, epoch, gen);
       } catch (err: unknown) {
         // The session changed (or the peer closed) while resuming: nothing was lost.
-        if (err instanceof StaleSessionError || this.closed || this.flowEpoch !== epoch) return;
+        if (err instanceof StaleSessionError || this.closed || this.flowEpoch !== epoch || this.lifecycle !== gen) return;
         this.onSessionLost?.(err instanceof Error ? err : new Error(String(err)));
       }
     });

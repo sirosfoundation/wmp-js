@@ -330,9 +330,11 @@ export function buildVCIFlowStart(
   flowId: string,
   params: OID4VCIFlowParams,
   timeout?: number,
+  /** The protocol version the session negotiated (default "0.1"). */
+  version: string = VERSION,
 ): FlowStartParams {
   return {
-    wmp: { version: VERSION, session_id: sessionId },
+    wmp: { version, session_id: sessionId },
     flow_type: OID4FlowType.OID4VCI,
     flow_id: flowId,
     params,
