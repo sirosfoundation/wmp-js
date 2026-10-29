@@ -205,10 +205,10 @@ export class Peer implements PeerContext {
   private sessionSeq = 0;
   private installedSeq = 0;
 
-  /** Sequence of incoming capability handlers (by start): the latest-started one is authoritative. */
-  private incCapSeq = 0;
-  private appliedIncCapSeq = 0;
+  /** Incoming capability handlers run one at a time (FIFO): the last to finish is the latest word. */
+  private incCapChain: Promise<void> = Promise.resolve();
   private grantRefreshing = false;
+  private grantRefreshPending = false;
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -260,10 +260,8 @@ export class Peer implements PeerContext {
     this.negotiated = undefined;
     this.capRev++;
     this.resetFlows();
-    // The transport is no longer bound to the session that ended (no stale
-    // Wmp-Session-Id, cursor or event stream for the next one).
-    const t = this.transport as { clearSession?: () => void };
-    if (typeof t.clearSession === "function") t.clearSession();
+    // The transport is no longer bound to the session that ended.
+    this.clearTransportBinding();
   }
 
   /**
@@ -292,7 +290,7 @@ export class Peer implements PeerContext {
    * it is the latest word and replaces the grant; a changed revision means it may
    * be stale, so it only removes capabilities that are no longer listed.
    */
-  private applySnapshot(n: { capabilities: Capabilities }, rev: number, snapshot: Capabilities): void {
+  private applySnapshot(n: { capabilities: Capabilities }, rev: number, snapshot: Capabilities, refreshOnStale = true): void {
     if (this.capRev === rev) {
       n.capabilities = { ...snapshot };
       this.capRev++;
@@ -306,14 +304,25 @@ export class Peer implements PeerContext {
     this.capRev++;
     // The answer may have been older than what is cached, so it was only allowed to
     // narrow: ask for a fresh snapshot, which restores any capability that is
-    // really granted. (If the peer cannot answer, the grant stays narrowed.)
-    this.scheduleGrantRefresh();
+    // really granted. (If the peer cannot answer, the grant stays narrowed.) An
+    // incoming handler is this peer's own authority: there is nobody to ask.
+    if (refreshOnStale) this.scheduleGrantRefresh();
   }
 
-  /** One fresh capability.list at a time; its answer is applied like any other (at the revision it was requested at). */
+  /**
+   * One fresh capability.list at a time; its answer is applied like any other (at
+   * the revision it was requested at). A request that arrives while one is in
+   * flight is remembered and runs after it, so the grant is refreshed after the
+   * LAST change that may have made a snapshot stale.
+   */
   private scheduleGrantRefresh(): void {
+    if (this.closed) return;
+    if (this.grantRefreshing) {
+      this.grantRefreshPending = true;
+      return;
+    }
     const id = this.negotiated?.sessionId;
-    if (this.grantRefreshing || this.closed || id === undefined) return;
+    if (id === undefined) return;
     this.grantRefreshing = true;
     void (async () => {
       try {
@@ -322,26 +331,30 @@ export class Peer implements PeerContext {
         /* no fresh snapshot: the narrowed grant stands (fail closed) */
       } finally {
         this.grantRefreshing = false;
+        if (this.grantRefreshPending) {
+          this.grantRefreshPending = false;
+          this.scheduleGrantRefresh(); // respects the session held NOW
+        }
       }
     })();
   }
 
   /**
-   * A result of an incoming capability handler. The handler is this peer's own
-   * authority over the grant, so the latest-STARTED one wins; an older one that
-   * finishes later is ignored.
+   * Runs an incoming capability handler after the previous one finished (FIFO), so
+   * their results are applied in the order the handlers decided. (This is this
+   * peer's own handler code, not an RPC to the other side: no deadlock with the
+   * outgoing direction.)
    */
-  private applyHandlerResult(gen: number, sessionId: string | undefined, seq: number, capabilities: unknown): void {
-    if (typeof capabilities !== "object" || capabilities === null || Array.isArray(capabilities)) return;
-    const n = this.negotiated;
-    if (!n || this.lifecycle !== gen) return;
-    if (sessionId !== undefined && n.sessionId !== undefined && sessionId !== n.sessionId) return;
-    // A handler that started before one that already decided has been overtaken:
-    // its result is ignored (not merged: the later decision may have granted more).
-    if (seq < this.appliedIncCapSeq) return;
-    this.appliedIncCapSeq = seq;
-    n.capabilities = { ...(capabilities as Capabilities) };
-    this.capRev++;
+  private async runIncomingCap<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.incCapChain;
+    let release!: () => void;
+    this.incCapChain = new Promise<void>((r) => (release = r));
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
   }
 
   /**
@@ -351,12 +364,12 @@ export class Peer implements PeerContext {
    * session's grant or overwrite a newer session's; `rev` orders it against other
    * changes to the grant (see `capRev`).
    */
-  private refreshNegotiated(gen: number, sessionId: string | undefined, rev: number, capabilities: unknown): void {
+  private refreshNegotiated(gen: number, sessionId: string | undefined, rev: number, capabilities: unknown, refreshOnStale = true): void {
     if (typeof capabilities !== "object" || capabilities === null || Array.isArray(capabilities)) return;
     const n = this.negotiated;
     if (!n || this.lifecycle !== gen) return;
     if (sessionId !== undefined && n.sessionId !== undefined && sessionId !== n.sessionId) return;
-    this.applySnapshot(n, rev, capabilities as Capabilities);
+    this.applySnapshot(n, rev, capabilities as Capabilities, refreshOnStale);
   }
 
   /** Whether `capability` was negotiated for the session the request names (fail closed). */
@@ -472,7 +485,7 @@ export class Peer implements PeerContext {
    * session. A missing entry reads as generation 0.
    */
   private releaseGen(flowId: string): void {
-    if (!this.recordedFlows.has(flowId) && !this.cancelling.has(flowId)) this.flowGen.delete(flowId);
+    if (!this.recordedFlows.has(flowId) && (this.cancelCount.get(flowId) ?? 0) === 0) this.flowGen.delete(flowId);
   }
 
   async call<T = unknown>(method: string, params: unknown): Promise<T> {
@@ -579,9 +592,11 @@ export class Peer implements PeerContext {
     // Core 2.2.2: the responder selects the highest version it supports that
     // is not above the offered one. Accept that, never a version this peer does
     // not speak or one above the offer.
+    // The offer must have been a valid version and the answer compatible with it
+    // (same MAJOR, not above it) and one this peer speaks: nothing else is installed.
     const selected = result.wmp.version;
-    const withinOffer = typeof offered !== "string" || parseVersion(offered) === undefined || negotiateVersion(offered, [selected ?? ""]) === selected;
-    if (!selected || !(this.supportedVersions.includes(selected) && withinOffer)) {
+    if (typeof offered !== "string" || parseVersion(offered) === undefined) throw versionRejection(offered, this.supportedVersions);
+    if (!selected || !(this.supportedVersions.includes(selected) && negotiateVersion(offered, [selected]) === selected)) {
       throw new WMPError(
         ErrorCode.VersionNotSupported,
         `negotiated version ${selected} is not supported`,
@@ -593,9 +608,8 @@ export class Peer implements PeerContext {
     this.bindSessionToTransport(newId);
     this.negotiatedVersion = selected;
     this.beginSession(newId, result.capabilities);
-    if (result.resumption_token) {
-      this.resumptionToken = result.resumption_token;
-    }
+    // The new session's token, or none: the previous session's must not linger.
+    this.resumptionToken = result.resumption_token || undefined;
     return result;
   }
 
@@ -670,16 +684,20 @@ export class Peer implements PeerContext {
     // session (the caller creates a new one), not a silent switch.
     const selected = result.wmp?.version;
     const offered = params.wmp?.version;
-    const withinOffer = typeof offered !== "string" || parseVersion(offered) === undefined || negotiateVersion(offered, [selected ?? ""]) === selected;
-    if (!selected || !(this.supportedVersions.includes(selected) && withinOffer)) {
+    if (typeof offered !== "string" || parseVersion(offered) === undefined) throw versionRejection(offered, this.supportedVersions);
+    if (!selected || !(this.supportedVersions.includes(selected) && negotiateVersion(offered, [selected]) === selected)) {
       throw new WMPError(
         ErrorCode.VersionNotSupported,
         `negotiated version ${selected} is not supported`,
         { supported_versions: this.supportedVersions },
       );
     }
-    const resumedId = Peer.usableId(result.wmp?.session_id);
+    // The resumed session: what the result names, else the one that was asked for
+    // (the optional member may be left out, as on the responder path).
+    const resumedId = Peer.usableId(result.wmp?.session_id) ?? Peer.usableId(params.session_id);
     if (resumedId !== undefined) {
+      // Another session's token is not this one's: dropped before any new one is applied.
+      if (resumedId !== this.sessionId) this.resumptionToken = undefined;
       // (Flow state: resumeNegotiated below keeps it for the same session and drops it for another.)
       this.sessionId = resumedId;
       this.bindSessionToTransport(resumedId);
@@ -689,7 +707,7 @@ export class Peer implements PeerContext {
       this.resumptionToken = result.resumption_token;
     }
     this.installedSeq = Math.max(this.installedSeq, this.sessionSeq); // creates issued before this are older
-    this.resumeNegotiated(this.sessionId, result.capabilities, rev);
+    this.resumeNegotiated(resumedId ?? this.sessionId, result.capabilities, rev);
     return result;
   }
 
@@ -1066,22 +1084,26 @@ export class Peer implements PeerContext {
       // Capabilities
       case Method.CapabilityUpdate:
         if (this.handler.onCapabilityUpdate) {
-          const gen = this.lifecycle;
-          const seq = ++this.incCapSeq;
-          const result = await this.handler.onCapabilityUpdate(p);
-          // The update changed what the session grants: later flow starts are gated by it.
-          this.applyHandlerResult(gen, p?.wmp?.session_id, seq, result?.capabilities);
-          return result;
+          return this.runIncomingCap(async () => {
+            const gen = this.lifecycle;
+            const rev = this.capRev;
+            const result = await this.handler.onCapabilityUpdate!(p);
+            // The update changed what the session grants: later flow starts are gated by it.
+            this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities, false);
+            return result;
+          });
         }
         break;
 
       case Method.CapabilityList:
         if (this.handler.onCapabilityList) {
-          const gen = this.lifecycle;
-          const seq = ++this.incCapSeq;
-          const result = await this.handler.onCapabilityList(p);
-          this.applyHandlerResult(gen, p?.wmp?.session_id, seq, result?.capabilities);
-          return result;
+          return this.runIncomingCap(async () => {
+            const gen = this.lifecycle;
+            const rev = this.capRev;
+            const result = await this.handler.onCapabilityList!(p);
+            this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities, false);
+            return result;
+          });
         }
         break;
 
@@ -1197,6 +1219,7 @@ export class Peer implements PeerContext {
             const pending = this.cancelling.get(flowId);
             if (pending && pending.epoch === epoch && pending.gen === gen) return pending.run;
             const entry: { epoch: number; gen: number; run: Promise<unknown> } = { epoch, gen, run: undefined as unknown as Promise<unknown> };
+            this.cancelCount.set(flowId, (this.cancelCount.get(flowId) ?? 0) + 1);
             entry.run = (async () => {
               // Yield first: the entry is installed before the handler can throw
               // (even synchronously), so its cleanup always sees it.
@@ -1208,10 +1231,11 @@ export class Peer implements PeerContext {
                 if (this.flowEpoch === epoch && (this.flowGen.get(flowId) ?? 0) === gen) this.endFlow(flowId, "cancelled");
                 return result;
               } finally {
-                if (this.cancelling.get(flowId) === entry) {
-                  this.cancelling.delete(flowId); // a failure leaves a retry possible
-                  this.releaseGen(flowId);
-                }
+                if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
+                const left = (this.cancelCount.get(flowId) ?? 1) - 1;
+                if (left <= 0) this.cancelCount.delete(flowId);
+                else this.cancelCount.set(flowId, left);
+                this.releaseGen(flowId);
               }
             })();
             this.cancelling.set(flowId, entry);
@@ -1284,6 +1308,7 @@ export class Peer implements PeerContext {
     this.terminalSeen.clear();
     this.flowGen.clear();
     this.cancelling.clear(); // pending cancellations belong to the old session
+    this.cancelCount.clear();
   }
 
   /**
@@ -1375,6 +1400,9 @@ export class Peer implements PeerContext {
    */
   private cancelling = new Map<string, { epoch: number; gen: number; run: Promise<unknown> }>();
 
+  /** Cancellations still running per flow id, of ANY generation: a generation entry is kept while one is. */
+  private cancelCount = new Map<string, number>();
+
   /** Incremented whenever the flow state is reset (session closed or replaced). */
   private flowEpoch = 0;
 
@@ -1444,7 +1472,7 @@ export class Peer implements PeerContext {
       if (this.recoveryQueuedEpoch === epoch) this.recoveryQueuedEpoch = undefined;
       if (this.closed || this.flowEpoch !== epoch || this.lifecycle !== gen) return;
       if (!this.sessionId || !this.resumptionToken) {
-        this.onSessionLost?.(new Error("event gap and no resumption token to resume with"));
+        this.sessionLost(new Error("event gap and no resumption token to resume with"));
         return;
       }
       try {
@@ -1452,9 +1480,25 @@ export class Peer implements PeerContext {
       } catch (err: unknown) {
         // The session changed (or the peer closed) while resuming: nothing was lost.
         if (err instanceof StaleSessionError || this.closed || this.flowEpoch !== epoch || this.lifecycle !== gen) return;
-        this.onSessionLost?.(err instanceof Error ? err : new Error(String(err)));
+        this.sessionLost(err instanceof Error ? err : new Error(String(err)));
       }
     });
+  }
+
+  /**
+   * The session cannot be continued: the transport's binding to it is dropped
+   * BEFORE the application is told, so the "create a new session" fallback the
+   * callback is for does not send the dead session's id.
+   */
+  private sessionLost(err: Error): void {
+    this.clearTransportBinding();
+    this.onSessionLost?.(err);
+  }
+
+  /** The transport is no longer bound to a session (no stale Wmp-Session-Id, cursor or event stream). */
+  private clearTransportBinding(): void {
+    const t = this.transport as { clearSession?: () => void };
+    if (typeof t.clearSession === "function") t.clearSession();
   }
 
   private recovery: Promise<void> = Promise.resolve();
