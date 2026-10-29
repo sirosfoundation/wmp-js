@@ -570,7 +570,13 @@ export class Peer implements PeerContext {
       case Method.SessionCreate:
         if (this.handler.onSessionCreate) {
           const result = await this.handler.onSessionCreate(p);
-          if (result) this.resetFlows(); // a new session: the previous one's flow state does not carry over
+          if (result) {
+            // The session this peer now serves: remember its identity (a responder-only
+            // peer has no other way to know it), and drop the previous session's flow state.
+            const id = result.wmp?.session_id;
+            if (typeof id === "string" && id !== "") this.sessionId = id;
+            this.resetFlows();
+          }
           return result;
         }
         break;
@@ -578,8 +584,15 @@ export class Peer implements PeerContext {
       case Method.SessionResume:
         if (this.handler.onSessionResume) {
           const result = await this.handler.onSessionResume(p);
-          // Resuming a different session than the one held drops the old flow state.
-          if (result?.resumed === true && typeof p?.session_id === "string" && this.sessionId !== undefined && p.session_id !== this.sessionId) this.resetFlows();
+          if (result?.resumed === true) {
+            const resumed = typeof result.wmp?.session_id === "string" && result.wmp.session_id !== "" ? result.wmp.session_id : typeof p?.session_id === "string" ? p.session_id : undefined;
+            // Resuming a different session than the one held drops the old flow
+            // state; the same one keeps it. The resumed session is the one held from now on.
+            if (resumed !== undefined) {
+              if (resumed !== this.sessionId) this.resetFlows();
+              this.sessionId = resumed;
+            }
+          }
           return result;
         }
         break;
