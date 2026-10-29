@@ -2007,6 +2007,100 @@ describe("stale snapshots, refresh sources (round 11)", () => {
   });
 });
 
+describe("grant refresh state is per lifecycle and per source", () => {
+  const mkCreate = (id: string) => ({ jsonrpc: "2.0" as const, id, method: "wmp.session.create", params: { wmp: { version: "0.1" }, security: { mode: "tls" } } });
+  const createAnswer = (id: string, sid: string, caps: Record<string, unknown> = {}) => ({ jsonrpc: "2.0" as const, id, result: { wmp: { version: "0.1", session_id: sid }, capabilities: caps, security: { mode: "tls" }, resumption_token: "rt" } });
+  const ok = (id: string, caps: Record<string, unknown>) => ({ jsonrpc: "2.0" as const, id, result: { wmp: { version: "0.1" }, capabilities: caps, security: { mode: "tls" } } });
+  const outgoingLists = (t: MockTransport) => t.sent.filter((m) => (m as { method?: string }).method === "wmp.capability.list") as { id: string }[];
+
+  /** Makes an outgoing stale answer that narrows the grant, which starts a remote refresh (left unanswered). */
+  async function staleNarrowing(t: MockTransport, peer: Peer, sid: string): Promise<void> {
+    const list = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: sid } });
+    const upd = peer.call("wmp.capability.update", { wmp: { version: "0.1", session_id: sid }, add: { oid4vci: {} } });
+    await settle();
+    const ids = t.sent.slice(-2).map((m) => (m as { id: string }).id);
+    t.receive(ok(ids[1], { oid4vci: {} })); // the grant is now oid4vci
+    t.receive(ok(ids[0], {})); // the older, empty snapshot arrives late: narrows, refresh requested
+    await Promise.all([list, upd]);
+    await settle();
+  }
+
+  it("a refresh left over from an earlier session does not hold the next session's refresh up, and finishing late does not clear it", async () => {
+    const t = new MockTransport();
+    const peer = new Peer(t, {});
+    const c1 = peer.createSession({});
+    await settle();
+    t.receive(createAnswer((t.sent[0] as { id: string }).id, "ses-1"));
+    await c1;
+    await staleNarrowing(t, peer, "ses-1");
+    const r1 = outgoingLists(t).at(-1)!; // the refresh of ses-1, never answered for now
+    expect(outgoingLists(t)).toHaveLength(2);
+
+    const c2 = peer.createSession({});
+    await settle();
+    t.receive(createAnswer((t.sent.at(-1) as { id: string }).id, "ses-2"));
+    await c2;
+    const before = outgoingLists(t).length;
+    await staleNarrowing(t, peer, "ses-2");
+    // ses-2 got its own refresh although ses-1's is still in flight
+    expect(outgoingLists(t).length).toBe(before + 2); // l, refresh
+    const r2 = outgoingLists(t).at(-1)!;
+    expect(r2.id).not.toBe(r1.id);
+
+    // the old refresh finishes late: it must not clear ses-2's marker, so a further stale answer queues behind r2
+    t.receive({ jsonrpc: "2.0", id: r1.id, error: { code: -32601, message: "no" } });
+    await settle();
+    const beforeStale = outgoingLists(t).length;
+    const l = peer.call("wmp.capability.list", { wmp: { version: "0.1", session_id: "ses-2" } });
+    const u = peer.call("wmp.capability.update", { wmp: { version: "0.1", session_id: "ses-2" }, add: { other: {} } });
+    await settle();
+    const ids = t.sent.slice(-2).map((m) => (m as { id: string }).id);
+    t.receive(ok(ids[1], { oid4vci: {}, other: {} }));
+    t.receive(ok(ids[0], { oid4vci: {} })); // stale, differs: wants another refresh
+    await Promise.all([l, u]);
+    await settle();
+    expect(outgoingLists(t).length).toBe(beforeStale + 1); // only the list itself: the refresh waits for r2
+    t.receive(ok(r2.id, { oid4vci: {}, other: {} }));
+    await settle(30);
+    expect(outgoingLists(t).length).toBe(beforeStale + 2); // exactly one queued refresh ran after r2
+  });
+
+  it("a refresh requested for the local authority while a remote one is in flight runs against the local authority", async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const t = new MockTransport();
+    const peer = new Peer(t, {
+      handler: {
+        onSessionCreate: async () => ({ wmp: { version: "", session_id: "ses-1" }, capabilities: {}, security: { mode: "tls" } }),
+        onCapabilityList: async () => {
+          calls++;
+          if (calls === 1) {
+            await gate; // the first list is slow and captures a snapshot that will be stale
+            return ok("x", { other: {} }).result;
+          }
+          return ok("x", { oid4vci: {} }).result;
+        },
+      },
+    });
+    t.receive(mkCreate("c"));
+    await settle();
+    t.receive({ jsonrpc: "2.0", id: "l", method: "wmp.capability.list", params: { wmp: { version: "0.1", session_id: "ses-1" } } }); // slow, captures at the current revision
+    await settle();
+    t.sent.length = 0;
+    await staleNarrowing(t, peer, "ses-1"); // a remote refresh is now in flight
+    const remote = outgoingLists(t).at(-1)!;
+    release(); // the slow local list finishes with a stale snapshot that differs: a local refresh is queued
+    await settle();
+    expect(calls).toBe(1); // still queued behind the remote refresh
+    const listsBefore = outgoingLists(t).length;
+    t.receive(ok(remote.id, {})); // names exactly what is cached: no change, no further remote refresh
+    await settle(30);
+    expect(calls).toBe(2); // drained against the local authority
+    expect(outgoingLists(t).length).toBe(listsBefore); // and not as another request to the remote peer
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Review round 12
 // ---------------------------------------------------------------------------
