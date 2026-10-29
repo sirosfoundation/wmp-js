@@ -50,7 +50,7 @@ function isObj(v: unknown): v is Obj {
 }
 
 function has(o: Obj, k: string): boolean {
-  return Object.prototype.hasOwnProperty.call(o, k);
+  return Object.hasOwn(o, k);
 }
 
 function fail(msg: string): never {
@@ -190,8 +190,8 @@ function validateResponseJWE(m: Obj): void {
 // match flow result (Section 3.3)
 // ---------------------------------------------------------------------------
 
-const MATCH_MEMBERS = ["satisfiable", "satisfiable_query_ids", "selection_handle", "code"];
-const MATCH_CODES = ["no_match", "insufficient", "error"];
+const MATCH_MEMBERS = new Set(["satisfiable", "satisfiable_query_ids", "selection_handle", "code"]);
+const MATCH_CODES = new Set(["no_match", "insufficient", "error"]);
 // 22 or more base64url characters, no padding, canonical length (4n, 4n+2, 4n+3).
 const MATCH_HANDLE = /^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2,3})?$/;
 
@@ -209,30 +209,34 @@ const MATCH_HANDLE = /^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2,3})?$/;
 export function validateMatchResult(result: unknown, queryIds?: readonly string[]): void {
   if (!isObj(result)) fail("match result is not an object");
   for (const k of Object.keys(result)) {
-    if (!MATCH_MEMBERS.includes(k)) fail("match result carries a member outside the closed set");
+    if (!MATCH_MEMBERS.has(k)) fail("match result carries a member outside the closed set");
   }
-  if (typeof result.satisfiable !== "boolean") fail("satisfiable is not a boolean");
-  if (result.satisfiable) {
-    if (has(result, "code")) fail("code present although satisfiable is true");
-  } else if (!has(result, "code")) {
-    fail("code absent although satisfiable is false");
-  }
-  if (has(result, "code") && !MATCH_CODES.includes(result.code as string)) {
-    fail("code is not one of no_match, insufficient, error");
-  }
-  if (has(result, "satisfiable_query_ids")) {
-    const ids = result.satisfiable_query_ids;
-    if (!Array.isArray(ids) || ids.some((x) => typeof x !== "string")) fail("satisfiable_query_ids is not an array of strings");
-    const seen = new Set<string>();
-    for (const id of ids as string[]) {
-      if (seen.has(id)) fail("satisfiable_query_ids repeats an element");
-      seen.add(id);
-      if (queryIds && !queryIds.includes(id)) fail("satisfiable_query_ids has an element that is not an id of the query");
-    }
-  }
+  validateMatchSatisfiable(result);
+  validateMatchIds(result, queryIds);
   if (has(result, "selection_handle")) {
     const h = result.selection_handle;
     if (typeof h !== "string" || h.length < 22 || !MATCH_HANDLE.test(h)) fail("selection_handle is not a base64url string of at least 22 characters");
+  }
+}
+
+function validateMatchSatisfiable(result: Obj): void {
+  if (typeof result.satisfiable !== "boolean") fail("satisfiable is not a boolean");
+  if (result.satisfiable && has(result, "code")) fail("code present although satisfiable is true");
+  if (!result.satisfiable && !has(result, "code")) fail("code absent although satisfiable is false");
+  if (has(result, "code") && !MATCH_CODES.has(result.code as string)) {
+    fail("code is not one of no_match, insufficient, error");
+  }
+}
+
+function validateMatchIds(result: Obj, queryIds?: readonly string[]): void {
+  if (!has(result, "satisfiable_query_ids")) return;
+  const ids = result.satisfiable_query_ids;
+  if (!Array.isArray(ids) || ids.some((x) => typeof x !== "string")) fail("satisfiable_query_ids is not an array of strings");
+  const seen = new Set<string>();
+  for (const id of ids as string[]) {
+    if (seen.has(id)) fail("satisfiable_query_ids repeats an element");
+    seen.add(id);
+    if (queryIds && !queryIds.includes(id)) fail("satisfiable_query_ids has an element that is not an id of the query");
   }
 }
 
@@ -292,12 +296,7 @@ export function splitReplaySecrets(data: string | Uint8Array): ReplaySplit {
   if (!env) return REFUSED;
   const rawMethod = env.get("method");
   if (rawMethod === undefined) return { ok: true, replay: text }; // a response carries no completion
-  let method: unknown;
-  try {
-    method = JSON.parse(rawMethod);
-  } catch {
-    return REFUSED;
-  }
+  const method = parseJson(rawMethod);
   if (typeof method !== "string") return REFUSED;
   if (method !== METHOD_FLOW_COMPLETE) return { ok: true, replay: text };
 
@@ -322,6 +321,15 @@ export function splitReplaySecrets(data: string | Uint8Array): ReplaySplit {
   return { ok: true, replay: assemble(env), live: text };
 }
 
+/** JSON.parse that yields undefined for text that is not JSON (undefined is no JSON value). */
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
 const REFUSED: ReplaySplit = { ok: false, replay: "" };
 
 function assemble(m: Map<string, string>): string {
@@ -338,14 +346,14 @@ function assemble(m: Map<string, string>): string {
 function mayNeedRedaction(text: string): boolean {
   const lower = text.toLowerCase();
   // eslint-disable-next-line no-control-regex
-  if (/[^\u0000-\u007f]/.test(text) || lower.includes("\\u") || lower.includes(`"${REDACTED_MEMBERS_KEY}"`)) {
+  if (/[^\u0000-\u007f]/.test(text) || lower.includes(String.raw`\u`) || lower.includes(`"${REDACTED_MEMBERS_KEY}"`)) {
     return true;
   }
   return REPLAY_SECRET_MEMBERS.some((k) => lower.includes(`"${k}"`));
 }
 
 function foldCase(s: string): string {
-  return s.replace(/ſ/g, "s").replace(/K/g, "k").toLowerCase();
+  return s.replaceAll("\u017f", "s").replaceAll("\u212a", "k").toLowerCase();
 }
 
 /**
@@ -355,100 +363,96 @@ function foldCase(s: string): string {
  * decoding, or that has a name equal to one of `exact` only up to letter case.
  */
 function scanObject(text: string, exact: readonly string[]): Map<string, string> | undefined {
-  let i = 0;
   const n = text.length;
-  const ws = (): void => {
-    while (i < n && (text[i] === " " || text[i] === "\t" || text[i] === "\n" || text[i] === "\r")) i++;
-  };
-  // Returns the end index (exclusive) of the string literal starting at i.
-  const stringEnd = (start: number): number => {
-    let j = start + 1;
-    while (j < n) {
-      const c = text[j];
-      if (c === "\\") j += 2;
-      else if (c === '"') return j + 1;
-      else j++;
-    }
-    return -1;
-  };
-  // Returns the end index of the JSON value starting at i, or -1.
-  const valueEnd = (start: number): number => {
-    const c = text[start];
-    if (c === '"') return stringEnd(start);
-    if (c === "{" || c === "[") {
-      let depth = 0;
-      let j = start;
-      while (j < n) {
-        const d = text[j];
-        if (d === '"') {
-          const e = stringEnd(j);
-          if (e < 0) return -1;
-          j = e;
-          continue;
-        }
-        if (d === "{" || d === "[") depth++;
-        else if (d === "}" || d === "]") {
-          depth--;
-          if (depth === 0) return j + 1;
-        }
-        j++;
-      }
-      return -1;
-    }
-    let j = start;
-    while (j < n && !/[,}\]\s]/.test(text[j])) j++;
-    return j > start ? j : -1;
-  };
-
-  ws();
+  let i = skipWs(text, 0);
   if (text[i] !== "{") return undefined;
-  i++;
+  i = skipWs(text, i + 1);
   const members = new Map<string, string>();
-  ws();
-  if (text[i] === "}") {
-    i++;
-  } else {
-    for (;;) {
-      ws();
-      if (text[i] !== '"') return undefined;
-      const ke = stringEnd(i);
-      if (ke < 0) return undefined;
-      let key: string;
-      try {
-        key = JSON.parse(text.slice(i, ke)) as string;
-      } catch {
-        return undefined;
-      }
-      i = ke;
-      ws();
-      if (text[i] !== ":") return undefined;
+  if (text[i] === "}") return skipWs(text, i + 1) === n ? members : undefined;
+  for (;;) {
+    const next = scanMember(text, skipWs(text, i), members, exact);
+    if (next < 0) return undefined;
+    i = skipWs(text, next);
+    if (text[i] === ",") {
       i++;
-      ws();
-      const ve = valueEnd(i);
-      if (ve < 0) return undefined;
-      const raw = text.slice(i, ve);
-      try {
-        JSON.parse(raw); // the value must itself be well-formed JSON
-      } catch {
-        return undefined;
-      }
-      if (members.has(key)) return undefined;
-      const folded = foldCase(key);
-      if (exact.some((e) => key !== e && folded === e)) return undefined;
-      members.set(key, raw);
-      i = ve;
-      ws();
-      if (text[i] === ",") {
-        i++;
-        continue;
-      }
-      if (text[i] === "}") {
-        i++;
-        break;
-      }
-      return undefined;
+      continue;
     }
+    if (text[i] !== "}") return undefined;
+    return skipWs(text, i + 1) === n ? members : undefined;
   }
-  ws();
-  return i === n ? members : undefined;
+}
+
+function skipWs(text: string, from: number): number {
+  let i = from;
+  while (i < text.length && (text[i] === " " || text[i] === "\t" || text[i] === "\n" || text[i] === "\r")) i++;
+  return i;
+}
+
+/** Returns the end index (exclusive) of the string literal starting at `start`, or -1. */
+function stringEnd(text: string, start: number): number {
+  let j = start + 1;
+  while (j < text.length) {
+    const c = text[j];
+    if (c === "\\") j += 2;
+    else if (c === '"') return j + 1;
+    else j++;
+  }
+  return -1;
+}
+
+/** Returns the end index of the bracketed value (object or array) starting at `start`, or -1. */
+function bracketedEnd(text: string, start: number): number {
+  let depth = 0;
+  let j = start;
+  while (j < text.length) {
+    const d = text[j];
+    if (d === '"') {
+      const e = stringEnd(text, j);
+      if (e < 0) return -1;
+      j = e;
+      continue;
+    }
+    if (d === "{" || d === "[") depth++;
+    else if (d === "}" || d === "]") {
+      depth--;
+      if (depth === 0) return j + 1;
+    }
+    j++;
+  }
+  return -1;
+}
+
+/** Returns the end index of the JSON value starting at `start`, or -1. */
+function valueEnd(text: string, start: number): number {
+  const c = text[start];
+  if (c === '"') return stringEnd(text, start);
+  if (c === "{" || c === "[") return bracketedEnd(text, start);
+  let j = start;
+  while (j < text.length && !/[,}\]\s]/.test(text[j])) j++;
+  return j > start ? j : -1;
+}
+
+/**
+ * Scans one `"name": value` member starting at `start` and records it in
+ * `members`. Returns the index after the value, or -1 when the member is
+ * malformed, repeated, or its name equals one of `exact` only up to letter case.
+ */
+function scanMember(text: string, start: number, members: Map<string, string>, exact: readonly string[]): number {
+  if (text[start] !== '"') return -1;
+  const ke = stringEnd(text, start);
+  if (ke < 0) return -1;
+  const key = parseJson(text.slice(start, ke));
+  if (typeof key !== "string") return -1;
+  const colon = skipWs(text, ke);
+  if (text[colon] !== ":") return -1;
+  const vs = skipWs(text, colon + 1);
+  const ve = valueEnd(text, vs);
+  if (ve < 0) return -1;
+  const raw = text.slice(vs, ve);
+  if (parseJson(raw) === undefined) return -1; // the value must itself be well-formed JSON
+  if (members.has(key)) return -1;
+  const folded = foldCase(key);
+  if (exact.some((e) => key !== e && folded === e)) return -1;
+  members.set(key, raw);
+  return ve;
 }

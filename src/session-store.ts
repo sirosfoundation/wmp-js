@@ -79,7 +79,7 @@ export function tokensEqual(a: string, b: string): boolean {
   let diff = a.length ^ b.length;
   const n = Math.max(a.length, b.length);
   for (let i = 0; i < n; i++) {
-    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+    diff |= (a.codePointAt(i) ?? 0) ^ (b.codePointAt(i) ?? 0);
   }
   return diff === 0;
 }
@@ -137,7 +137,7 @@ export interface ExpiredSessionLister {
 export class MemorySessionStore
   implements SessionStore, TokenRotator, SessionCreator, SessionUpdater, ExpiredSessionLister
 {
-  private sessions = new Map<string, Session>();
+  private readonly sessions = new Map<string, Session>();
 
   async create(session: Session): Promise<void> {
     this.sessions.set(session.id, { ...session });
@@ -161,7 +161,7 @@ export class MemorySessionStore
     const now = Date.now();
     const out: Session[] = [];
     for (const s of this.sessions.values()) {
-      if (s.metadata && s.metadata[key] === value && !isSessionExpired(s, now)) out.push(s);
+      if (s.metadata?.[key] === value && !isSessionExpired(s, now)) out.push(s);
     }
     return out;
   }
