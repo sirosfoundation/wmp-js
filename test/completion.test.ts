@@ -103,6 +103,34 @@ describe("validateCompletionResult", () => {
     expect(refused({ credential_metadata: { auxiliary_data: 1 } }, [])).toBe("");
   });
 
+  it("checks the type of the oid4vp completion members (Section 3.2.4)", () => {
+    for (const ok of [
+      { vp_token: "eyJ" },
+      { vp_token: ["a", "b"] },
+      { vp_token: { q1: ["a"] }, presentation_submission: { id: "x" }, response_code: "rc" },
+    ]) {
+      expect(refused(ok), JSON.stringify(ok)).toBe("");
+    }
+    for (const bad of [
+      { vp_token: true },
+      { vp_token: 1 },
+      { vp_token: null },
+      { vp_token: "" },
+      { vp_token: [] },
+      { vp_token: [1] },
+      { vp_token: {} },
+      { vp_token: { q1: "a" } },
+      { presentation_submission: "x" },
+      { presentation_submission: [] },
+      { presentation_submission: null },
+      { response_code: 7 },
+      { response_code: {} },
+      { response_code: null },
+    ]) {
+      expect(refused(bad), JSON.stringify(bad)).toContain("non-conforming flow result");
+    }
+  });
+
   it("never echoes a member value in the error", () => {
     const msg = refused({ credential_response_encrypted: true, credentials: [{ credential: "TOP-SECRET-VALUE" }], refresh_token: "RT-SECRET" });
     expect(msg).not.toContain("TOP-SECRET-VALUE");

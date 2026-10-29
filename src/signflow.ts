@@ -5,7 +5,7 @@
  */
 
 import { sha256, sha384, sha512 } from "@noble/hashes/sha2.js";
-import { CompletionResultError, validateCompletionResult } from "./completion.js";
+import { CompletionResultError, validVpToken, validateCompletionResult } from "./completion.js";
 import { isSelectionHandle } from "./consent.js";
 import { unsupportedError } from "./errors.js";
 import { WMPError } from "./jsonrpc.js";
@@ -362,21 +362,6 @@ function present(v: unknown): boolean {
   return typeof v === "object" && v !== null && Object.keys(v).length > 0;
 }
 
-/**
- * A vp_token the profile allows (table in profile 3.2.5, DCQL form in 7.x): a
- * non-empty string, a non-empty array of non-empty strings, or an object mapping
- * query ids to non-empty arrays of non-empty strings. Anything else (booleans,
- * numbers, null, empty or mixed values) is not a presentation.
- */
-function validVpToken(v: unknown): boolean {
-  const str = (x: unknown): boolean => typeof x === "string" && x !== "";
-  const strs = (x: unknown): boolean => Array.isArray(x) && x.length > 0 && x.every(str);
-  if (str(v) || strs(v)) return true;
-  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
-  const vals = Object.values(v as Record<string, unknown>);
-  return vals.length > 0 && vals.every(strs);
-}
-
 /** Response modes in which the wallet encrypts the response (profile 7.7). */
 const ENCRYPTED_RESPONSE_MODES = ["direct_post.jwt", "dc_api.jwt"];
 
@@ -395,6 +380,10 @@ const DECRYPT_RESULT_MEMBERS = ["credential_count", "transaction_id", "interval"
 export function validateSignResult(action: string, result: unknown, responseMode?: string): void {
   validateCompletionResult(result);
   const r = result as Record<string, unknown>;
+  // A proof is a compact JWS: a missing, empty or non-string proof_jwt must not be sent as one.
+  if (action === "generate_proof" && "proof_jwt" in r && (typeof r.proof_jwt !== "string" || r.proof_jwt === "")) {
+    throw new CompletionResultError("proof_jwt is not a non-empty string");
+  }
   if (action === "sign_presentation") {
     // An encrypted response mode: the wallet builds and encrypts the response
     // itself and answers with response_jwe; a plaintext vp_token would reach the
