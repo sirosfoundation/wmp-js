@@ -205,10 +205,8 @@ export class Peer implements PeerContext {
   private sessionSeq = 0;
   private installedSeq = 0;
 
-  /** Incoming capability handlers run one at a time (FIFO): the last to finish is the latest word. */
-  private incCapChain: Promise<void> = Promise.resolve();
   private grantRefreshing = false;
-  private grantRefreshPending = false;
+  private grantRefreshPending: "remote" | "local" | undefined;
 
   constructor(transport: Transport, opts?: PeerOptions) {
     this.transport = transport;
@@ -290,23 +288,30 @@ export class Peer implements PeerContext {
    * it is the latest word and replaces the grant; a changed revision means it may
    * be stale, so it only removes capabilities that are no longer listed.
    */
-  private applySnapshot(n: { capabilities: Capabilities }, rev: number, snapshot: Capabilities, refreshOnStale = true): void {
+  private applySnapshot(n: { capabilities: Capabilities }, rev: number, snapshot: Capabilities, source: "remote" | "local" = "remote"): void {
     if (this.capRev === rev) {
       n.capabilities = { ...snapshot };
       this.capRev++;
       return;
     }
+    const have = Object.keys(n.capabilities);
+    const same = have.length === Object.keys(snapshot).length && have.every((k) => Object.prototype.hasOwnProperty.call(snapshot, k));
+    // A stale snapshot that names exactly what is cached changes nothing: no
+    // revision bump and no refresh (which would otherwise ping-pong between peers
+    // whose grants never change).
+    if (same) return;
     const kept: Capabilities = {};
-    for (const k of Object.keys(n.capabilities)) {
+    for (const k of have) {
       if (Object.prototype.hasOwnProperty.call(snapshot, k)) kept[k] = n.capabilities[k];
     }
     n.capabilities = kept;
     this.capRev++;
     // The answer may have been older than what is cached, so it was only allowed to
-    // narrow: ask for a fresh snapshot, which restores any capability that is
-    // really granted. (If the peer cannot answer, the grant stays narrowed.) An
-    // incoming handler is this peer's own authority: there is nobody to ask.
-    if (refreshOnStale) this.scheduleGrantRefresh();
+    // narrow: ask the authority for a fresh snapshot, which restores any capability
+    // that is really granted (a failed refresh leaves the grant narrowed). The
+    // authority is the remote peer for what it answered, this peer's own capability
+    // handler for what that returned.
+    this.scheduleGrantRefresh(source);
   }
 
   /**
@@ -315,46 +320,37 @@ export class Peer implements PeerContext {
    * flight is remembered and runs after it, so the grant is refreshed after the
    * LAST change that may have made a snapshot stale.
    */
-  private scheduleGrantRefresh(): void {
+  private scheduleGrantRefresh(source: "remote" | "local"): void {
     if (this.closed) return;
     if (this.grantRefreshing) {
-      this.grantRefreshPending = true;
+      this.grantRefreshPending = source;
       return;
     }
     const id = this.negotiated?.sessionId;
     if (id === undefined) return;
+    const gen = this.lifecycle;
+    const rev = this.capRev;
+    const params = { wmp: { version: this.negotiatedVersion ?? VERSION, session_id: id } };
     this.grantRefreshing = true;
     void (async () => {
       try {
-        await this.callNow(Method.CapabilityList, { wmp: { version: this.negotiatedVersion ?? VERSION, session_id: id } });
+        if (source === "remote") {
+          await this.callNow(Method.CapabilityList, params);
+        } else if (this.handler.onCapabilityList) {
+          const result = await this.handler.onCapabilityList(params as never);
+          this.refreshNegotiated(gen, id, rev, result?.capabilities, "local");
+        }
       } catch {
         /* no fresh snapshot: the narrowed grant stands (fail closed) */
       } finally {
         this.grantRefreshing = false;
-        if (this.grantRefreshPending) {
-          this.grantRefreshPending = false;
-          this.scheduleGrantRefresh(); // respects the session held NOW
+        const pending = this.grantRefreshPending;
+        if (pending) {
+          this.grantRefreshPending = undefined;
+          this.scheduleGrantRefresh(pending); // respects the session held NOW
         }
       }
     })();
-  }
-
-  /**
-   * Runs an incoming capability handler after the previous one finished (FIFO), so
-   * their results are applied in the order the handlers decided. (This is this
-   * peer's own handler code, not an RPC to the other side: no deadlock with the
-   * outgoing direction.)
-   */
-  private async runIncomingCap<T>(fn: () => Promise<T>): Promise<T> {
-    const previous = this.incCapChain;
-    let release!: () => void;
-    this.incCapChain = new Promise<void>((r) => (release = r));
-    await previous;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
   }
 
   /**
@@ -364,12 +360,12 @@ export class Peer implements PeerContext {
    * session's grant or overwrite a newer session's; `rev` orders it against other
    * changes to the grant (see `capRev`).
    */
-  private refreshNegotiated(gen: number, sessionId: string | undefined, rev: number, capabilities: unknown, refreshOnStale = true): void {
+  private refreshNegotiated(gen: number, sessionId: string | undefined, rev: number, capabilities: unknown, source: "remote" | "local" = "remote"): void {
     if (typeof capabilities !== "object" || capabilities === null || Array.isArray(capabilities)) return;
     const n = this.negotiated;
     if (!n || this.lifecycle !== gen) return;
     if (sessionId !== undefined && n.sessionId !== undefined && sessionId !== n.sessionId) return;
-    this.applySnapshot(n, rev, capabilities as Capabilities, refreshOnStale);
+    this.applySnapshot(n, rev, capabilities as Capabilities, source);
   }
 
   /** Whether `capability` was negotiated for the session the request names (fail closed). */
@@ -1094,26 +1090,22 @@ export class Peer implements PeerContext {
       // Capabilities
       case Method.CapabilityUpdate:
         if (this.handler.onCapabilityUpdate) {
-          return this.runIncomingCap(async () => {
-            const gen = this.lifecycle;
-            const rev = this.capRev;
-            const result = await this.handler.onCapabilityUpdate!(p);
-            // The update changed what the session grants: later flow starts are gated by it.
-            this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities, false);
-            return result;
-          });
+          const gen = this.lifecycle;
+          const rev = this.capRev;
+          const result = await this.handler.onCapabilityUpdate(p);
+          // The update changed what the session grants: later flow starts are gated by it.
+          this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities, "local");
+          return result;
         }
         break;
 
       case Method.CapabilityList:
         if (this.handler.onCapabilityList) {
-          return this.runIncomingCap(async () => {
-            const gen = this.lifecycle;
-            const rev = this.capRev;
-            const result = await this.handler.onCapabilityList!(p);
-            this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities, false);
-            return result;
-          });
+          const gen = this.lifecycle;
+          const rev = this.capRev;
+          const result = await this.handler.onCapabilityList(p);
+          this.refreshNegotiated(gen, p?.wmp?.session_id, rev, result?.capabilities, "local");
+          return result;
         }
         break;
 
@@ -1237,10 +1229,14 @@ export class Peer implements PeerContext {
                 return result;
               } finally {
                 if (this.cancelling.get(flowId) === entry) this.cancelling.delete(flowId); // a failure leaves a retry possible
-                const left = (this.cancelCount.get(flowId) ?? 1) - 1;
-                if (left <= 0) this.cancelCount.delete(flowId);
-                else this.cancelCount.set(flowId, left);
-                this.releaseGen(flowId);
+                // Bookkeeping of a session that was reset meanwhile (counts and entries
+                // were cleared) must not touch the new session's.
+                if (this.flowEpoch === epoch) {
+                  const left = (this.cancelCount.get(flowId) ?? 1) - 1;
+                  if (left <= 0) this.cancelCount.delete(flowId);
+                  else this.cancelCount.set(flowId, left);
+                  this.releaseGen(flowId);
+                }
               }
             })();
             this.cancelling.set(flowId, entry);
