@@ -23,7 +23,7 @@ jobs:
       - name: Clone WMP spec (test vectors and schemas)
         run: git clone --depth 1 https://github.com/sirosfoundation/wmp.git ../wmp
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
