@@ -86,8 +86,13 @@ export function extractDomain(identifier: string): string {
 /**
  * Fetch the well-known WMP configuration for any WMP identifier.
  *
- * Extracts the domain and fetches `https://<domain>/.well-known/wmp-configuration`.
- * Throws if no domain can be extracted or the fetch fails.
+ * For a full URL (e.g. `https://host/wmp-engine/wmp`), tries the well-known
+ * at the URL's own path prefix FIRST (`https://host/wmp-engine/.well-known/
+ * wmp-configuration`) — path-prefixed deployments (a reverse proxy's
+ * location) serve it there — and falls back to the domain root.
+ * For bare identifiers (domains, DIDs), fetches the domain root.
+ *
+ * Throws if no domain can be extracted or every fetch fails.
  */
 export async function discoverEndpoint(
   identifier: string,
@@ -99,12 +104,36 @@ export async function discoverEndpoint(
       `Cannot extract domain from identifier "${identifier}": use session parameters or a profile resolver`,
     );
   }
-  const url = `https://${domain}/.well-known/wmp-configuration`;
-  const resp = await fetchFn(url, {
-    headers: { Accept: "application/json" },
-  });
-  if (!resp.ok) {
-    throw new Error(`WMP discovery failed for ${url}: HTTP ${resp.status}`);
+  // The candidate well-known URLs, first-wins: the URL's own path prefix
+  // (a reverse-proxied deployment), then the domain root.
+  const candidates: string[] = [];
+  if (identifier.startsWith("https://")) {
+    try {
+      const url = new URL(identifier);
+      const path = url.pathname.replace(/\/+$/, "").replace(/\/wmp$/, "");
+      if (path && path !== "/") {
+        candidates.push(`${url.origin}${path}/.well-known/wmp-configuration`);
+      }
+    } catch {
+      // fall through to the domain root
+    }
   }
-  return (await resp.json()) as WellKnownConfig;
+  candidates.push(`https://${domain}/.well-known/wmp-configuration`);
+  let lastError: unknown;
+  for (const url of candidates) {
+    try {
+      const resp = await fetchFn(url, {
+        headers: { Accept: "application/json" },
+      });
+      if (resp.ok) {
+        return (await resp.json()) as WellKnownConfig;
+      }
+      lastError = new Error(`WMP discovery failed for ${url}: HTTP ${resp.status}`);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`WMP discovery failed for ${identifier}`);
 }
