@@ -139,6 +139,8 @@ export const ErrorCode = {
   PolicyUnsupported: -31018,
   /** Core §3.8.2: the decrypted plaintext does not match the sender's `plaintext_hash` commitment (§5.2.1). The message MUST NOT be acknowledged. */
   PlaintextHashMismatch: -31019,
+  /** Core §3.8: the issuer of an OID4VCI offer is not registered to issue the credential configurations it offers (OpenID4x §3.1.6). */
+  IssuerNotEntitled: -31020,
 } as const;
 
 // ---------------------------------------------------------------------------

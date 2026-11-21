@@ -87,6 +87,45 @@ export function validateCompletionResult(
   validateRedactedMembers(result);
   validateDecryptResult(result);
   validateResponseJWE(result);
+  validateVpToken(result);
+}
+
+// OpenID4x §3.2.4: a sign result's vp_token is a non-empty string, a non-empty
+// array of non-empty strings, or a non-empty object of non-empty arrays of
+// non-empty strings. Anything else is refused; the value is not logged or echoed.
+function validateVpToken(m: Obj): void {
+  if (!has(m, "vp_token")) return;
+  const v = m.vp_token;
+  if (typeof v === "string") {
+    if (v.length === 0) fail("vp_token is the empty string");
+    return;
+  }
+  if (Array.isArray(v)) {
+    if (v.length === 0) fail("vp_token is the empty array");
+    v.forEach((entry, i) => {
+      if (typeof entry !== "string" || entry.length === 0) {
+        fail(`vp_token[${i}] is not a non-empty string`);
+      }
+    });
+    return;
+  }
+  if (isObj(v)) {
+    const keys = Object.keys(v);
+    if (keys.length === 0) fail("vp_token is the empty object");
+    for (const key of keys) {
+      const arr = (v as Record<string, unknown>)[key];
+      if (!Array.isArray(arr) || arr.length === 0) {
+        fail(`vp_token[${JSON.stringify(key)}] is not a non-empty array`);
+      }
+      arr.forEach((entry, i) => {
+        if (typeof entry !== "string" || entry.length === 0) {
+          fail(`vp_token[${JSON.stringify(key)}][${i}] is not a non-empty string`);
+        }
+      });
+    }
+    return;
+  }
+  fail("vp_token is not a string, array, or object");
 }
 
 function validateEncryptedFlag(m: Obj): boolean {
