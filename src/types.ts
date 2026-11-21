@@ -137,6 +137,8 @@ export const ErrorCode = {
   ConsignmentModeUnsupported: -31016,
   AssuranceLevelUnsupported: -31017,
   PolicyUnsupported: -31018,
+  /** Core §3.8.2: the decrypted plaintext does not match the sender's `plaintext_hash` commitment (§5.2.1). The message MUST NOT be acknowledged. */
+  PlaintextHashMismatch: -31019,
 } as const;
 
 // ---------------------------------------------------------------------------
