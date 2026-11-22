@@ -40,7 +40,7 @@ export interface TransactionDataCapability {
  * which would read as support the peer never claimed.
  */
 export function offersTransactionData(caps: Capabilities | undefined, version: number = TRANSACTION_DATA_VERSION_1): boolean {
-  const raw: unknown = caps !== undefined && Object.prototype.hasOwnProperty.call(caps, CAPABILITY_TRANSACTION_DATA) ? caps[CAPABILITY_TRANSACTION_DATA] : undefined;
+  const raw: unknown = caps !== undefined && Object.hasOwn(caps, CAPABILITY_TRANSACTION_DATA) ? caps[CAPABILITY_TRANSACTION_DATA] : undefined;
   // A malformed descriptor is not an offer: fail closed on every member we know.
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
   const c = raw as { versions?: unknown; hash_algs?: unknown };
@@ -79,16 +79,16 @@ export const TRANSACTION_DATA_HASH_ALGS: readonly string[] = [...HASHES.keys()];
 
 function toBase64Url(bytes: Uint8Array): string {
   let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  for (const b of bytes) bin += String.fromCodePoint(b);
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
 function fromBase64Url(s: string): Uint8Array {
   if (!/^[A-Za-z0-9_-]+$/.test(s)) throw new Error("not base64url");
   const pad = (4 - (s.length % 4)) % 4;
   if (pad === 3) throw new Error("impossible base64url length");
-  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat(pad));
-  return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  const bin = atob(s.replaceAll("-", "+").replaceAll("_", "/") + "=".repeat(pad));
+  return Uint8Array.from(bin, (c) => c.codePointAt(0) ?? 0);
 }
 
 /**
@@ -105,7 +105,7 @@ export function transactionDataHash(raw: string, alg: string = "sha-256"): strin
   // eslint-disable-next-line no-control-regex
   if (!/^[\u0000-\u007f]*$/.test(raw)) throw new Error("transaction_data raw is not ASCII");
   const bytes = new Uint8Array(raw.length);
-  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.codePointAt(i) ?? 0;
   return toBase64Url(h(bytes));
 }
 
@@ -116,7 +116,7 @@ function deepEqual(a: unknown, b: unknown): boolean {
   const ka = Object.keys(a);
   const kb = Object.keys(b);
   if (ka.length !== kb.length) return false;
-  return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
+  return ka.every((k) => Object.hasOwn(b, k) && deepEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
 }
 
 /**
@@ -378,10 +378,10 @@ function validVpToken(v: unknown): boolean {
 }
 
 /** Response modes in which the wallet encrypts the response (profile 7.7). */
-const ENCRYPTED_RESPONSE_MODES = ["direct_post.jwt", "dc_api.jwt"];
+const ENCRYPTED_RESPONSE_MODES = new Set(["direct_post.jwt", "dc_api.jwt"]);
 
 /** The members a decrypt_credential_response result may carry: control members only. */
-const DECRYPT_RESULT_MEMBERS = ["credential_count", "transaction_id", "interval", "error"];
+const DECRYPT_RESULT_MEMBERS = new Set(["credential_count", "transaction_id", "interval", "error"]);
 
 /**
  * Checks the result of a sign sub-flow before it is sent: the completion rules
@@ -400,7 +400,7 @@ export function validateSignResult(action: string, result: unknown, responseMode
     // itself and answers with response_jwe; a plaintext vp_token would reach the
     // orchestrator unprotected and no later refusal can undo that (profile 7.7).
     // A plaintext mode has no use for a JWE the orchestrator cannot read.
-    const encrypted = responseMode !== undefined && ENCRYPTED_RESPONSE_MODES.includes(responseMode);
+    const encrypted = responseMode !== undefined && ENCRYPTED_RESPONSE_MODES.has(responseMode);
     if ("error" in r) {
       // An error result carries no presentation in any mode, and no response_jwe
       // (profile 7.7): it reports a refusal, there is nothing to encrypt. The
@@ -421,7 +421,7 @@ export function validateSignResult(action: string, result: unknown, responseMode
   }
   if (action !== "decrypt_credential_response") return;
   for (const k of Object.keys(r)) {
-    if (!DECRYPT_RESULT_MEMBERS.includes(k)) throw new CompletionResultError("decryption result carries a member outside the control set");
+    if (!DECRYPT_RESULT_MEMBERS.has(k)) throw new CompletionResultError("decryption result carries a member outside the control set");
   }
   if (!("credential_count" in r) && !("transaction_id" in r) && !("error" in r)) {
     throw new CompletionResultError("decryption result carries no credential_count, transaction_id or error");

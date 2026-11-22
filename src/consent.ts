@@ -60,8 +60,8 @@ export function isQueryId(q: unknown): q is string {
 export function newSelectionHandle(): string {
   const bytes = getRandomValues(16);
   let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  for (const b of bytes) bin += String.fromCodePoint(b);
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
 export interface SelectCredentialsContext {
