@@ -510,6 +510,11 @@ describe("decrypt_credential_response results carry control members only", () =>
     }
     // other actions keep only the general rules
     expect(() => validateSignResult("generate_proof", { proof_jwt: "eyJ", credentials: [] })).not.toThrow();
+    // a proof_jwt that is not a non-empty string is no proof; a key-only answer has none
+    for (const bad of [true, 1, null, "", [], {}, ["eyJ"]]) {
+      expect(() => validateSignResult("generate_proof", { proof_jwt: bad }), JSON.stringify(bad)).toThrow(CompletionResultError);
+    }
+    expect(() => validateSignResult("generate_proof", { credential_response_encryption_jwk: { kty: "EC" } })).not.toThrow();
   });
 
   it("the profile never sends decrypted credentials to the orchestrator", async () => {
