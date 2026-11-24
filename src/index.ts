@@ -265,8 +265,13 @@ export type {
 } from "./session-store.js";
 
 // Discovery
-export { extractDomain, discoverEndpoint } from "./discovery.js";
-export type { WellKnownConfig } from "./discovery.js";
+export {
+  extractDomain,
+  discoverEndpoint,
+  discoveryBase,
+  wellKnownUrl,
+} from "./discovery.js";
+export type { WellKnownConfig, DiscoveryBase } from "./discovery.js";
 export type { ErdsMetadata, RecipientMetadata } from "./discovery.js";
 
 // Invitation
