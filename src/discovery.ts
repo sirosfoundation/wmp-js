@@ -198,7 +198,12 @@ function describesBase(config: WellKnownConfig, base: DiscoveryBase): boolean {
   if (config.discovery_base === undefined || config.discovery_base === "") {
     return base.tenantPath === "";
   }
-  if (typeof config.discovery_base !== "string") {
+  // The declared base is compared as written: a trailing "/" is not the
+  // base, only an identifier's path is trimmed.
+  if (
+    typeof config.discovery_base !== "string" ||
+    config.discovery_base.endsWith("/")
+  ) {
     return false;
   }
   // The scheme compares case-insensitively, like the host.

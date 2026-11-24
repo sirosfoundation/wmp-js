@@ -120,6 +120,7 @@ describe("discoverEndpoint", () => {
     ["the host's", "https://example.com"],
     ["another tenant's", "https://example.com/tenant2"],
     ["another host's", "https://evil.example/tenant1"],
+    ["the tenant's with a trailing slash", "https://example.com/tenant1/"],
     ["not a string", 7],
   ])("refuses a tenant document whose discovery_base is %s", async (_n, b) => {
     const { fetchFn } = server({
@@ -144,9 +145,18 @@ describe("discoverEndpoint", () => {
 
   it("accepts a host document that names the host", async () => {
     const { fetchFn } = server({
-      [`https://example.com${WK}`]: doc("wss://x/wmp", "https://example.com/"),
+      [`https://example.com${WK}`]: doc("wss://x/wmp", "https://example.com"),
     });
     const config = await discoverEndpoint("did:web:example.com", fetchFn);
     expect(config.endpoints.websocket).toBe("wss://x/wmp");
+  });
+
+  it("refuses a host document whose base has a trailing slash", async () => {
+    const { fetchFn } = server({
+      [`https://example.com${WK}`]: doc("wss://x/wmp", "https://example.com/"),
+    });
+    await expect(
+      discoverEndpoint("did:web:example.com", fetchFn),
+    ).rejects.toThrow(/not for https:\/\/example.com/);
   });
 });
