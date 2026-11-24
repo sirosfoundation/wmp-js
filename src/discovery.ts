@@ -129,7 +129,11 @@ function urlBase(raw: string): DiscoveryBase | null {
   if (!base) {
     return null;
   }
-  const tenantPath = slash < 0 ? "" : rest.slice(slash).replace(/\/+$/, "");
+  let end = rest.length;
+  while (slash >= 0 && end > slash && rest[end - 1] === "/") {
+    end--;
+  }
+  const tenantPath = slash < 0 ? "" : rest.slice(slash, end);
   for (const segment of tenantPath.split("/")) {
     let decoded: string;
     try {
