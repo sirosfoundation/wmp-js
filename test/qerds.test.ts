@@ -82,6 +82,11 @@ class FakeErds {
     const method = init?.method ?? "GET";
     if (method === "GET") {
       this.calls.push({ method, url, headers });
+      if (this.stallEvidence) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+        });
+      }
       const page = this.evidencePages[Math.min(this.evidenceReads++, this.evidencePages.length - 1)];
       return new Response(JSON.stringify(page), { status: 200, headers: { "Content-Type": "application/json" } });
     }
@@ -91,6 +96,9 @@ class FakeErds {
     const answer = refused ? { jsonrpc: "2.0", id: body.id, error: refused } : { jsonrpc: "2.0", id: body.id, result: this.result(body) };
     return new Response(JSON.stringify(answer), { status: 200, headers: { "Content-Type": "application/json" } });
   };
+
+  /** When set, an evidence read never answers (until it is aborted). */
+  stallEvidence = false;
 
   private result(body: { method: string; params: Record<string, any> }): unknown {
     switch (body.method) {
@@ -264,7 +272,7 @@ describe("sendQerds", () => {
   });
 
   it("proves every request when auth is dpop", async () => {
-    const { erds, opts } = await setup({ auth: "dpop", evidence: { timeoutMs: 0 } });
+    const { erds, opts } = await setup({ auth: "dpop", evidence: { timeoutMs: 5_000, intervalMs: 60_000 } });
     await sendQerds(opts);
     expect(erds.of("wmp.session.create")[0].body!.params.auth).toEqual({ type: "dpop" });
     expect(erds.calls).toHaveLength(6);
@@ -319,7 +327,8 @@ describe("sendQerds", () => {
     erds.recipients[BOB] = [await recipient(BOB, 1)];
     expect((await sendQerds(opts)).group.cipherSuite).toBe(1);
 
-    erds.security = { mode: "mls", cipher_suites: [2] };
+    // The selected suite binds even when the list is wider.
+    erds.security = { mode: "mls", cipher_suites: [1, 2], cipher_suite: 2 };
     const err = await sendQerds(opts).catch((e) => e);
     expect(err).toBeInstanceOf(QerdsError);
     expect(err.step).toBe("group");
@@ -402,7 +411,7 @@ describe("sendQerds", () => {
 
   it("reads the repository the session negotiated", async () => {
     const { erds, opts } = await setup({
-      evidence: { timeoutMs: 0 },
+      evidence: { timeoutMs: 5_000, intervalMs: 60_000 },
       capabilities: { evidence: { event_types: ["delivery_confirmed"], repository: "https://evidence.example.com/api/" } },
     });
     await sendQerds(opts);
@@ -413,7 +422,7 @@ describe("sendQerds", () => {
     ["no evidence_records", { evidence_records: null }],
     ["a malformed record", { evidence_records: [{ event_type: "delivery_confirmed" }] }],
   ])("refuses a repository answer with %s", async (_name, page) => {
-    const { erds, opts } = await setup({ evidence: { timeoutMs: 0 } });
+    const { erds, opts } = await setup({ evidence: { timeoutMs: 5_000, intervalMs: 60_000 } });
     erds.evidencePages = [page];
     const err = await sendQerds(opts).catch((e) => e);
     expect(err).toBeInstanceOf(QerdsError);
@@ -434,5 +443,41 @@ describe("sendQerds", () => {
     expect(err).toBeInstanceOf(QerdsError);
     expect(err.step).toBe("config");
     expect(erds.calls).toHaveLength(0);
+  });
+
+  it.each(["tls", "none", undefined])("refuses a session whose security mode is %s", async (mode) => {
+    const { erds, opts } = await setup();
+    erds.security = { mode };
+    const err = await sendQerds(opts).catch((e) => e);
+    expect(err).toBeInstanceOf(QerdsError);
+    expect(err.step).toBe("session");
+    expect(erds.calls).toHaveLength(1);
+  });
+
+  it("accepts an mls-optional session", async () => {
+    const { erds, opts } = await setup();
+    erds.security = { mode: "mls-optional", cipher_suites: [2] };
+    expect((await sendQerds(opts)).group.cipherSuite).toBe(2);
+  });
+
+  it("reports what was sent when the deliver fails", async () => {
+    const { erds, opts } = await setup();
+    erds.refuse["wmp.message.deliver"] = { code: -32603, message: "Internal error" };
+    const err = await sendQerds(opts).catch((e) => e);
+    expect(err.step).toBe("deliver");
+    const call = erds.of("wmp.message.deliver")[0].body!;
+    expect(err.sent.id).toBe(call.id);
+    expect(err.sent.content).toEqual({ ciphertext: call.params.ciphertext });
+    expect(err.sent.signature).toBe(call.params.wmp.signature);
+    expect(err.sent.plaintext.to).toEqual([BOB]);
+  });
+
+  it("ends the poll unconfirmed when the repository stalls past the timeout", async () => {
+    const { erds, opts } = await setup({ evidence: { timeoutMs: 50 } });
+    erds.stallEvidence = true;
+    const result = await sendQerds(opts);
+    expect(result.confirmed).toBe(false);
+    expect(result.evidence).toEqual([]);
+    expect(result.message.id).toBeTruthy();
   });
 });

@@ -133,8 +133,8 @@ The one certificate chain serves every role: the per-request proof, the §5.4 co
 
 - `auth: "mtls"` (the default) sends no proof: pass a `fetch` that presents the client certificate (for example undici's `fetch` with an `Agent` that has `connect: { cert, key }`).
 - `auth: "dpop"` sends a per-request proof (WMP Core §4.4.8) on every request, the evidence reads included.
-- A step that fails throws a `QerdsError` whose `step` is `session`, `resolve`, `group`, `deliver` or `evidence`, and whose `cause` is the `WMPError` of a refused request.
-- A poll that ends before one of `evidence.until` returns `confirmed: false` with the records read so far. `evidence: { poll: false }` returns right after the deliver.
+- A step that fails throws a `QerdsError` whose `step` is `session`, `resolve`, `group`, `deliver` or `evidence`, and whose `cause` is the `WMPError` of a refused request. When the deliver request itself fails, `sent` carries the message that was sent: the ERDS may have accepted it, and its id is what the evidence refers to.
+- A poll that ends before one of `evidence.until` returns `confirmed: false` with the records read so far; `evidence.timeoutMs` also bounds each read of the repository. `evidence: { poll: false }` returns right after the deliver.
 - `plaintextHash: true` adds the salted `plaintext_hash` commitment of WMP Core §5.2.1.
 - `mls` replaces the default ts-mls engine.
 

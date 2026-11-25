@@ -43,6 +43,13 @@ export type QerdsStep = "config" | "session" | "resolve" | "group" | "deliver" |
 
 /** A QERDS send that did not complete. `cause` carries the WMPError of a refused request. */
 export class QerdsError extends Error {
+  /**
+   * What was sent, when the deliver request was made and failed: its answer
+   * may have been lost after the ERDS accepted the message, and the id is
+   * what its evidence refers to.
+   */
+  sent?: SendQerdsResult["message"];
+
   constructor(
     readonly step: QerdsStep,
     reason: string,
@@ -116,7 +123,7 @@ export interface QerdsEvidenceOptions {
   poll?: boolean;
   /** Event types that end the poll. Default: delivery_confirmed and the terminal failures. */
   until?: string[];
-  /** How long to poll. Default: 90 000 ms. */
+  /** How long to poll; it also bounds each read of the repository. Default: 90 000 ms. */
   timeoutMs?: number;
   /** Pause between polls. Default: 5 000 ms. */
   intervalMs?: number;
@@ -365,10 +372,11 @@ class QerdsClient {
   }
 
   /** One page of the evidence repository. */
-  async evidencePage(url: URL): Promise<Record<string, unknown>> {
+  async evidencePage(url: URL, signal: AbortSignal): Promise<Record<string, unknown>> {
     const resp = await this.fetchFn(url.toString(), {
       method: "GET",
       headers: await this.headers("GET", url.toString(), { Accept: "application/json" }),
+      signal,
     });
     if (!resp.ok) throw new Error(`evidence repository: HTTP ${resp.status}`);
     const page: unknown = await resp.json();
@@ -432,6 +440,11 @@ async function createSession(client: QerdsClient, opts: SendQerdsOptions): Promi
   });
   const id = isObject(result.wmp) ? result.wmp.session_id : undefined;
   if (typeof id !== "string" || id === "") throw new Error("the response names no session");
+  // The group and the encrypted deliver need a session that negotiated MLS.
+  const mode = isObject(result.security) ? result.security.mode : undefined;
+  if (typeof mode !== "string" || !mode.startsWith("mls")) {
+    throw new Error(`the session's security mode is ${JSON.stringify(mode)}, not mls`);
+  }
   client.sessionId = id;
   return {
     id,
@@ -465,8 +478,10 @@ async function resolveRecipient(client: QerdsClient, recipient: string): Promise
 
 /** The cipher suites the session negotiated, when it names any. */
 function acceptedSuites(security: SecurityMode | undefined): number[] | undefined {
+  // The suite the responder selected binds; the list is what it would accept.
+  if (Number.isInteger(security?.cipher_suite)) return [security!.cipher_suite!];
   if (Array.isArray(security?.cipher_suites) && security.cipher_suites.length > 0) return security.cipher_suites;
-  return Number.isInteger(security?.cipher_suite) ? [security!.cipher_suite!] : undefined;
+  return undefined;
 }
 
 /** The cipher suite every recipient has a KeyPackage for, and that KeyPackage per recipient. */
@@ -518,20 +533,27 @@ async function deliver(
     kid: opts.credential.kid,
   });
   const id = opts.message.id ?? uniqueId("msg");
-  await client.call(
-    Method.MessageDeliver,
-    {
-      wmp: client.meta({
-        encrypted: true,
-        epoch,
-        signature,
-        identity_assertions: opts.identityAssertions ?? [{ type: "x509_chain", x5c: client.x5c }],
-      }),
-      ...content,
-    },
-    id,
-  );
-  return { message: { id, content, signature, plaintext }, epoch };
+  const message = { id, content, signature, plaintext };
+  try {
+    await client.call(
+      Method.MessageDeliver,
+      {
+        wmp: client.meta({
+          encrypted: true,
+          epoch,
+          signature,
+          identity_assertions: opts.identityAssertions ?? [{ type: "x509_chain", x5c: client.x5c }],
+        }),
+        ...content,
+      },
+      id,
+    );
+  } catch (err) {
+    const failed = new QerdsError("deliver", `wmp.message.deliver: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+    failed.sent = message;
+    throw failed;
+  }
+  return { message, epoch };
 }
 
 function withoutTrailingSlashes(url: string): string {
@@ -555,11 +577,12 @@ async function readEvidencePage(
   repository: string,
   messageId: string,
   token: string | undefined,
+  signal: AbortSignal,
 ): Promise<{ records: QerdsEvidenceRecord[]; next?: string }> {
   const url = new URL(`${withoutTrailingSlashes(repository)}/evidence`);
   url.searchParams.set("session_id", client.sessionId!);
   if (token !== undefined) url.searchParams.set("continuation_token", token);
-  const doc = await client.evidencePage(url);
+  const doc = await client.evidencePage(url, signal);
   if (!Array.isArray(doc.evidence_records)) throw new Error("evidence repository: no evidence_records");
   const records: QerdsEvidenceRecord[] = [];
   for (const r of doc.evidence_records) {
@@ -578,13 +601,14 @@ async function readEvidence(
   client: QerdsClient,
   repository: string,
   messageId: string,
+  signal: AbortSignal,
   token?: string,
   page = 1,
 ): Promise<QerdsEvidenceRecord[]> {
   if (page > MAX_EVIDENCE_PAGES) throw new Error(`evidence repository: more than ${MAX_EVIDENCE_PAGES} pages`);
-  const { records, next } = await readEvidencePage(client, repository, messageId, token);
+  const { records, next } = await readEvidencePage(client, repository, messageId, token, signal);
   if (next === undefined) return records;
-  return records.concat(await readEvidence(client, repository, messageId, next, page + 1));
+  return records.concat(await readEvidence(client, repository, messageId, signal, next, page + 1));
 }
 
 interface EvidencePoll {
@@ -593,11 +617,23 @@ interface EvidencePoll {
   until: string[];
   intervalMs: number;
   deadline: number;
+  /** Aborts a read that is still running at the deadline. */
+  signal: AbortSignal;
+  /** The last complete read. */
+  last: QerdsEvidenceRecord[];
 }
 
 /** Reads the evidence, and again after a pause until it is confirmed or the deadline would pass. */
 async function pollUntil(client: QerdsClient, poll: EvidencePoll): Promise<{ evidence: QerdsEvidenceRecord[]; confirmed: boolean }> {
-  const evidence = await readEvidence(client, poll.repository, poll.messageId);
+  let evidence: QerdsEvidenceRecord[];
+  try {
+    evidence = await readEvidence(client, poll.repository, poll.messageId, poll.signal);
+  } catch (err) {
+    // A repository that stalls past the timeout ends the poll unconfirmed, as an elapsed timeout does.
+    if (poll.signal.aborted) return { evidence: poll.last, confirmed: false };
+    throw err;
+  }
+  poll.last = evidence;
   if (evidence.some((r) => poll.until.includes(r.event_type))) return { evidence, confirmed: true };
   if (Date.now() + poll.intervalMs > poll.deadline) return { evidence, confirmed: false };
   await new Promise((resolve) => setTimeout(resolve, poll.intervalMs));
@@ -610,12 +646,15 @@ function pollEvidence(
   session: SendQerdsResult["session"],
   messageId: string,
 ): Promise<{ evidence: QerdsEvidenceRecord[]; confirmed: boolean }> {
+  const timeoutMs = opts.evidence?.timeoutMs ?? 90_000;
   return pollUntil(client, {
     repository: repositoryUrl(opts, session),
     messageId,
     until: opts.evidence?.until ?? DEFAULT_UNTIL,
     intervalMs: opts.evidence?.intervalMs ?? 5_000,
-    deadline: Date.now() + (opts.evidence?.timeoutMs ?? 90_000),
+    deadline: Date.now() + timeoutMs,
+    signal: AbortSignal.timeout(timeoutMs),
+    last: [],
   });
 }
 
