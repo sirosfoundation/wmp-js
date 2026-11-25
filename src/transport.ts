@@ -163,9 +163,31 @@ export class WebSocketTransport extends Emitter implements Transport {
 // HTTP+SSE transport
 // ---------------------------------------------------------------------------
 
+/** The request a per-request proof is made for. */
+export interface ProofRequest {
+  method: string;
+  /** The absolute request URL. */
+  url: string;
+  sessionId: string;
+}
+
+/** Returns the compact JWS proof for a request. */
+export type RequestProofProvider = (req: ProofRequest) => string | Promise<string>;
+
 export interface HttpSseTransportOptions {
   /** Authorization header value (e.g., "Bearer <token>"). */
   authorization?: string;
+  /**
+   * Makes the per-request proof (WMP Core section 4.4.8) of a request that
+   * names a session; see createRequestProof. The proof is sent as
+   * "Authorization: DPoP <proof>" on each POST after the session create and on
+   * each connection of the event stream, in place of `authorization`.
+   *
+   * The event stream carries it only through an EventSource that accepts a
+   * `fetch` function in its init object (the `eventsource` package does); a
+   * browser's native EventSource sends no Authorization header.
+   */
+  requestProof?: RequestProofProvider;
   /**
    * Initial SSE cursor (the ID of the last event already processed). It is
    * sent on the first connectSSE() and replaces itself as events arrive.
@@ -189,6 +211,7 @@ export class HttpSseTransport extends Emitter implements Transport {
   private rpcUrl: string;
   private eventsUrl: string;
   private authorization?: string;
+  private requestProof?: RequestProofProvider;
   private sessionId?: string;
   private eventSource: EventSource | null = null;
   private fetchFn: typeof globalThis.fetch;
@@ -210,6 +233,7 @@ export class HttpSseTransport extends Emitter implements Transport {
     this.rpcUrl = rpcUrl;
     this.eventsUrl = eventsUrl;
     this.authorization = opts?.authorization;
+    this.requestProof = opts?.requestProof;
     this.fetchFn = opts?.fetch ?? globalThis.fetch.bind(globalThis);
     this.EventSourceCtor = opts?.EventSource ?? globalThis.EventSource;
     this.cursor = opts?.lastEventId || undefined;
@@ -307,6 +331,13 @@ export class HttpSseTransport extends Emitter implements Transport {
     return h;
   }
 
+  /** The Authorization value of a request on `sessionId`: a fresh proof, when proofs are configured. */
+  private async proofAuthorization(method: string, url: string, sessionId: string): Promise<string> {
+    const base = (globalThis as { location?: { href?: string } }).location?.href;
+    const absolute = new URL(url, base).toString();
+    return `DPoP ${await this.requestProof!({ method, url: absolute, sessionId })}`;
+  }
+
   private streamUrl(cursor?: string): string {
     // session_id (required for tenant routing) and the cursor. The cursor goes
     // as last_event_id (Transport Section 4.3.3) and, for servers that predate
@@ -339,13 +370,23 @@ export class HttpSseTransport extends Emitter implements Transport {
     const headers = this.streamHeaders(cursor);
     // Polyfills that can set request headers read `headers` from the init
     // object; a native EventSource ignores it.
-    const init = Object.keys(headers).length > 0 ? ({ headers } as EventSourceInit) : undefined;
-    const es = new this.EventSourceCtor(this.streamUrl(cursor), init);
-    this.eventSource = es;
+    let init = Object.keys(headers).length > 0 ? ({ headers } as EventSourceInit) : undefined;
     // The session this stream belongs to: once it is no longer the bound one (or
     // the stream was replaced or closed) nothing it delivers may touch the
     // cursor, the seen ids or the application.
     const session = this.sessionId;
+    if (this.requestProof && session) {
+      // A proof is single-use and short-lived: each connection the EventSource
+      // makes (the first and every reconnect) fetches with a fresh one.
+      const proofFetch = async (url: string | URL, fetchInit?: RequestInit): Promise<Response> => {
+        const h = new Headers(fetchInit?.headers);
+        h.set("Authorization", await this.proofAuthorization("GET", String(url), session));
+        return this.fetchFn(url, { ...fetchInit, headers: h });
+      };
+      init = { ...init, fetch: proofFetch } as EventSourceInit;
+    }
+    const es = new this.EventSourceCtor(this.streamUrl(cursor), init);
+    this.eventSource = es;
 
     es.onopen = () => {
       if (this.eventSource !== es) return;
@@ -410,8 +451,12 @@ export class HttpSseTransport extends Emitter implements Transport {
     let status: number | undefined;
     try {
       const abort = new AbortController();
+      const probeHeaders: Record<string, string> = { ...this.streamHeaders(cursor), Accept: "text/event-stream" };
+      if (this.requestProof && session) {
+        probeHeaders["Authorization"] = await this.proofAuthorization("GET", this.streamUrl(cursor), session);
+      }
       const resp = await this.fetchFn(this.streamUrl(cursor), {
-        headers: { ...this.streamHeaders(cursor), Accept: "text/event-stream" },
+        headers: probeHeaders,
         signal: abort.signal,
       });
       status = resp.status;
@@ -459,6 +504,9 @@ export class HttpSseTransport extends Emitter implements Transport {
     }
     if (routeId) {
       headers["Wmp-Session-Id"] = routeId;
+      if (this.requestProof) {
+        headers["Authorization"] = await this.proofAuthorization("POST", this.rpcUrl, routeId);
+      }
     }
 
     const resp = await this.fetchFn(this.rpcUrl, {
