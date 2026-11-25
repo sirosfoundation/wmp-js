@@ -205,4 +205,23 @@ describe("content signature (WMP Core 5.4)", () => {
     const sig = await signContent(content, { signer, x5c });
     await expect(verifyContentSignature(sig, content, { verifyChain: () => {}, algorithms: ["EdDSA"] })).rejects.toThrow(/algorithm/);
   });
+
+  // Made by go-wmp (pkg/wmp/signature) with a real two-certificate x5c chain.
+  const GO_SIGNATURE =
+    "eyJhbGciOiJFUzI1NiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il0sIng1YyI6WyJNSUlCUkRDQjY2QURBZ0VDQWdFQ01Bb0dDQ3FHU000OUJBTUNNQkl4RURBT0JnTlZCQU1UQjNSbGMzUWdZMkV3SGhjTk1qWXhNVEkxTVRNek9ERXpXaGNOTWpZeE1USTFNVFV6T0RFeldqQVJNUTh3RFFZRFZRUURFd1p6Wlc1a1pYSXdXVEFUQmdjcWhrak9QUUlCQmdncWhrak9QUU1CQndOQ0FBUTFpZ2J2UTQ1NE8yVTVoNmNwajd0Tzh2N3Vkb08wWHUzOWtGaFBkbk5jNDFSU3NnOWZ2V3BNOTVUYy8rUUlmYVhkTlBDaDlsR1NBNm5JeTBQWURnU0tvek13TVRBT0JnTlZIUThCQWY4RUJBTUNCNEF3SHdZRFZSMGpCQmd3Rm9BVUc0M3Q5aGNDY1BrSFA3U1dMQkxFcWZpMFpoc3dDZ1lJS29aSXpqMEVBd0lEU0FBd1JRSWhBUG1ScVNkeTJOdVBabjhUWDVZSW9xaVRJMk5oMHhwV0g3WGZsTUdqK2dveEFpQnpJTFBDMWcvMjBzdmd6ZDRBYUI4ZFRrK3U5SVhyNmpkRUJteG1mSUJNTlE9PSIsIk1JSUJWRENCKzZBREFnRUNBZ0VCTUFvR0NDcUdTTTQ5QkFNQ01CSXhFREFPQmdOVkJBTVRCM1JsYzNRZ1kyRXdIaGNOTWpZeE1USTFNVE16T0RFeldoY05Nall4TVRJMU1UVXpPREV6V2pBU01SQXdEZ1lEVlFRREV3ZDBaWE4wSUdOaE1Ga3dFd1lIS29aSXpqMENBUVlJS29aSXpqMERBUWNEUWdBRWhnODVmZ2pkVzBFcHFYZ3JqMlpBb3dJOFlIOHE1Q0tIaFBiWTNkOU1ZYWhDOHhodThNcWFtOWZrTnFUbG9kL0U4bDdQWlcxQVovM3poaGJsRXkydVc2TkNNRUF3RGdZRFZSMFBBUUgvQkFRREFnSUVNQThHQTFVZEV3RUIvd1FGTUFNQkFmOHdIUVlEVlIwT0JCWUVGQnVON2ZZWEFuRDVCeiswbGl3U3hLbjR0R1liTUFvR0NDcUdTTTQ5QkFNQ0EwZ0FNRVVDSVFDaGVOaHhJditkWmIwMFd2cFhCcDMrQzl5MWhVMkEwT0k5ays2bUZtY1ozQUlnUXNHakFzbFVobnBKZlkwbmFsMHV3TTJYWU80YVRYVUIvRUdGSFpBbHpjUT0iXX0..ducXnnQo90oPZ617OLoG46vnL-ix9Riuc6KTPFFgvq0VeSc-KXQ1JOmoPuhOHmnxI0MaIFAt9ViR9T4CiEmxfw";
+  const VECTOR_CONTENT = {
+    ciphertext: "AAECAwQ",
+    plaintext_hash: { algorithm: "sha-256", value: "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU" },
+  };
+
+  it("verifies a signature made by go-wmp", async () => {
+    const verifyChain = vi.fn();
+    const v = await verifyContentSignature(GO_SIGNATURE, VECTOR_CONTENT, { verifyChain });
+    expect(v.alg).toBe("ES256");
+    expect(v.chain).toHaveLength(2);
+    expect(verifyChain).toHaveBeenCalledOnce();
+    await expect(
+      verifyContentSignature(GO_SIGNATURE, { ...VECTOR_CONTENT, ciphertext: "AAECAwU" }, { verifyChain }),
+    ).rejects.toThrow(/signature/);
+  });
 });
