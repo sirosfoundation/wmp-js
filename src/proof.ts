@@ -431,12 +431,18 @@ export async function verifyRequestProof(
 /** An in-process replay cache. A deployment with several instances needs a shared one. */
 export class MemoryRequestProofReplayCache implements RequestProofReplayCache {
   private entries = new Map<string, number>();
+  /** When expired entries are next removed: a lookup does not pay for the whole cache. */
+  private sweepAt = 0;
   constructor(private now: () => number = () => Date.now() / 1000) {}
 
   seen(key: string, expires: number): boolean {
     const now = this.now();
-    for (const [k, exp] of this.entries) if (exp <= now) this.entries.delete(k);
-    if (this.entries.has(key)) return true;
+    if (now >= this.sweepAt) {
+      for (const [k, exp] of this.entries) if (exp <= now) this.entries.delete(k);
+      this.sweepAt = now + 1;
+    }
+    const known = this.entries.get(key);
+    if (known !== undefined && known > now) return true;
     this.entries.set(key, expires);
     return false;
   }

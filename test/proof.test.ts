@@ -254,6 +254,10 @@ describe("request proof (WMP Core 4.4.8)", () => {
     const cache = new MemoryRequestProofReplayCache(() => t);
     expect(cache.seen("a", EPOCH + 60)).toBe(false);
     expect(cache.seen("a", EPOCH + 60)).toBe(true);
+    // Between sweeps an expired entry is still not a replay.
+    expect(cache.seen("b", EPOCH + 0.5)).toBe(false);
+    t = EPOCH + 0.5;
+    expect(cache.seen("b", EPOCH + 60)).toBe(false);
     t = EPOCH + 60;
     expect(cache.seen("a", EPOCH + 120)).toBe(false);
   });
