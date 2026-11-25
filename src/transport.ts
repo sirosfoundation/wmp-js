@@ -168,7 +168,8 @@ export interface ProofRequest {
   method: string;
   /** The absolute request URL. */
   url: string;
-  sessionId: string;
+  /** The session the request names. Undefined for a wmp.session.create, whose proof carries no `sid`. */
+  sessionId?: string;
 }
 
 /** Returns the compact JWS proof for a request. */
@@ -178,10 +179,11 @@ export interface HttpSseTransportOptions {
   /** Authorization header value (e.g., "Bearer <token>"). */
   authorization?: string;
   /**
-   * Makes the per-request proof (WMP Core section 4.4.8) of a request that
-   * names a session; see createRequestProof. The proof is sent as
-   * "Authorization: DPoP <proof>" on each POST after the session create and on
-   * each connection of the event stream, in place of `authorization`.
+   * Makes the per-request proof (WMP Core section 4.4.8) of a request; see
+   * createRequestProof. The proof is sent as "Authorization: DPoP <proof>" on
+   * the session create (a proof without `sid`), on each POST that names a
+   * session and on each connection of the event stream, in place of
+   * `authorization`.
    *
    * The event stream carries it only through an EventSource that accepts a
    * `fetch` function in its init object (the `eventsource` package does); a
@@ -332,10 +334,12 @@ export class HttpSseTransport extends Emitter implements Transport {
   }
 
   /** The Authorization value of a request on `sessionId`: a fresh proof, when proofs are configured. */
-  private async proofAuthorization(method: string, url: string, sessionId: string): Promise<string> {
+  private async proofAuthorization(method: string, url: string, sessionId: string | undefined): Promise<string> {
     const base = (globalThis as { location?: { href?: string } }).location?.href;
     const absolute = new URL(url, base).toString();
-    return `DPoP ${await this.requestProof!({ method, url: absolute, sessionId })}`;
+    const req: ProofRequest = { method, url: absolute };
+    if (sessionId !== undefined) req.sessionId = sessionId;
+    return `DPoP ${await this.requestProof!(req)}`;
   }
 
   private streamUrl(cursor?: string): string {
@@ -508,9 +512,12 @@ export class HttpSseTransport extends Emitter implements Transport {
     const routeId = this.routeOf(msg);
     if (routeId) {
       headers["Wmp-Session-Id"] = routeId;
-      if (this.requestProof) {
-        headers["Authorization"] = await this.proofAuthorization("POST", this.rpcUrl, routeId);
-      }
+    }
+    // A proof covers every POST that names a session, and the session create,
+    // whose proof names none.
+    const isCreate = (msg as { method?: unknown }).method === "wmp.session.create";
+    if (this.requestProof && (routeId || isCreate)) {
+      headers["Authorization"] = await this.proofAuthorization("POST", this.rpcUrl, routeId || undefined);
     }
 
     const resp = await this.fetchFn(this.rpcUrl, {
