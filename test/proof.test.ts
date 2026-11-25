@@ -152,6 +152,20 @@ describe("request proof (WMP Core 4.4.8)", () => {
     await expect(verifyRequestProof(await make(), { ...expectPost, accessToken }, trustAll)).rejects.toThrow(/ath/);
   });
 
+  it("makes and verifies the sid-less proof of a session create", async () => {
+    const { make } = await x5cFixture();
+    const createProof = await make({ sessionId: undefined });
+    const payload = Buffer.from(createProof.split(".")[1], "base64url").toString("utf8");
+    expect(payload).not.toContain('"sid"');
+    expect(payload.startsWith('{"htm":"POST","htu":"https://relay.example.com/wmp","iat":1795526400,"jti":"')).toBe(true);
+    const create = { method: "POST", url: RELAY, noSession: true };
+    const v = await verifyRequestProof(createProof, create, trustAll);
+    expect(v.claims.sid).toBeUndefined();
+    // It is not a proof for a session, and a session's proof does not pass where none is named.
+    await expect(verifyRequestProof(createProof, expectPost, trustAll)).rejects.toThrow(/sid/);
+    await expect(verifyRequestProof(await make(), create, trustAll)).rejects.toThrow(/sid/);
+  });
+
   it("returns the session to the caller when none is expected", async () => {
     const { make } = await x5cFixture();
     const v = await verifyRequestProof(await make(), { method: "POST", url: RELAY }, trustAll);
@@ -284,18 +298,34 @@ describe("request proof (WMP Core 4.4.8)", () => {
 describe("HttpSseTransport per-request proof", () => {
   const okFetch = () => vi.fn().mockResolvedValue({ ok: true, status: 200, headers: new Headers() });
 
-  it("proves each POST that names a session and leaves the create to the authorization", async () => {
+  it("proves the create without a session and each POST that names one", async () => {
     const fetchMock = okFetch();
-    const requestProof = vi.fn(async (r: { method: string; url: string; sessionId: string }) => "proof-" + r.sessionId);
+    const requestProof = vi.fn(
+      async (r: { method: string; url: string; sessionId?: string }) => "proof-" + (r.sessionId ?? "none"),
+    );
     const transport = new HttpSseTransport("https://example.com/wmp", "https://example.com/wmp/events", {
       fetch: fetchMock as unknown as typeof fetch,
       authorization: "Bearer tok",
       requestProof,
     });
 
-    await transport.send(createRequest("wmp.session.create", {}));
+    // A message that names no session and is not the create keeps the authorization.
+    await transport.send(createRequest("wmp.flow.start", { flow_id: "f0" }));
     expect(fetchMock.mock.calls[0][1].headers["Authorization"]).toBe("Bearer tok");
     expect(requestProof).not.toHaveBeenCalled();
+    fetchMock.mockClear();
+
+    await transport.send(createRequest("wmp.session.create", {}));
+    expect(fetchMock.mock.calls[0][1].headers["Authorization"]).toBe("DPoP proof-none");
+    expect(requestProof).toHaveBeenLastCalledWith({ method: "POST", url: "https://example.com/wmp" });
+
+    // Also with a session bound: the create names none.
+    transport.setSessionId("ses-0");
+    await transport.send(createRequest("wmp.session.create", {}));
+    expect(fetchMock.mock.calls[1][1].headers["Authorization"]).toBe("DPoP proof-none");
+    fetchMock.mockClear();
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, headers: new Headers() });
+    await transport.send(createRequest("wmp.flow.start", { flow_id: "f0" }));
 
     transport.setSessionId("ses-1");
     await transport.send(createRequest("wmp.flow.start", { flow_id: "f1" }));

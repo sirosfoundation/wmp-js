@@ -55,8 +55,8 @@ export interface RequestProofClaims {
   iat: number;
   /** Unique identifier of this proof. */
   jti: string;
-  /** The WMP session the proof is bound to. */
-  sid: string;
+  /** The WMP session the proof is bound to. Absent in the proof of a wmp.session.create. */
+  sid?: string;
   /** base64url SHA-256 of the access token the request also carries (RFC 9449 section 4.2). */
   ath?: string;
 }
@@ -74,8 +74,8 @@ export interface CreateRequestProofOptions {
   method: string;
   /** The absolute request URL. Its query and fragment are left out of `htu`. */
   url: string;
-  /** The WMP session of the request. */
-  sessionId: string;
+  /** The WMP session of the request. Left out only for a wmp.session.create, whose proof carries no `sid`. */
+  sessionId?: string;
   /** The bearer token the request also carries; its hash becomes `ath`. */
   accessToken?: string;
   /** Current time in unix seconds. Default: the system clock. */
@@ -139,7 +139,8 @@ function normalizeUrl(raw: string, strip: boolean): string {
 function canonicalClaims(c: RequestProofClaims): string {
   const members: Array<[string, string | number]> = [];
   if (c.ath !== undefined) members.push(["ath", c.ath]);
-  members.push(["htm", c.htm], ["htu", c.htu], ["iat", c.iat], ["jti", c.jti], ["sid", c.sid]);
+  members.push(["htm", c.htm], ["htu", c.htu], ["iat", c.iat], ["jti", c.jti]);
+  if (c.sid !== undefined) members.push(["sid", c.sid]);
   const body = members.map(([k, v]) => JSON.stringify(k) + ":" + JSON.stringify(v)).join(",");
   return `{${body}}`;
 }
@@ -166,7 +167,8 @@ export async function createRequestProof(opts: CreateRequestProofOptions): Promi
   const hasChain = opts.x5c !== undefined && opts.x5c.length > 0;
   const hasKid = opts.kid !== undefined && opts.kid !== "";
   if (hasChain === hasKid) throw new Error("exactly one of x5c and kid is required");
-  if (!opts.method || !opts.sessionId) throw new Error("method and session id are required");
+  if (!opts.method) throw new Error("method is required");
+  if (opts.sessionId === "") throw new Error("session id is empty");
   if (!(opts.signer.alg in ALGORITHMS)) throw new Error(`unsupported algorithm ${String(opts.signer.alg)}`);
 
   const header: Record<string, unknown> = { alg: opts.signer.alg, typ: REQUEST_PROOF_TYPE };
@@ -178,8 +180,8 @@ export async function createRequestProof(opts: CreateRequestProofOptions): Promi
     htu: normalizeUrl(opts.url, true),
     iat: opts.now ? Math.floor(opts.now()) : Math.floor(Date.now() / 1000),
     jti: toBase64Url(crypto.getRandomValues(new Uint8Array(16))),
-    sid: opts.sessionId,
   };
+  if (opts.sessionId !== undefined) claims.sid = opts.sessionId;
   if (opts.accessToken) claims.ath = await tokenHash(opts.accessToken);
 
   const input = `${toBase64Url(encoder.encode(JSON.stringify(header)))}.${toBase64Url(encoder.encode(canonicalClaims(claims)))}`;
@@ -200,10 +202,13 @@ export interface RequestProofExpectation {
   /** The URL the request was sent to, as the client saw it. */
   url: string;
   /**
-   * The session the request names. When it is undefined the `sid` claim is not
-   * compared and the caller MUST compare the returned `claims.sid` itself.
+   * The session the request names. When it is undefined and `noSession` is not
+   * set the `sid` claim is not compared and the caller MUST compare the
+   * returned `claims.sid` itself.
    */
   sessionId?: string;
+  /** The request names no session (wmp.session.create): the proof must carry no `sid`. */
+  noSession?: boolean;
   /**
    * The bearer token the request also carries. When set, the proof must carry
    * its hash in `ath`; when not, a proof with an `ath` is refused.
@@ -386,14 +391,18 @@ function parseClaims(payload: Record<string, unknown>): RequestProofClaims {
     htu: stringMember(payload, "htu"),
     iat,
     jti: stringMember(payload, "jti"),
-    sid: stringMember(payload, "sid"),
   };
+  // `sid` is omitted on a wmp.session.create; when present it is a non-empty string.
+  if (Object.hasOwn(payload, "sid")) claims.sid = stringMember(payload, "sid");
   if (Object.hasOwn(payload, "ath")) claims.ath = stringMember(payload, "ath");
   return claims;
 }
 
 /** Checks that the claims name the session, the request and the access token. */
 async function checkBinding(claims: RequestProofClaims, expect: RequestProofExpectation): Promise<void> {
+  if (expect.noSession && (expect.sessionId !== undefined || claims.sid !== undefined)) {
+    throw new RequestProofError("sid on a request that names no session");
+  }
   if (expect.sessionId !== undefined && claims.sid !== expect.sessionId) {
     throw new RequestProofError("sid does not name this session");
   }
@@ -447,7 +456,7 @@ export async function verifyRequestProof(
     }
   }
   // Last, so that only an otherwise valid proof consumes its jti.
-  if (opts.replay && (await opts.replay.seen(`${claims.sid}\u0000${claims.jti}`, claims.iat + 2 * skew))) {
+  if (opts.replay && (await opts.replay.seen(`${claims.sid ?? ""}\u0000${claims.jti}`, claims.iat + 2 * skew))) {
     throw new RequestProofError("jti was already used");
   }
   return { alg, claims, chain, kid, key };
