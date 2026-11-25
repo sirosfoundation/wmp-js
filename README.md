@@ -93,7 +93,7 @@ Built-in transports:
 
 #### Per-request proof
 
-For a deployment that terminates TLS without forwarding the client certificate, `HttpSseTransport` sends the per-request proof of WMP Core §4.4.8 on every request that names a session:
+For a deployment that terminates TLS without forwarding the client certificate, `HttpSseTransport` sends the per-request proof of WMP Core §4.4.8 on the session create and on every request that names a session:
 
 ```typescript
 const signer = webCryptoProofSigner(privateKey);
