@@ -71,6 +71,19 @@ Built-in transports:
 - `WebSocketTransport` — full-duplex WebSocket
 - `HttpSseTransport` — HTTP POST for requests, SSE for server notifications
 
+#### Per-request proof
+
+For a deployment that terminates TLS without forwarding the client certificate, `HttpSseTransport` sends the per-request proof of WMP Core §4.4.8 on every request that names a session:
+
+```typescript
+const signer = webCryptoProofSigner(privateKey);
+const transport = new HttpSseTransport(rpcUrl, eventsUrl, {
+  requestProof: (req) => createRequestProof({ signer, x5c: chain, ...req }),
+});
+```
+
+`verifyRequestProof` checks a proof on the receiving side.
+
 ### Peer
 
 Bidirectional JSON-RPC 2.0 peer over any `Transport`.

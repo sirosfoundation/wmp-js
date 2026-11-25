@@ -83,6 +83,8 @@ export type {
   TransportEventName,
   WebSocketTransportOptions,
   HttpSseTransportOptions,
+  ProofRequest,
+  RequestProofProvider,
 } from "./transport.js";
 
 // Profile system
@@ -293,3 +295,25 @@ export type {
   CreateInvitationOptions,
   InvitationStore,
 } from "./invitation.js";
+
+export {
+  REQUEST_PROOF_TYPE,
+  REQUEST_PROOF_SCHEME,
+  REQUEST_PROOF_SKEW_SECONDS,
+  RequestProofError,
+  MemoryRequestProofReplayCache,
+  createRequestProof,
+  verifyRequestProof,
+  requestProofFromHeader,
+  webCryptoProofSigner,
+} from "./proof.js";
+export type {
+  RequestProofAlgorithm,
+  RequestProofSigner,
+  RequestProofClaims,
+  CreateRequestProofOptions,
+  RequestProofExpectation,
+  VerifyRequestProofOptions,
+  RequestProofReplayCache,
+  VerifiedRequestProof,
+} from "./proof.js";
