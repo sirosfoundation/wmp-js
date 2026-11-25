@@ -11,9 +11,9 @@ TypeScript implementation of the Wallet Messaging Protocol (WMP) — a JSON-RPC 
 - **JSON-RPC 2.0** request/response and notification handling
 - **Bidirectional peer** with concurrent request tracking and timeout support
 - **Pluggable transports** — WebSocket and HTTP+SSE included
-- **Flow profile** for orchestrating multi-step wallet flows (issuance, presentation, etc.)
-- **Zero runtime dependencies**, ESM-only
-- **Fully tested** — 38 tests
+- **Profiles** for structured flows (OpenID4VCI, OpenID4VP, signing), MLS and evidence
+- **Per-request proof** for HTTPS sessions (WMP Core §4.4.8)
+- ESM-only
 
 ## Install
 
@@ -26,33 +26,52 @@ npm install @sirosfoundation/wmp-js
 ```typescript
 import { Peer, HttpSseTransport } from "@sirosfoundation/wmp-js";
 
-const transport = new HttpSseTransport({
-  rpcUrl: "https://wallet-backend.example.com/wmp/rpc",
-  eventsUrl: "https://wallet-backend.example.com/wmp/events",
-});
+// POST endpoint and event-stream endpoint, then options.
+const transport = new HttpSseTransport(
+  "https://wallet-backend.example.com/wmp",
+  "https://wallet-backend.example.com/wmp/events",
+  { authorization: "Bearer <token>" },
+);
 
 const peer = new Peer(transport, {
-  // Handle incoming notifications
-  onNotification: (method, params) => {
-    console.log("notification:", method, params);
+  handler: {
+    onFlowProgress: (params) => console.log("progress:", params),
+    onMessageDeliver: (params) => console.log("message:", params),
   },
 });
 
-await peer.connect();
-
-// Create a session
-const session = await peer.request("wmp.session.create", {
-  wmp: { version: "0.1", session_id: "" },
-  auth: { token: "bearer-token" },
+// Create a session. The peer binds the session id to the transport.
+const session = await peer.createSession({
+  sender: "did:web:me.example.com",
+  security: { mode: "tls" },
+  ttl: 3600,
 });
 
-// Start a flow
-const flow = await peer.request("wmp.flow.start", {
-  wmp: { version: "0.1", session_id: session.session_id },
-  flow_type: "issuance",
-  flow_id: "flow-1",
+// Open the event stream for the session: server-initiated messages arrive on it.
+transport.connectSSE();
+
+// Start a flow.
+const flow = await peer.startFlow("oid4vci", "flow-1", { credential_offer_uri: "..." });
+
+// Any other method.
+const caps = await peer.call("wmp.capability.list", {
+  wmp: { version: "0.1", session_id: session.wmp.session_id },
 });
 ```
+
+The order matters: `createSession()` first, `connectSSE()` after it. Binding a session to a transport whose stream was never opened opens nothing, and such a session sends but receives no events. Once the stream is open, a later session (a new create or a resume) reopens it automatically.
+
+### Node.js
+
+Node has no global `EventSource` (it is behind `--experimental-eventsource`), so pass one to the transport. The [`eventsource`](https://www.npmjs.com/package/eventsource) package accepts the `fetch` function the transport uses to send the Authorization header and the per-request proof on the stream:
+
+```typescript
+import { EventSource } from "eventsource";
+
+const transport = new HttpSseTransport(rpcUrl, eventsUrl, { EventSource });
+```
+
+A browser's native `EventSource` sends no Authorization header; a deployment that authenticates the stream by header needs the same polyfill there.
 
 ## API
 
@@ -60,16 +79,17 @@ const flow = await peer.request("wmp.flow.start", {
 
 ```typescript
 interface Transport {
-  send(data: string): Promise<void>;
-  onMessage(handler: (data: string) => void): void;
-  connect(): Promise<void>;
+  send(msg: Message): Promise<void>;
   close(): void;
+  on(event: "message" | "error" | "close" | "open" | "gap", listener): void;
+  off(event, listener): void;
 }
 ```
 
 Built-in transports:
-- `WebSocketTransport` — full-duplex WebSocket
-- `HttpSseTransport` — HTTP POST for requests, SSE for server notifications
+- `WebSocketTransport(url, opts?)` — full-duplex WebSocket
+- `HttpSseTransport(rpcUrl, eventsUrl, opts?)` — HTTP POST for requests, SSE for server-initiated messages. `connectSSE()` opens the stream; `setAuthorization()` replaces the Authorization value.
+- `StdioTransport`, `UnixSocketTransport` — from `@sirosfoundation/wmp-js/node`
 
 #### Per-request proof
 
@@ -89,29 +109,35 @@ const transport = new HttpSseTransport(rpcUrl, eventsUrl, {
 Bidirectional JSON-RPC 2.0 peer over any `Transport`.
 
 ```typescript
-const peer = new Peer(transport, options);
+const peer = new Peer(transport, { handler, callTimeout: 30_000 });
 
-// Send request and wait for response
-const result = await peer.request("method.name", params);
+// Session lifecycle
+await peer.createSession({ sender, participants, capabilities, security, auth, ttl });
+await peer.resumeSession();
+await peer.closeSession();
 
-// Send notification (no response expected)
-peer.notify("method.name", params);
+// Send a request and wait for the response
+const result = await peer.call("method.name", params);
+
+// Send a notification (no response expected)
+await peer.notify("method.name", params);
+
+// Flows and resolution
+await peer.startFlow(flowType, flowId, params);
+await peer.flowAction(flowId, action, params);
+await peer.resolve("vctm", "https://credentials.example.com/identity");
 ```
 
-### Flow Profile
+Incoming calls go to the `handler` option (`onSessionCreate`, `onMessageDeliver`, `onFlowStart`, `onFlowProgress`, `onFlowAction`, `onFlowComplete`, `onFlowError`, `onResolve`, ...); a method without a handler is answered "method not found".
 
-Higher-level abstraction for wallet flows.
+### Profiles
+
+A profile adds flow types, methods or resolve types to a peer:
 
 ```typescript
-import { Registry } from "@sirosfoundation/wmp-js";
+import { OpenID4xProfile } from "@sirosfoundation/wmp-js";
 
-const registry = new Registry();
-
-registry.register("issuance", {
-  onStart: async (ctx, params) => { /* ... */ },
-  onProgress: async (ctx, params) => { /* ... */ },
-  onComplete: async (ctx, params) => { /* ... */ },
-});
+peer.use(new OpenID4xProfile(config));
 ```
 
 ## Development
