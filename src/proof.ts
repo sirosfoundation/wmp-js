@@ -13,7 +13,8 @@ export const REQUEST_PROOF_SKEW_SECONDS = 30;
 
 export type RequestProofAlgorithm = "ES256" | "ES384" | "ES512" | "EdDSA";
 
-const ALGORITHMS: Record<
+/** @internal */
+export const ALGORITHMS: Record<
   RequestProofAlgorithm,
   { importParams: EcKeyImportParams | Algorithm; verifyParams: EcdsaParams | Algorithm; size: number }
 > = {
@@ -85,20 +86,23 @@ export interface CreateRequestProofOptions {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
-function toBase64(bytes: Uint8Array): string {
+/** @internal */
+export function toBase64(bytes: Uint8Array): string {
   let s = "";
   for (const b of bytes) s += String.fromCodePoint(b);
   return btoa(s);
 }
 
-function fromBase64(s: string): Uint8Array {
+/** @internal */
+export function fromBase64(s: string): Uint8Array {
   const bin = atob(s);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.codePointAt(i)!;
   return out;
 }
 
-function toBase64Url(bytes: Uint8Array): string {
+/** @internal */
+export function toBase64Url(bytes: Uint8Array): string {
   return toBase64(bytes).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 }
 
@@ -156,7 +160,8 @@ export function webCryptoProofSigner(key: CryptoKey): RequestProofSigner {
   };
 }
 
-function algorithmOfKey(key: CryptoKey): RequestProofAlgorithm | undefined {
+/** @internal */
+export function algorithmOfKey(key: CryptoKey): RequestProofAlgorithm | undefined {
   if (key.algorithm.name === "Ed25519") return "EdDSA";
   if (key.algorithm.name === "ECDSA") return CURVE_ALGORITHMS[(key.algorithm as EcKeyAlgorithm).namedCurve];
   return undefined;
@@ -291,8 +296,8 @@ function readTlv(der: Uint8Array, at: number): { tag: number; start: number; end
   return { tag, start, end: start + len };
 }
 
-/** Returns the DER subjectPublicKeyInfo of an X.509 certificate. */
-function certificateSpki(der: Uint8Array): Uint8Array {
+/** Returns the DER subjectPublicKeyInfo of an X.509 certificate. @internal */
+export function certificateSpki(der: Uint8Array): Uint8Array {
   const cert = readTlv(der, 0);
   if (cert.tag !== 0x30 || cert.end !== der.length) throw new Error("not a certificate");
   const tbs = readTlv(der, cert.start);

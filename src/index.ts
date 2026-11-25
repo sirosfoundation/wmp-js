@@ -317,3 +317,31 @@ export type {
   RequestProofReplayCache,
   VerifiedRequestProof,
 } from "./proof.js";
+
+// Non-repudiation signatures (Core 5.4)
+export {
+  ContentSignatureError,
+  canonicalize,
+  contentObject,
+  signContent,
+  verifyContentSignature,
+} from "./signature.js";
+export type {
+  SignContentOptions,
+  VerifyContentSignatureOptions,
+  VerifiedContentSignature,
+} from "./signature.js";
+
+// QERDS sender profile
+export { QerdsError, sendQerds, tsMlsQerdsGroups } from "./qerds.js";
+export type {
+  QerdsStep,
+  QerdsCredential,
+  QerdsKeyPackage,
+  QerdsGroup,
+  QerdsGroupProvider,
+  QerdsEvidenceRecord,
+  QerdsEvidenceOptions,
+  SendQerdsOptions,
+  SendQerdsResult,
+} from "./qerds.js";
