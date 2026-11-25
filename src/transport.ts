@@ -389,6 +389,11 @@ export class HttpSseTransport extends Emitter implements Transport {
       };
       init = { ...init, fetch: proofFetch } as EventSourceInit;
     }
+    if (typeof this.EventSourceCtor !== "function") {
+      throw new Error(
+        "HttpSseTransport: no EventSource is available; pass one as opts.EventSource (Node has no global EventSource)",
+      );
+    }
     const es = new this.EventSourceCtor(this.streamUrl(cursor), init);
     this.eventSource = es;
 
