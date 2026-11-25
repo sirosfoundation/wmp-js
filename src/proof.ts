@@ -87,14 +87,14 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 
 function toBase64(bytes: Uint8Array): string {
   let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
+  for (const b of bytes) s += String.fromCodePoint(b);
   return btoa(s);
 }
 
 function fromBase64(s: string): Uint8Array {
   const bin = atob(s);
   const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.codePointAt(i)!;
   return out;
 }
 
@@ -140,7 +140,8 @@ function canonicalClaims(c: RequestProofClaims): string {
   const members: Array<[string, string | number]> = [];
   if (c.ath !== undefined) members.push(["ath", c.ath]);
   members.push(["htm", c.htm], ["htu", c.htu], ["iat", c.iat], ["jti", c.jti], ["sid", c.sid]);
-  return `{${members.map(([k, v]) => `${JSON.stringify(k)}:${JSON.stringify(v)}`).join(",")}}`;
+  const body = members.map(([k, v]) => JSON.stringify(k) + ":" + JSON.stringify(v)).join(",");
+  return `{${body}}`;
 }
 
 /** A signer for a WebCrypto private key (ECDSA P-256, P-384, P-521 or Ed25519). */
@@ -318,6 +319,98 @@ function parseChain(v: unknown): Uint8Array[] {
   });
 }
 
+interface ProofKey {
+  key: CryptoKey;
+  chain?: Uint8Array[];
+  kid?: string;
+}
+
+/** Checks the protected header and returns its algorithm. */
+function headerAlgorithm(header: Record<string, unknown>, opts: VerifyRequestProofOptions): RequestProofAlgorithm {
+  const alg = stringMember(header, "alg") as RequestProofAlgorithm;
+  if (stringMember(header, "typ") !== REQUEST_PROOF_TYPE) throw new RequestProofError(`typ is not ${REQUEST_PROOF_TYPE}`);
+  const accepted = opts.algorithms ?? (Object.keys(ALGORITHMS) as RequestProofAlgorithm[]);
+  if (!Object.hasOwn(ALGORITHMS, alg) || !accepted.includes(alg)) throw new RequestProofError(`algorithm ${alg} is not accepted`);
+  if (Object.hasOwn(header, "crit")) throw new RequestProofError("crit is not supported");
+  return alg;
+}
+
+async function chainKey(header: Record<string, unknown>, alg: RequestProofAlgorithm, opts: VerifyRequestProofOptions): Promise<ProofKey> {
+  const chain = parseChain(header.x5c);
+  if (!opts.verifyChain) throw new RequestProofError("x5c proofs are not accepted");
+  try {
+    const spki = certificateSpki(chain[0]) as BufferSource;
+    return { chain, key: await crypto.subtle.importKey("spki", spki, ALGORITHMS[alg].importParams, true, ["verify"]) };
+  } catch {
+    throw new RequestProofError(`leaf key does not fit algorithm ${alg}`);
+  }
+}
+
+async function resolvedKey(header: Record<string, unknown>, alg: RequestProofAlgorithm, opts: VerifyRequestProofOptions): Promise<ProofKey> {
+  const kid = stringMember(header, "kid");
+  if (!opts.resolveKey) throw new RequestProofError("kid proofs are not accepted");
+  let key: CryptoKey | undefined;
+  try {
+    key = await opts.resolveKey(kid);
+  } catch {
+    key = undefined;
+  }
+  if (!key) throw new RequestProofError("kid does not resolve");
+  if (algorithmOfKey(key) !== alg) throw new RequestProofError(`key does not fit algorithm ${alg}`);
+  return { kid, key };
+}
+
+/** The key the header names: the leaf of its x5c chain, or the key of its kid. */
+function proofKey(header: Record<string, unknown>, alg: RequestProofAlgorithm, opts: VerifyRequestProofOptions): Promise<ProofKey> {
+  const hasChain = Object.hasOwn(header, "x5c");
+  if (hasChain === Object.hasOwn(header, "kid")) throw new RequestProofError("exactly one of x5c and kid is required");
+  return hasChain ? chainKey(header, alg, opts) : resolvedKey(header, alg, opts);
+}
+
+async function checkSignature(alg: RequestProofAlgorithm, key: CryptoKey, input: string, sig: Uint8Array): Promise<void> {
+  if (sig.length !== ALGORITHMS[alg].size) throw new RequestProofError("signature length");
+  let valid = false;
+  try {
+    valid = await crypto.subtle.verify(ALGORITHMS[alg].verifyParams, key, sig as BufferSource, encoder.encode(input) as BufferSource);
+  } catch {
+    valid = false;
+  }
+  if (!valid) throw new RequestProofError("signature");
+}
+
+function parseClaims(payload: Record<string, unknown>): RequestProofClaims {
+  const iat = Object.hasOwn(payload, "iat") ? payload.iat : undefined;
+  if (typeof iat !== "number" || !Number.isSafeInteger(iat)) throw new RequestProofError("iat is not an integer");
+  const claims: RequestProofClaims = {
+    htm: stringMember(payload, "htm"),
+    htu: stringMember(payload, "htu"),
+    iat,
+    jti: stringMember(payload, "jti"),
+    sid: stringMember(payload, "sid"),
+  };
+  if (Object.hasOwn(payload, "ath")) claims.ath = stringMember(payload, "ath");
+  return claims;
+}
+
+/** Checks that the claims name the session, the request and the access token. */
+async function checkBinding(claims: RequestProofClaims, expect: RequestProofExpectation): Promise<void> {
+  if (expect.sessionId !== undefined && claims.sid !== expect.sessionId) {
+    throw new RequestProofError("sid does not name this session");
+  }
+  if (claims.htm !== expect.method) throw new RequestProofError("htm does not match the request");
+  let claimed: string | undefined;
+  try {
+    claimed = normalizeUrl(claims.htu, false);
+  } catch {
+    claimed = undefined;
+  }
+  if (claimed === undefined || claimed !== normalizeUrl(expect.url, true)) {
+    throw new RequestProofError("htu does not match the request");
+  }
+  const wantHash = expect.accessToken ? await tokenHash(expect.accessToken) : undefined;
+  if (claims.ath !== wantHash) throw new RequestProofError("ath does not match the access token");
+}
+
 /**
  * Verifies a compact JWS proof (WMP Core section 4.4.8, verification steps 1
  * to 5) and throws RequestProofError when it does not pass. The caller still
@@ -335,79 +428,11 @@ export async function verifyRequestProof(
   const payloadBytes = fromBase64Url(parts[1], "payload");
   const sig = fromBase64Url(parts[2], "signature");
 
-  const alg = stringMember(header, "alg") as RequestProofAlgorithm;
-  if (stringMember(header, "typ") !== REQUEST_PROOF_TYPE) throw new RequestProofError(`typ is not ${REQUEST_PROOF_TYPE}`);
-  const accepted = opts.algorithms ?? (Object.keys(ALGORITHMS) as RequestProofAlgorithm[]);
-  if (!Object.hasOwn(ALGORITHMS, alg) || !accepted.includes(alg)) throw new RequestProofError(`algorithm ${alg} is not accepted`);
-  if (Object.hasOwn(header, "crit")) throw new RequestProofError("crit is not supported");
-
-  const hasChain = Object.hasOwn(header, "x5c");
-  const hasKid = Object.hasOwn(header, "kid");
-  if (hasChain === hasKid) throw new RequestProofError("exactly one of x5c and kid is required");
-
-  let key: CryptoKey;
-  let chain: Uint8Array[] | undefined;
-  let kid: string | undefined;
-  if (hasChain) {
-    chain = parseChain(header.x5c);
-    if (!opts.verifyChain) throw new RequestProofError("x5c proofs are not accepted");
-    try {
-      key = await crypto.subtle.importKey("spki", certificateSpki(chain[0]) as BufferSource, ALGORITHMS[alg].importParams, true, ["verify"]);
-    } catch {
-      throw new RequestProofError(`leaf key does not fit algorithm ${alg}`);
-    }
-  } else {
-    kid = stringMember(header, "kid");
-    if (!opts.resolveKey) throw new RequestProofError("kid proofs are not accepted");
-    let resolved: CryptoKey | undefined;
-    try {
-      resolved = await opts.resolveKey(kid);
-    } catch {
-      resolved = undefined;
-    }
-    if (!resolved) throw new RequestProofError("kid does not resolve");
-    if (algorithmOfKey(resolved) !== alg) throw new RequestProofError(`key does not fit algorithm ${alg}`);
-    key = resolved;
-  }
-
-  if (sig.length !== ALGORITHMS[alg].size) throw new RequestProofError("signature length");
-  const input = encoder.encode(`${parts[0]}.${parts[1]}`);
-  let valid = false;
-  try {
-    valid = await crypto.subtle.verify(ALGORITHMS[alg].verifyParams, key, sig as BufferSource, input as BufferSource);
-  } catch {
-    valid = false;
-  }
-  if (!valid) throw new RequestProofError("signature");
-
-  const payload = parseObject(payloadBytes, "payload");
-  const claims: RequestProofClaims = {
-    htm: stringMember(payload, "htm"),
-    htu: stringMember(payload, "htu"),
-    iat: payload.iat as number,
-    jti: stringMember(payload, "jti"),
-    sid: stringMember(payload, "sid"),
-  };
-  if (!Object.hasOwn(payload, "iat") || typeof payload.iat !== "number" || !Number.isSafeInteger(payload.iat)) {
-    throw new RequestProofError("iat is not an integer");
-  }
-  if (Object.hasOwn(payload, "ath")) claims.ath = stringMember(payload, "ath");
-
-  if (expect.sessionId !== undefined && claims.sid !== expect.sessionId) {
-    throw new RequestProofError("sid does not name this session");
-  }
-  if (claims.htm !== expect.method) throw new RequestProofError("htm does not match the request");
-  let claimed: string | undefined;
-  try {
-    claimed = normalizeUrl(claims.htu, false);
-  } catch {
-    claimed = undefined;
-  }
-  if (claimed === undefined || claimed !== normalizeUrl(expect.url, true)) {
-    throw new RequestProofError("htu does not match the request");
-  }
-  const wantHash = expect.accessToken ? await tokenHash(expect.accessToken) : undefined;
-  if (claims.ath !== wantHash) throw new RequestProofError("ath does not match the access token");
+  const alg = headerAlgorithm(header, opts);
+  const { key, chain, kid } = await proofKey(header, alg, opts);
+  await checkSignature(alg, key, `${parts[0]}.${parts[1]}`, sig);
+  const claims = parseClaims(parseObject(payloadBytes, "payload"));
+  await checkBinding(claims, expect);
 
   const now = opts.now ? opts.now() : Date.now() / 1000;
   const skew = opts.skewSeconds !== undefined && opts.skewSeconds > 0 ? opts.skewSeconds : REQUEST_PROOF_SKEW_SECONDS;
@@ -430,10 +455,10 @@ export async function verifyRequestProof(
 
 /** An in-process replay cache. A deployment with several instances needs a shared one. */
 export class MemoryRequestProofReplayCache implements RequestProofReplayCache {
-  private entries = new Map<string, number>();
+  private readonly entries = new Map<string, number>();
   /** When expired entries are next removed: a lookup does not pay for the whole cache. */
   private sweepAt = 0;
-  constructor(private now: () => number = () => Date.now() / 1000) {}
+  constructor(private readonly now: () => number = () => Date.now() / 1000) {}
 
   seen(key: string, expires: number): boolean {
     const now = this.now();

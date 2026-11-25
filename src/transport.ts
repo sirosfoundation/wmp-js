@@ -477,6 +477,23 @@ export class HttpSseTransport extends Emitter implements Transport {
     this.emit("error", new Error("SSE connection error"));
   }
 
+  /** The session a POST of `msg` names, if any. */
+  private routeOf(msg: Message): string | undefined {
+    // A session.create must not carry a session id (Transport 4.3.1: the server
+    // assigns it and refuses a request that names one). The binding itself stays,
+    // in case the create fails and the old session is still the one in use.
+    const method = (msg as { method?: unknown }).method;
+    if (method === "wmp.session.create") return undefined;
+    if (method === "wmp.session.resume") {
+      // A resume is addressed to the session it asks for, which may not be the one
+      // currently bound (the binding changes only if the resume succeeds): header
+      // and body must name the same session.
+      const asked = (msg as { params?: { session_id?: unknown } }).params?.session_id;
+      if (typeof asked === "string" && asked !== "") return asked;
+    }
+    return this.sessionId;
+  }
+
   async send(msg: Message): Promise<void> {
     if (this.closed) {
       throw new Error("Transport is closed");
@@ -488,20 +505,7 @@ export class HttpSseTransport extends Emitter implements Transport {
     if (this.authorization) {
       headers["Authorization"] = this.authorization;
     }
-    // A session.create must not carry a session id (Transport 4.3.1: the server
-    // assigns it and refuses a request that names one). The binding itself stays,
-    // in case the create fails and the old session is still the one in use.
-    const method = (msg as { method?: unknown }).method;
-    let routeId: string | undefined = this.sessionId;
-    if (method === "wmp.session.create") {
-      routeId = undefined;
-    } else if (method === "wmp.session.resume") {
-      // A resume is addressed to the session it asks for, which may not be the one
-      // currently bound (the binding changes only if the resume succeeds): header
-      // and body must name the same session.
-      const asked = (msg as { params?: { session_id?: unknown } }).params?.session_id;
-      if (typeof asked === "string" && asked !== "") routeId = asked;
-    }
+    const routeId = this.routeOf(msg);
     if (routeId) {
       headers["Wmp-Session-Id"] = routeId;
       if (this.requestProof) {
