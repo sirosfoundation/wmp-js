@@ -93,7 +93,7 @@ Built-in transports:
 
 #### Per-request proof
 
-For a deployment that terminates TLS without forwarding the client certificate, `HttpSseTransport` sends the per-request proof of WMP Core §4.4.8 on every request that names a session:
+For a deployment that terminates TLS without forwarding the client certificate, `HttpSseTransport` sends the per-request proof of WMP Core §4.4.8 on the session create and on every request that names a session:
 
 ```typescript
 const signer = webCryptoProofSigner(privateKey);
@@ -103,6 +103,51 @@ const transport = new HttpSseTransport(rpcUrl, eventsUrl, {
 ```
 
 `verifyRequestProof` checks a proof on the receiving side.
+
+### QERDS sender profile
+
+`sendQerds()` runs a registered electronic delivery (WMP Evidence, eDelivery and MLS profiles) as one call: the session create, the recipient and KeyPackage resolves, the MLS group, the encrypted and signed deliver, and the evidence poll.
+
+```typescript
+import { sendQerds, webCryptoProofSigner } from "@sirosfoundation/wmp-js";
+
+const result = await sendQerds({
+  endpoint: "https://erds.example.com/wmp",       // the WMP endpoint (see discoverEndpoint)
+  sender: "ebcore:iso6523:0007:5595421925",
+  recipients: ["ebcore:iso6523:0106:99900817"],
+  credential: {
+    chain: [leafDer, issuerDer],                  // leaf first, DER or base64 DER
+    signer: webCryptoProofSigner(privateKey),     // the leaf's key
+  },
+  auth: "dpop",                                   // or "mtls"
+  message: { body: { text: "the consignment" } },
+  evidence: { timeoutMs: 90_000 },
+});
+
+result.confirmed;   // delivery_confirmed was reached
+result.evidence;    // the evidence records of this message
+result.message;     // { id, content, signature, plaintext }: keep these with the evidence
+```
+
+The one certificate chain serves every role: the per-request proof, the §5.4 content signature, the MLS leaf credential and the §5.6 `x509_chain` identity assertion.
+
+- `auth: "mtls"` (the default) sends no proof: pass a `fetch` that presents the client certificate (for example undici's `fetch` with an `Agent` that has `connect: { cert, key }`).
+- `auth: "dpop"` sends a per-request proof (WMP Core §4.4.8) on every request, the evidence reads included.
+- A step that fails throws a `QerdsError` whose `step` is `session`, `resolve`, `group`, `deliver` or `evidence`, and whose `cause` is the `WMPError` of a refused request. When the deliver request itself fails, `sent` carries the message that was sent: the ERDS may have accepted it, and its id is what the evidence refers to.
+- A poll that ends before one of `evidence.until` returns `confirmed: false` with the records read so far; `evidence.timeoutMs` also bounds each read of the repository. `evidence: { poll: false }` returns right after the deliver.
+- `plaintextHash: true` adds the salted `plaintext_hash` commitment of WMP Core §5.2.1.
+- `mls` replaces the default ts-mls engine.
+
+The rules the profile encodes: the ciphertext is the only content field of the deliver (`to`, `content_type` and `body` travel inside it); the signature is a detached JWS with a raw R||S ECDSA signature; every request and every message has its own id; a KeyPackage is resolved fresh for each group; the cipher suite is the one the resolved KeyPackage names.
+
+### Content signatures
+
+`signContent` and `verifyContentSignature` make and check the `wmp.signature` value of WMP Core §5.4: a detached JWS (`b64: false`) over the RFC 8785 form of the content object. `contentObject(params)` is the object that is signed, and `canonicalize` its canonical form.
+
+```typescript
+const signature = await signContent(contentObject(params), { signer, x5c: chain });
+await verifyContentSignature(signature, contentObject(params), { verifyChain });
+```
 
 ### Peer
 
