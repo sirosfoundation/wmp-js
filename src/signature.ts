@@ -29,10 +29,20 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
+/**
+ * The order of RFC 8785 section 3.2.3: by UTF-16 code units, which is how
+ * the relational operators compare strings. A locale-aware comparison would
+ * give another order.
+ */
+function byCodeUnits(a: string, b: string): number {
+  if (a < b) return -1;
+  return a > b ? 1 : 0;
+}
+
 function canonicalMember(key: string, value: unknown, path: string): string | undefined {
   // As in JSON.stringify, a member without a value is not part of the object.
   if (value === undefined) return undefined;
-  return `${JSON.stringify(key)}:${canonicalValue(value, `${path}.${key}`)}`;
+  return JSON.stringify(key) + ":" + canonicalValue(value, path + "." + key);
 }
 
 function canonicalValue(value: unknown, path: string): string {
@@ -47,15 +57,14 @@ function canonicalValue(value: unknown, path: string): string {
     return JSON.stringify(value);
   }
   if (Array.isArray(value)) {
-    return `[${value.map((v, i) => canonicalValue(v, `${path}[${i}]`)).join(",")}]`;
+    return "[" + value.map((v, i) => canonicalValue(v, path + "[" + i + "]")).join(",") + "]";
   }
   if (typeof value === "object") {
     const proto = Object.getPrototypeOf(value);
     if (proto !== Object.prototype && proto !== null) throw new TypeError(`${path}: not a plain JSON object`);
     const o = value as Record<string, unknown>;
-    // The default sort compares UTF-16 code units, the order RFC 8785 section 3.2.3 requires.
     const members = Object.keys(o)
-      .sort()
+      .sort(byCodeUnits)
       .map((k) => canonicalMember(k, o[k], path))
       .filter((m) => m !== undefined);
     return `{${members.join(",")}}`;

@@ -190,8 +190,8 @@ describe("content signature (WMP Core 5.4)", () => {
   });
 
   it.each([
-    ["an attached payload", (s: string) => s.replace("..", ".e30.")],
-    ["two segments", (s: string) => s.replace("..", ".")],
+    ["an attached payload", (s: string) => s.split("..").join(".e30.")],
+    ["two segments", (s: string) => s.split("..").join(".")],
     ["an empty signature", (s: string) => s.slice(0, s.indexOf("..") + 2)],
     ["a non-canonical encoding", (s: string) => `${s}=`],
   ])("refuses %s", async (_name, mutate) => {

@@ -534,52 +534,89 @@ async function deliver(
   return { message: { id, content, signature, plaintext }, epoch };
 }
 
+function withoutTrailingSlashes(url: string): string {
+  let end = url.length;
+  while (end > 0 && url[end - 1] === "/") end--;
+  return url.slice(0, end);
+}
+
 function repositoryUrl(opts: SendQerdsOptions, session: SendQerdsResult["session"]): string {
   if (opts.evidence?.repository) return opts.evidence.repository;
   const negotiated = (session.capabilities as { evidence?: { repository?: unknown } } | undefined)?.evidence?.repository;
   if (typeof negotiated === "string" && negotiated !== "") return negotiated;
-  return opts.endpoint.replace(/\/+$/, "");
+  return opts.endpoint;
 }
 
-/** Every evidence record of the session that belongs to the message, across pages. */
-async function readEvidence(client: QerdsClient, repository: string, messageId: string): Promise<QerdsEvidenceRecord[]> {
+const MAX_EVIDENCE_PAGES = 100;
+
+/** The records of one page that belong to the message, and the token of the next page. */
+async function readEvidencePage(
+  client: QerdsClient,
+  repository: string,
+  messageId: string,
+  token: string | undefined,
+): Promise<{ records: QerdsEvidenceRecord[]; next?: string }> {
+  const url = new URL(`${withoutTrailingSlashes(repository)}/evidence`);
+  url.searchParams.set("session_id", client.sessionId!);
+  if (token !== undefined) url.searchParams.set("continuation_token", token);
+  const doc = await client.evidencePage(url);
+  if (!Array.isArray(doc.evidence_records)) throw new Error("evidence repository: no evidence_records");
   const records: QerdsEvidenceRecord[] = [];
-  let token: string | undefined;
-  for (let page = 0; page < 100; page++) {
-    const url = new URL(`${repository.replace(/\/+$/, "")}/evidence`);
-    url.searchParams.set("session_id", client.sessionId!);
-    if (token !== undefined) url.searchParams.set("continuation_token", token);
-    const doc = await client.evidencePage(url);
-    if (!Array.isArray(doc.evidence_records)) throw new Error("evidence repository: no evidence_records");
-    for (const r of doc.evidence_records) {
-      if (!isObject(r) || typeof r.evidence_id !== "string" || typeof r.event_type !== "string") {
-        throw new Error("evidence repository: a malformed record");
-      }
-      // The session's records of other messages are not this message's evidence.
-      if (r.original_message_id === messageId) records.push(r as QerdsEvidenceRecord);
+  for (const r of doc.evidence_records) {
+    if (!isObject(r) || typeof r.evidence_id !== "string" || typeof r.event_type !== "string") {
+      throw new Error("evidence repository: a malformed record");
     }
-    if (typeof doc.continuation_token !== "string" || doc.continuation_token === "") return records;
-    token = doc.continuation_token;
+    // The session's records of other messages are not this message's evidence.
+    if (r.original_message_id === messageId) records.push(r as QerdsEvidenceRecord);
   }
-  throw new Error("evidence repository: more than 100 pages");
+  const next = typeof doc.continuation_token === "string" && doc.continuation_token !== "" ? doc.continuation_token : undefined;
+  return { records, next };
 }
 
-async function pollEvidence(
+/** Every evidence record of the session that belongs to the message: the pages are read one after the other. */
+async function readEvidence(
+  client: QerdsClient,
+  repository: string,
+  messageId: string,
+  token?: string,
+  page = 1,
+): Promise<QerdsEvidenceRecord[]> {
+  if (page > MAX_EVIDENCE_PAGES) throw new Error(`evidence repository: more than ${MAX_EVIDENCE_PAGES} pages`);
+  const { records, next } = await readEvidencePage(client, repository, messageId, token);
+  if (next === undefined) return records;
+  return records.concat(await readEvidence(client, repository, messageId, next, page + 1));
+}
+
+interface EvidencePoll {
+  repository: string;
+  messageId: string;
+  until: string[];
+  intervalMs: number;
+  deadline: number;
+}
+
+/** Reads the evidence, and again after a pause until it is confirmed or the deadline would pass. */
+async function pollUntil(client: QerdsClient, poll: EvidencePoll): Promise<{ evidence: QerdsEvidenceRecord[]; confirmed: boolean }> {
+  const evidence = await readEvidence(client, poll.repository, poll.messageId);
+  if (evidence.some((r) => poll.until.includes(r.event_type))) return { evidence, confirmed: true };
+  if (Date.now() + poll.intervalMs > poll.deadline) return { evidence, confirmed: false };
+  await new Promise((resolve) => setTimeout(resolve, poll.intervalMs));
+  return pollUntil(client, poll);
+}
+
+function pollEvidence(
   client: QerdsClient,
   opts: SendQerdsOptions,
   session: SendQerdsResult["session"],
   messageId: string,
 ): Promise<{ evidence: QerdsEvidenceRecord[]; confirmed: boolean }> {
-  const until = opts.evidence?.until ?? DEFAULT_UNTIL;
-  const interval = opts.evidence?.intervalMs ?? 5_000;
-  const deadline = Date.now() + (opts.evidence?.timeoutMs ?? 90_000);
-  const repository = repositoryUrl(opts, session);
-  for (;;) {
-    const evidence = await readEvidence(client, repository, messageId);
-    if (evidence.some((r) => until.includes(r.event_type))) return { evidence, confirmed: true };
-    if (Date.now() + interval > deadline) return { evidence, confirmed: false };
-    await new Promise((resolve) => setTimeout(resolve, interval));
-  }
+  return pollUntil(client, {
+    repository: repositoryUrl(opts, session),
+    messageId,
+    until: opts.evidence?.until ?? DEFAULT_UNTIL,
+    intervalMs: opts.evidence?.intervalMs ?? 5_000,
+    deadline: Date.now() + (opts.evidence?.timeoutMs ?? 90_000),
+  });
 }
 
 /**
